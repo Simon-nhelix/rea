@@ -7,7 +7,15 @@ import {
   managedArtifactSummaryViewResultSchema,
 } from "../domain/analysisView/analysisView.js";
 import { evidenceBundleSummarySchema } from "../domain/evidenceRecordSummary.js";
-import { BINARY_ARCHITECTURES } from "../domain/binaryTargetTypes.js";
+import {
+  BINARY_ARCHITECTURES,
+  CONSOLE_ONLY_ARCHITECTURES,
+} from "../domain/binaryTargetTypes.js";
+import { CONSOLE_TARGET_FORMATS } from "../domain/consoleRom.js";
+import {
+  scanPointerTableResultSchema,
+  searchRomStringsResultSchema,
+} from "../domain/romHacking.js";
 import {
   binaryArchitectureSchema,
   rawBinaryEntryPointSchema,
@@ -383,6 +391,8 @@ export const enhancedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   inspect_native_api: evidenceResultOf(nativeApiInspectionResultSchema),
   trace_feature: literalTraceOutput,
   trace_call_path: callPathTraceOutput,
+  search_rom_strings: evidenceResultOf(searchRomStringsResultSchema),
+  scan_pointer_table: evidenceResultOf(scanPointerTableResultSchema),
 };
 
 /** Exact Evidence schemas for provider-neutral native inspection. */
@@ -458,8 +468,11 @@ const lifecycleTargetFields = {
 };
 const detectedLifecycleTargetSchema = z.object({
   ...lifecycleTargetFields,
-  format: targetFormatSchema.exclude(["raw-binary"]),
-  architecture: z.enum(BINARY_ARCHITECTURES).exclude(["6502"]).nullable(),
+  format: targetFormatSchema.exclude(["raw-binary", ...CONSOLE_TARGET_FORMATS]),
+  architecture: z
+    .enum(BINARY_ARCHITECTURES)
+    .exclude(CONSOLE_ONLY_ARCHITECTURES)
+    .nullable(),
 });
 const rawLifecycleTargetSchema = z.object({
   ...lifecycleTargetFields,
@@ -470,6 +483,15 @@ const rawLifecycleTargetSchema = z.object({
     "Canonical caller-selected address where raw file offset 0 is mapped and execution is seeded.",
   ),
 });
+const consoleLifecycleTargetSchema = z.object({
+  ...lifecycleTargetFields,
+  format: z.enum(CONSOLE_TARGET_FORMATS),
+  kind: z.literal("executable"),
+  architecture: z.enum(BINARY_ARCHITECTURES),
+  entry_point: rawBinaryEntryPointSchema.describe(
+    "Canonical console load or entry address derived from the ROM/executable header or caller override.",
+  ),
+});
 
 /** Exact structured-content schemas for target lifecycle operations. */
 export const sessionOutputSchemas = {
@@ -477,6 +499,7 @@ export const sessionOutputSchemas = {
     z.discriminatedUnion("format", [
       detectedLifecycleTargetSchema,
       rawLifecycleTargetSchema,
+      consoleLifecycleTargetSchema,
     ]),
   ),
   close_binary: lifecycleResultOf(

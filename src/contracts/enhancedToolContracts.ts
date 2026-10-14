@@ -86,4 +86,14 @@ export const ENHANCED_TOOL_CONTRACTS = [
     "Trace a bounded static dependency graph from one explicit native procedure. Includes high-p-code def-use, constants, operators, memory and branch operations, resolved call edges, and derived argument/parameter and return/output bindings. Missing bindings, alias semantics, persistent state and RNG roles remain unknown. Budgets bound depth, decompilations, graph size and payloads; nodes are paginated.",
     enhancedInputSchemas.trace_native_values,
   ),
+  enhanced(
+    "search_rom_strings",
+    "Search or scan console ROM memory for localized text in Shift-JIS (sjis/cp932), EUC-JP, UTF-8, UTF-16LE/BE, ASCII, or custom .tbl character tables. Returns virtual addresses, ROM file offsets, raw hex bytes, decoded text, and incoming cross-references for localization and ROM hacking workflows.",
+    enhancedInputSchemas.search_rom_strings,
+  ),
+  enhanced(
+    "scan_pointer_table",
+    "Scan a 16-bit, 24-bit, or 32-bit pointer table in console ROM or executable memory with configurable endianness, bank base_address, and entry stride. Resolves each slot's target virtual address, ROM file offset, decoded string preview (Shift-JIS/EUC-JP/UTF/ASCII/.tbl), and incoming cross-references.",
+    enhancedInputSchemas.scan_pointer_table,
+  ),
 ] as const satisfies readonly ToolContract[];

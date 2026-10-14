@@ -4,7 +4,10 @@ import type {
 } from "../application/AnalysisProvider.js";
 import { createAnalysisProfile } from "../domain/analysisProfile.js";
 import type { GhidraLanguageOverride } from "../config/ghidraLanguageOverride.js";
-import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import {
+  isConsoleBinaryTarget,
+  type BinaryTarget,
+} from "../domain/binaryTargetTypes.js";
 import {
   AnalysisCancelledError,
   AnalysisUnsupportedTargetError,
@@ -26,6 +29,7 @@ import {
   ghidraPowerPcProfileParameters,
 } from "./GhidraPowerPcProfile.js";
 import { ghidraRawBinaryLanguage } from "./GhidraRawBinaryLanguage.js";
+import { isConsoleTargetFormat } from "../domain/consoleRom.js";
 
 import {
   ghidraProcessorUnsupportedReason,
@@ -153,6 +157,67 @@ export const resolveGhidraAnalysisProfile = async (
           language_id: language.languageId,
           compiler_spec_id: language.compilerSpecId,
           language_selection: "caller-supplied-v1",
+          entry_point: target.entryPoint,
+          entry_seed: "external-entry-and-function-before-analysis-v1",
+          ...analyzerParameters,
+        }),
+      }),
+    );
+  }
+  if (isConsoleBinaryTarget(target)) {
+    if (languageOverride !== undefined)
+      return Promise.resolve(
+        err(
+          new AnalysisUnsupportedTargetError(
+            "resolve_analysis_profile",
+            target.path,
+            "REA_GHIDRA_LANGUAGE_ID cannot override the admitted console ROM import.",
+          ),
+        ),
+      );
+    const consoleRom = target.consoleRom;
+    if (consoleRom === undefined)
+      return Promise.resolve(
+        err(new ProviderAdapterError(identity.id, "resolve_analysis_profile")),
+      );
+    return Promise.resolve(
+      ok({
+        profile: createAnalysisProfile(provider, {
+          target_kind: target.kind,
+          target_format: target.format,
+          architecture: target.architecture,
+          available_architectures: [...target.availableArchitectures].sort(),
+          import_mode: "ephemeral-source-immutable",
+          annotation_policy: "atomic-function-entry-metadata-v1",
+          load_image_observations: "source-mappings-entry-context-v2",
+          function_body_evidence: "complete-inclusive-ranges-v1",
+          function_references: "complete-body-and-entry-reference-manager-v2",
+          call_relationship_coverage: callRelationshipCoverage,
+          function_dossier_coverage:
+            "observed-facets-and-call-relationships-v1",
+          string_inventory_evidence: "defined-data-coverage-v1",
+          location_resolution: "explicit-address-exact-entry-symbol-first-v3",
+          procedure_file_offset_resolution:
+            "address-first-unique-target-source-mapping-v2",
+          instruction_flow_evidence: "decoded-return-pcode-v1",
+          instruction_references: "exact-address-incoming-v1",
+          function_boundary_observations:
+            "ghidra-function-boundary-limitations-v3",
+          no_return_repair:
+            installation.platform === "win32"
+              ? "disabled-windows-p0"
+              : "returning-imports-decoded-return-v2",
+          process_launch:
+            installation.platform === "win32"
+              ? "official-headless-script-v1"
+              : "inspected-jvm-launch-support-v1",
+          load_image_evidence: "console-rom-mapping-context-v1",
+          jump_table_evidence: "typed-case-default-blocks-v1",
+          decompiler_jump_loads: true,
+          loader: consoleRom.loader,
+          language_id: consoleRom.ghidraLanguageId,
+          compiler_spec_id: consoleRom.compilerSpecId,
+          language_selection: "console-rom-profile-v1",
           entry_point: target.entryPoint,
           entry_seed: "external-entry-and-function-before-analysis-v1",
           ...analyzerParameters,

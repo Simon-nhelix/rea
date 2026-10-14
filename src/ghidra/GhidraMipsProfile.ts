@@ -1,5 +1,6 @@
 import type { GhidraLanguageOverride } from "../config/ghidraLanguageOverride.js";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import { isConsoleTargetFormat } from "../domain/consoleRom.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 
 const MIPS_FP_ABI_SOFT = 3;
@@ -11,6 +12,7 @@ const MIPS16_HEADER_ASE = 0x04000000;
 /** A distinct compressed shared-image shape; admission still checks every declaration. */
 const isGhidraMips16SharedTarget = (target: BinaryTarget): boolean =>
   target.kind === "executable" &&
+  !isConsoleTargetFormat(target.format) &&
   target.architecture === "mips" &&
   target.mips.type === MIPS_ET_DYN &&
   (target.mips.flags & 0x0f000000) === MIPS16_HEADER_ASE;
@@ -21,6 +23,8 @@ export const ghidraMipsLanguageOverride = (
 ): GhidraLanguageOverride | undefined =>
   (isGhidraMips16SharedTarget(target) || hasLegacyMipsHeaderShape(target)) &&
   ghidraMipsUnsupportedReason(target) === null &&
+  target.kind === "executable" &&
+  !isConsoleTargetFormat(target.format) &&
   target.architecture === "mips"
     ? {
         languageId: `MIPS:${target.mips.byteOrder === "little" ? "LE" : "BE"}:32:default`,
@@ -69,7 +73,11 @@ const hasLegacyMipsHeaderShape = (target: BinaryTarget): boolean => {
 export const ghidraMipsUnsupportedReason = (
   target: BinaryTarget,
 ): string | null => {
-  if (target.kind !== "executable" || target.architecture !== "mips")
+  if (
+    target.kind !== "executable" ||
+    isConsoleTargetFormat(target.format) ||
+    target.architecture !== "mips"
+  )
     return null;
   const metadata = target.mips;
   if (target.format !== "elf" || metadata === undefined)
@@ -181,6 +189,7 @@ export const GHIDRA_MIPS_SOFT_FLOAT_STORAGE = "o32-soft-float-prototype-v1";
 /** Whether the admitted target declares the soft-float o32 ABI. */
 export const isGhidraMipsSoftFloatTarget = (target: BinaryTarget): boolean =>
   target.kind === "executable" &&
+  !isConsoleTargetFormat(target.format) &&
   target.architecture === "mips" &&
   target.mips?.abiFlags?.cpr1Size === 0 &&
   target.mips.abiFlags.fpAbi === MIPS_FP_ABI_SOFT;
@@ -224,6 +233,7 @@ export const ghidraMipsRelocatableLimitations = (
   target: BinaryTarget,
 ): readonly string[] =>
   target.kind === "executable" &&
+  !isConsoleTargetFormat(target.format) &&
   target.architecture === "mips" &&
   target.mips?.type === MIPS_ET_REL
     ? [
@@ -236,7 +246,10 @@ export const ghidraMipsRelocatableLimitations = (
 export const ghidraMipsSharedLimitations = (
   target: BinaryTarget,
 ): readonly string[] =>
-  isGhidraMips16SharedTarget(target) && target.architecture === "mips"
+  isGhidraMips16SharedTarget(target) &&
+  target.kind === "executable" &&
+  !isConsoleTargetFormat(target.format) &&
+  target.architecture === "mips"
     ? [
         "MIPS16 shared ELF: the endian-matched generic MIPS32 language uses the provider's per-address ISA_MODE context. The program language variant is not the instruction's encoding mode.",
         "Shared-image addresses are Ghidra analysis coordinates, not runtime addresses. The source bytes remain unchanged; inspect_native_load_image retains original relocation bytes, loaded memory bytes and provider relocation status. External GOT bindings remain unverified without their defining images.",
@@ -255,6 +268,7 @@ export const ghidraMipsProfileParameters = (
 ): Readonly<Record<string, JsonValue>> => {
   if (
     target.kind !== "executable" ||
+    isConsoleTargetFormat(target.format) ||
     target.architecture !== "mips" ||
     target.mips === undefined
   )

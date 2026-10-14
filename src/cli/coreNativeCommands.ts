@@ -251,6 +251,204 @@ export const registerCoreNativeCommands = (
   registerNativeApiCommand(cli, logger, runDirectAnalysis);
   registerNativeUiActionCommand(cli, logger, runDirectAnalysis);
   registerNativeDispatchMetadataCommand(cli, logger, runDirectAnalysis);
+  registerRomHackingCommands(cli, logger, runDirectAnalysis);
+};
+
+const registerRomHackingCommands = (
+  cli: CliInstance,
+  logger: Logger,
+  runDirectAnalysis: DirectAnalysis["runDirectAnalysis"],
+): void => {
+  cli.command(CLI_COMMANDS.searchRomStrings, {
+    description:
+      "Search or scan console ROM memory for Shift-JIS, EUC-JP, UTF, ASCII, or custom .tbl text",
+    args: z.object({
+      path: z.string().describe("Console ROM or executable path"),
+    }),
+    options: z.object({
+      query: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Text query to encode and search across ROM memory"),
+      encoding: z
+        .enum([
+          "sjis",
+          "cp932",
+          "euc-jp",
+          "utf-8",
+          "utf-16le",
+          "utf-16be",
+          "ascii",
+          "tbl",
+        ])
+        .default("sjis")
+        .describe("Character encoding for query and decoded results"),
+      tablePath: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Path to custom .tbl character mapping file"),
+      tableText: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Inline .tbl character mapping rules"),
+      startAddress: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Start address (hex) for range scan or bounded query search"),
+      length: z
+        .number()
+        .int()
+        .min(1)
+        .max(65_536)
+        .default(4096)
+        .describe("Bytes to scan when startAddress is used without query"),
+      minLength: z
+        .number()
+        .int()
+        .min(1)
+        .max(256)
+        .default(2)
+        .describe("Minimum decoded character count for range scan"),
+      maxResults: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .default(50)
+        .describe("Maximum number of string matches to return"),
+      resolveXrefs: z
+        .boolean()
+        .default(true)
+        .describe("Resolve incoming cross-references and file offsets"),
+      ...nativeOpenOptionFields,
+    }),
+    run: ({ args, options }) =>
+      logCliCommand(logger, CLI_COMMANDS.searchRomStrings, () =>
+        runDirectAnalysis(
+          args.path,
+          "search_rom_strings",
+          {
+            ...(options.query === undefined ? {} : { query: options.query }),
+            encoding: options.encoding,
+            ...(options.tablePath === undefined
+              ? {}
+              : { table_path: options.tablePath }),
+            ...(options.tableText === undefined
+              ? {}
+              : { table_text: options.tableText }),
+            ...(options.startAddress === undefined
+              ? {}
+              : { start_address: options.startAddress }),
+            length: options.length,
+            min_length: options.minLength,
+            max_results: options.maxResults,
+            resolve_xrefs: options.resolveXrefs,
+          },
+          directAnalysisOptionsFromCli(logger, options),
+        ),
+      ),
+  });
+
+  cli.command(CLI_COMMANDS.scanPointerTable, {
+    description:
+      "Scan a 16/24/32-bit pointer table in console ROM or executable memory with string previews and xrefs",
+    args: z.object({
+      path: z.string().describe("Console ROM or executable path"),
+      address: z.string().describe("Pointer table start address (hex)"),
+    }),
+    options: z.object({
+      count: z
+        .number()
+        .int()
+        .min(1)
+        .max(512)
+        .default(32)
+        .describe("Number of pointer table entries to read"),
+      pointerSize: z
+        .union([z.literal(2), z.literal(3), z.literal(4)])
+        .default(4)
+        .describe("Pointer width in bytes (2, 3, or 4)"),
+      endian: z
+        .enum(["little", "big"])
+        .default("little")
+        .describe("Pointer byte order"),
+      baseAddress: z
+        .string()
+        .default("0x0")
+        .describe("Base address added to each raw pointer value"),
+      stride: z
+        .number()
+        .int()
+        .min(1)
+        .max(64)
+        .optional()
+        .describe("Bytes per table entry (defaults to pointerSize)"),
+      encoding: z
+        .enum([
+          "sjis",
+          "cp932",
+          "euc-jp",
+          "utf-8",
+          "utf-16le",
+          "utf-16be",
+          "ascii",
+          "tbl",
+        ])
+        .default("sjis")
+        .describe("Text encoding used to decode target string previews"),
+      tablePath: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Path to custom .tbl character mapping file"),
+      tableText: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Inline .tbl character mapping rules"),
+      previewBytes: z
+        .number()
+        .int()
+        .min(0)
+        .max(256)
+        .default(64)
+        .describe("Bytes to read at each target address for string preview"),
+      resolveXrefs: z
+        .boolean()
+        .default(true)
+        .describe("Resolve incoming cross-references and file offsets"),
+      ...nativeOpenOptionFields,
+    }),
+    run: ({ args, options }) =>
+      logCliCommand(logger, CLI_COMMANDS.scanPointerTable, () =>
+        runDirectAnalysis(
+          args.path,
+          "scan_pointer_table",
+          {
+            address: args.address,
+            count: options.count,
+            pointer_size: options.pointerSize,
+            endian: options.endian,
+            base_address: options.baseAddress,
+            ...(options.stride === undefined ? {} : { stride: options.stride }),
+            encoding: options.encoding,
+            ...(options.tablePath === undefined
+              ? {}
+              : { table_path: options.tablePath }),
+            ...(options.tableText === undefined
+              ? {}
+              : { table_text: options.tableText }),
+            preview_bytes: options.previewBytes,
+            resolve_xrefs: options.resolveXrefs,
+          },
+          directAnalysisOptionsFromCli(logger, options),
+        ),
+      ),
+  });
 };
 
 const registerNativeDispatchMetadataCommand = (

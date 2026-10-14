@@ -46,6 +46,10 @@ import {
   inspectGhidraPspExtension,
   type GhidraPspExtension,
 } from "./GhidraPspExtension.js";
+import {
+  formatConsoleTargetSpecTsv,
+  type ConsoleTargetAdmission,
+} from "../domain/consoleRom.js";
 
 /** Private paths and identity material for one headless Ghidra import. */
 export interface GhidraLaunchSession {
@@ -160,6 +164,7 @@ export interface GhidraHeadlessLauncherOptions {
     readonly compilerSpecId: string;
     readonly baseAddr: string;
   };
+  readonly consoleRom?: ConsoleTargetAdmission;
   /** Explicit import language committed by the analysis profile. */
   readonly languageOverride?: GhidraLanguageOverride;
   /** Auto-analyzers disabled before default auto-analysis, as configured. */
@@ -234,6 +239,13 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
               this.options.analysisSeeds,
               session.runtimeRoot,
             );
+      if (this.options.consoleRom !== undefined) {
+        await writeGhidraRuntimeFile(
+          paths.consoleSpecPath,
+          formatConsoleTargetSpecTsv(this.options.consoleRom),
+          platform,
+        );
+      }
       const extensions = await snapshotGhidraExtensions(
         this.options.analysisExtensions ?? [],
         session.runtimeRoot,
@@ -277,6 +289,17 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
         ...(this.options.rawBinary === undefined
           ? {}
           : { rawBinary: this.options.rawBinary }),
+        ...(this.options.consoleRom === undefined
+          ? {}
+          : {
+              consoleRom: {
+                loader: this.options.consoleRom.loader,
+                languageId: this.options.consoleRom.ghidraLanguageId,
+                compilerSpecId: this.options.consoleRom.compilerSpecId,
+                baseAddr: this.options.consoleRom.loadBase,
+                specPath: paths.consoleSpecPath,
+              },
+            }),
         ...(this.options.languageOverride === undefined
           ? {}
           : { languageOverride: this.options.languageOverride }),
@@ -544,6 +567,13 @@ export interface GhidraHeadlessArgumentOptions {
     readonly compilerSpecId: string;
     readonly baseAddr: string;
   };
+  readonly consoleRom?: {
+    readonly loader: "BinaryLoader" | "ElfLoader";
+    readonly languageId: string;
+    readonly compilerSpecId: string;
+    readonly baseAddr: string;
+    readonly specPath: string;
+  };
   readonly languageOverride?: GhidraLanguageOverride;
   /** Auto-analyzers disabled by the pre-analysis options script. */
   readonly disabledAnalyzers?: readonly string[];
@@ -562,6 +592,7 @@ export const ghidraHeadlessArguments = (
   const bridgeDirectory = scriptPath.dirname(options.bridgeScriptPath);
   const override = options.languageOverride;
   const rawBinary = options.rawBinary;
+  const consoleRom = options.consoleRom;
   if (
     options.psp === true &&
     (options.dosMz === true ||
@@ -628,35 +659,57 @@ export const ghidraHeadlessArguments = (
             "-cspec",
             "default",
           ]
-        : rawBinary === undefined
-          ? options.psp === true
+        : consoleRom !== undefined
+          ? consoleRom.loader === "ElfLoader"
             ? [
                 "-loader",
-                "PspElfLoader",
+                "ElfLoader",
                 "-processor",
-                "Allegrex:LE:32:default",
+                consoleRom.languageId,
                 "-cspec",
-                "default",
+                consoleRom.compilerSpecId,
               ]
-            : override !== undefined
+            : [
+                "-loader",
+                "BinaryLoader",
+                "-loader-baseAddr",
+                consoleRom.languageId === "x86:LE:16:Real Mode"
+                  ? "0000:0000"
+                  : consoleRom.baseAddr,
+                "-processor",
+                consoleRom.languageId,
+                "-cspec",
+                consoleRom.compilerSpecId,
+              ]
+          : rawBinary === undefined
+            ? options.psp === true
               ? [
+                  "-loader",
+                  "PspElfLoader",
                   "-processor",
-                  override.languageId,
-                  ...(override.compilerSpecId === undefined
-                    ? []
-                    : ["-cspec", override.compilerSpecId]),
+                  "Allegrex:LE:32:default",
+                  "-cspec",
+                  "default",
                 ]
-              : []
-          : [
-              "-loader",
-              "BinaryLoader",
-              "-loader-baseAddr",
-              rawBinary.baseAddr,
-              "-processor",
-              rawBinary.languageId,
-              "-cspec",
-              rawBinary.compilerSpecId,
-            ]),
+              : override !== undefined
+                ? [
+                    "-processor",
+                    override.languageId,
+                    ...(override.compilerSpecId === undefined
+                      ? []
+                      : ["-cspec", override.compilerSpecId]),
+                  ]
+                : []
+            : [
+                "-loader",
+                "BinaryLoader",
+                "-loader-baseAddr",
+                rawBinary.baseAddr,
+                "-processor",
+                rawBinary.languageId,
+                "-cspec",
+                rawBinary.compilerSpecId,
+              ]),
     "-readOnly",
     "-deleteProject",
     "-log",
@@ -678,6 +731,13 @@ export const ghidraHeadlessArguments = (
           scriptPath.join(bridgeDirectory, "ReaGhidraPrepareRaw.java"),
           rawBinary.languageId,
           rawBinary.baseAddr,
+        ]),
+    ...(consoleRom === undefined
+      ? []
+      : [
+          "-preScript",
+          scriptPath.join(bridgeDirectory, "ReaGhidraPrepareConsole.java"),
+          consoleRom.specPath,
         ]),
     // Seeds follow any loader preparation and precede default auto-analysis.
     ...(options.seedPath === undefined
@@ -726,6 +786,7 @@ const ghidraRuntimePaths = (runtimeRoot: string) => ({
   configRoot: join(runtimeRoot, "config"),
   dataRoot: join(runtimeRoot, "data"),
   descriptorPath: join(runtimeRoot, "session.json"),
+  consoleSpecPath: join(runtimeRoot, "console-spec.tsv"),
   ownershipPath: join(runtimeRoot, "ownership.json"),
   ghidraLogPath: join(runtimeRoot, "ghidra.log"),
   scriptLogPath: join(runtimeRoot, "script.log"),

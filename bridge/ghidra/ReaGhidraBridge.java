@@ -202,15 +202,20 @@ public final class ReaGhidraBridge extends HeadlessScript {
         sessionDefaultAddressSpace =
             currentProgram.getAddressFactory().getDefaultAddressSpace();
         if (currentProgram.getExecutableFormat().equals("Raw Binary")) {
-            boolean dosCom = currentProgram.getLanguageID().getIdAsString()
-                .equals("x86:LE:16:Real Mode");
-            String preparation = dosCom ? "REA DOS COM prepared" : "REA raw binary prepared";
-            if (!currentProgram.getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO)
-                .getBoolean(preparation, false)) {
-                throw new IllegalStateException(
-                    dosCom ? "REA DOS COM entry/context preparation failed" :
-                        "REA raw binary entry preparation failed"
-                );
+            boolean consolePrepared = currentProgram
+                .getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO)
+                .getBoolean("REA console prepared", false);
+            if (!consolePrepared) {
+                boolean dosCom = currentProgram.getLanguageID().getIdAsString()
+                    .equals("x86:LE:16:Real Mode");
+                String preparation = dosCom ? "REA DOS COM prepared" : "REA raw binary prepared";
+                if (!currentProgram.getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO)
+                    .getBoolean(preparation, false)) {
+                    throw new IllegalStateException(
+                        dosCom ? "REA DOS COM entry/context preparation failed" :
+                            "REA raw binary entry preparation failed"
+                    );
+                }
             }
         }
         if (!Application.getApplicationVersion().equals(descriptor.providerVersion)) {

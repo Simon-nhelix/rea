@@ -1,4 +1,5 @@
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import { isConsoleTargetFormat } from "../domain/consoleRom.js";
 import { ghidraMipsUnsupportedReason } from "./GhidraMipsProfile.js";
 import { ghidraPowerPcUnsupportedReason } from "./GhidraPowerPcProfile.js";
 import { ghidraRiscvUnsupportedReason } from "./GhidraRiscvProfile.js";
@@ -15,6 +16,8 @@ export const isGhidraPspTarget = (target: BinaryTarget): boolean =>
 export const ghidraProcessorUnsupportedReason = (
   target: BinaryTarget,
 ): string | null => {
+  if (target.kind === "executable" && isConsoleTargetFormat(target.format))
+    return null;
   if (target.kind === "executable" && target.architecture === "powerpc")
     return ghidraPowerPcUnsupportedReason(target);
   if (target.kind === "executable" && target.architecture === "riscv")

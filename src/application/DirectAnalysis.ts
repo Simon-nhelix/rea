@@ -77,7 +77,9 @@ type DirectAnalysisTool =
   | "xrefs"
   | "trace_feature"
   | "trace_native_ui_action"
-  | "trace_native_values";
+  | "trace_native_values"
+  | "search_rom_strings"
+  | "scan_pointer_table";
 
 /**
  * Open one binary, execute one tool, and always release provider resources.
@@ -399,7 +401,9 @@ const executeAnalysisTool = async (input: {
     tool === "inspect_native_dispatch_metadata" ||
     tool === "trace_feature" ||
     tool === "trace_native_values" ||
-    tool === "trace_native_ui_action"
+    tool === "trace_native_ui_action" ||
+    tool === "search_rom_strings" ||
+    tool === "scan_pointer_table"
   ) {
     const { EnhancedTools } = await import("./EnhancedTools.js");
     const result = await executeComposedWorkflow(session, (observed) =>
@@ -594,7 +598,9 @@ const isWorkflowEvidenceTool = (
   tool === "inspect_native_dispatch_metadata" ||
   tool === "trace_feature" ||
   tool === "trace_native_values" ||
-  tool === "trace_native_ui_action";
+  tool === "trace_native_ui_action" ||
+  tool === "search_rom_strings" ||
+  tool === "scan_pointer_table";
 
 const fileExists = async (path: string): Promise<boolean> => {
   try {

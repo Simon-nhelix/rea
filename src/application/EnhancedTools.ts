@@ -46,6 +46,10 @@ import { traceCallPath } from "./CallPathTracing.js";
 import { resolveProcedureAddress } from "./ProcedureAddressResolution.js";
 import { traceLiteralFeature } from "./EnhancedLiteralTracing.js";
 import { projectNativeApiInspection } from "./native/NativeApiInspection.js";
+import {
+  executeScanPointerTable,
+  executeSearchRomStrings,
+} from "./romhacking/RomHackingTools.js";
 
 /**
  * Composes direct provider operations into bounded reverse-engineering tools.
@@ -127,6 +131,18 @@ export class EnhancedTools {
           ? this.executeValidated({ name, input: parsed.data }, signal)
           : invalidEnhancedInput(name, parsed.error);
       }
+      case "search_rom_strings": {
+        const parsed = enhancedInputSchemas.search_rom_strings.safeParse(input);
+        return parsed.success
+          ? this.executeValidated({ name, input: parsed.data }, signal)
+          : invalidEnhancedInput(name, parsed.error);
+      }
+      case "scan_pointer_table": {
+        const parsed = enhancedInputSchemas.scan_pointer_table.safeParse(input);
+        return parsed.success
+          ? this.executeValidated({ name, input: parsed.data }, signal)
+          : invalidEnhancedInput(name, parsed.error);
+      }
     }
   }
 
@@ -182,6 +198,10 @@ export class EnhancedTools {
       case "trace_native_ui_action": {
         return traceNativeUiAction(this.analysis, call.input, signal);
       }
+      case "search_rom_strings":
+        return executeSearchRomStrings(this.analysis, call.input, signal);
+      case "scan_pointer_table":
+        return executeScanPointerTable(this.analysis, call.input, signal);
     }
   }
 

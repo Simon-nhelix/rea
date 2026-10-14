@@ -1,9 +1,14 @@
 import { z } from "zod";
+import { CONSOLE_TARGET_FORMATS } from "./consoleRom.js";
 import { err, ok, type Result } from "./result.js";
 
-/** Headerless executable interpretation explicitly selected by the caller. */
-export const executableFormatHintSchema = z.enum(["dos-com", "raw-binary"]);
-/** Explicit executable interpretation for formats with no identifying header. */
+/** Explicit executable or console ROM interpretation selected by the caller. */
+export const executableFormatHintSchema = z.enum([
+  "dos-com",
+  "raw-binary",
+  ...CONSOLE_TARGET_FORMATS,
+]);
+/** Explicit executable interpretation for raw, DOS COM, or console targets. */
 export type ExecutableFormatHint = z.infer<typeof executableFormatHintSchema>;
 
 /** Validate the single 64 KiB COM segment, excluding its 256-byte PSP prefix. */

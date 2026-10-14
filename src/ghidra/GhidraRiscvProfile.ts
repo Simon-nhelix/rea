@@ -1,4 +1,5 @@
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import { isConsoleTargetFormat } from "../domain/consoleRom.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type { GhidraLanguageOverride } from "../config/ghidraLanguageOverride.js";
 
@@ -44,7 +45,11 @@ const riscvUnsupportedFloatAbi = (abi: number): string =>
 export const ghidraRiscvUnsupportedReason = (
   target: BinaryTarget,
 ): string | null => {
-  if (target.kind !== "executable" || target.architecture !== "riscv")
+  if (
+    target.kind !== "executable" ||
+    isConsoleTargetFormat(target.format) ||
+    target.architecture !== "riscv"
+  )
     return null;
   const metadata = target.riscv;
   if (target.format !== "elf")
@@ -81,6 +86,7 @@ export const ghidraRiscvLanguageOverride = (
   target: BinaryTarget,
 ): GhidraLanguageOverride | undefined =>
   target.kind === "executable" &&
+  !isConsoleTargetFormat(target.format) &&
   target.architecture === "riscv" &&
   ghidraRiscvUnsupportedReason(target) === null
     ? {
@@ -94,6 +100,7 @@ export const ghidraRiscvProfileParameters = (
   target: BinaryTarget,
 ): Readonly<Record<string, JsonValue>> =>
   target.kind === "executable" &&
+  !isConsoleTargetFormat(target.format) &&
   target.architecture === "riscv" &&
   target.riscv !== undefined
     ? {
@@ -120,7 +127,9 @@ export const ghidraRiscvProfileParameters = (
 export const ghidraRiscvLimitations = (
   target: BinaryTarget,
 ): readonly string[] =>
-  target.kind === "executable" && target.architecture === "riscv"
+  target.kind === "executable" &&
+  !isConsoleTargetFormat(target.format) &&
+  target.architecture === "riscv"
     ? [
         `RISC-V ELF: REA pins Ghidra's generic \`RISCV:LE:${target.riscv.elfClass}:default\` language with the \`gcc\` compiler specification instead of accepting the loader's header-based choice, which selects \`RISCV:LE:32:AndeStar_v5\` for ordinary RV32 images on Ghidra 12.1.4.`,
         "The pinned generic language models the double-float ABI declared by `e_flags`; the declaration is recorded as an ELF fact and is not evidence of the original compiler or of verified instruction semantics.",

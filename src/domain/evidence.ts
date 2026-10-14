@@ -11,9 +11,11 @@ import {
 } from "./analysisProfile.js";
 import {
   BINARY_ARCHITECTURES,
+  CONSOLE_ONLY_ARCHITECTURES,
   type BinaryArchitecture,
   type BinaryTarget,
 } from "./binaryTargetTypes.js";
+import { CONSOLE_TARGET_FORMATS } from "./consoleRom.js";
 import {
   jsonObjectSchema,
   jsonValueSchema,
@@ -47,6 +49,7 @@ const subjectFormatSchema = z.enum([
   "dos-mz",
   "dos-com",
   "raw-binary",
+  ...CONSOLE_TARGET_FORMATS,
   "zip",
   "ipa",
   "apk",
@@ -76,11 +79,21 @@ const subjectBaseSchema = z.strictObject({
 // The format owns the architecture claim, including nested Evidence subjects.
 const subjectSchema = z.discriminatedUnion("format", [
   subjectBaseSchema.extend({
-    format: subjectFormatSchema.exclude(["raw-binary"]),
-    architecture: z.enum(BINARY_ARCHITECTURES).exclude(["6502"]).nullable(),
+    format: subjectFormatSchema.exclude([
+      "raw-binary",
+      ...CONSOLE_TARGET_FORMATS,
+    ]),
+    architecture: z
+      .enum(BINARY_ARCHITECTURES)
+      .exclude(CONSOLE_ONLY_ARCHITECTURES)
+      .nullable(),
   }),
   subjectBaseSchema.extend({
     format: z.literal("raw-binary"),
+    architecture: z.enum(BINARY_ARCHITECTURES).nullable(),
+  }),
+  subjectBaseSchema.extend({
+    format: z.enum(CONSOLE_TARGET_FORMATS),
     architecture: z.enum(BINARY_ARCHITECTURES).nullable(),
   }),
 ]);

@@ -1,5 +1,9 @@
 import { z } from "zod";
 import { nativeValueTraceInputSchema } from "../domain/native/nativeValueTrace.js";
+import {
+  scanPointerTableInputSchema,
+  searchRomStringsInputSchema,
+} from "../domain/romHacking.js";
 const traceLiteralInputSchema = z.strictObject({
   query: z.string().min(1),
   case_sensitive: z.boolean().default(false),
@@ -68,6 +72,8 @@ export const enhancedInputSchemas = {
     max_nodes: z.number().int().min(1).max(2_000).default(250),
     max_edges: z.number().int().min(1).max(5_000).default(500),
   }),
+  search_rom_strings: searchRomStringsInputSchema,
+  scan_pointer_table: scanPointerTableInputSchema,
 } as const;
 
 export type EnhancedToolName = keyof typeof enhancedInputSchemas;

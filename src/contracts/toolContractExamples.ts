@@ -52,6 +52,8 @@ export const TOOL_EXAMPLE_OVERRIDES: Readonly<
   trace_feature: { query: "license" },
   trace_call_path: { start: "0x1000", goal: "0x1100" },
   trace_native_ui_action: { action: "buildTapped:" },
+  search_rom_strings: { query: "勇者", encoding: "sjis" },
+  scan_pointer_table: { address: "0x08001000", count: 16 },
   open_binary: { path: "/tmp/fixture" },
   export_evidence_bundle: { path: "/tmp/evidence.json" },
   get_evidence_bundle: {

@@ -134,6 +134,8 @@ export const admitRawBinary = (input: {
   });
 };
 
+import { isConsoleTargetFormat } from "./consoleRom.js";
+
 /** Describe the format/architecture/entry pairing without performing I/O. */
 export const rawBinarySelectionError = (input: {
   readonly format?: ExecutableFormatHint;
@@ -145,6 +147,11 @@ export const rawBinarySelectionError = (input: {
   if (input.format === "raw-binary") {
     if (!hasArchitecture || !hasEntry)
       return "format=raw-binary requires architecture and entry_point";
+    return undefined;
+  }
+  if (isConsoleTargetFormat(input.format)) {
+    if (hasArchitecture)
+      return "architecture and entry_point apply only with format=raw-binary";
     return undefined;
   }
   if (hasArchitecture || hasEntry)

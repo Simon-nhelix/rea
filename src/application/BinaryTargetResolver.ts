@@ -23,6 +23,12 @@ import {
   type ResolvedAppBundle,
 } from "./AppBundleExecutable.js";
 import {
+  admitConsoleTarget,
+  detectConsoleFormatFromHeader,
+  isConsoleTargetFormat,
+  type ConsoleTargetFormat,
+} from "../domain/consoleRom.js";
+import {
   validateDosComLength,
   type ExecutableFormatHint,
 } from "../domain/dosCom.js";
@@ -54,6 +60,7 @@ import {
 import type { PeCodeViewRecord } from "../domain/binaryTargetTypes.js";
 
 const XML_PLIST_PROBE_CHUNK_BYTES = 64 * 1024;
+const CONSOLE_HEADER_PROBE_BYTES = 68 * 1024;
 
 /** Options for resolving a local binary target and its stable identity. */
 export interface BinaryTargetResolverOptions {
@@ -172,6 +179,27 @@ export const parseBinaryTarget = async (
           availableArchitectures: ["x86"],
         });
       }
+      if (formatHint !== undefined && isConsoleTargetFormat(formatHint)) {
+        if (targetKind !== undefined && targetKind !== "executable")
+          return err(
+            new BinaryTargetError(
+              path,
+              `${formatHint} format requires an executable target kind`,
+              { constraint: "load_selection_rejected" },
+            ),
+          );
+        const consoleTarget = await readConsoleBinaryTarget({
+          handle,
+          path,
+          sourcePath,
+          metadata,
+          format: formatHint,
+          entryPoint,
+          signal,
+        });
+        if (!consoleTarget.ok) return err(consoleTarget.error);
+        return ok(consoleTarget.value);
+      }
       // Probe WASM content before suffix-only database routing; an explicit
       // database selection keeps the caller's chosen interpretation.
       const artifactFormat =
@@ -198,6 +226,17 @@ export const parseBinaryTarget = async (
         return isArchiveFormat(artifactFormat)
           ? ok({ ...identity, kind: "archive", format: artifactFormat })
           : ok({ ...identity, kind: "artifact", format: artifactFormat });
+      }
+      const autoConsole = await tryAutoDetectConsoleBinaryTarget({
+        handle,
+        path,
+        sourcePath,
+        metadata,
+        signal,
+      });
+      if (autoConsole !== undefined) {
+        if (!autoConsole.ok) return err(autoConsole.error);
+        return ok(autoConsole.value);
       }
       const detected = await readExecutableMetadata(
         handle,
@@ -289,6 +328,7 @@ const detectArtifactFormat = async (
       | "dos-mz"
       | "dos-com"
       | "raw-binary"
+      | ConsoleTargetFormat
     >
   | undefined
 > => {
@@ -389,9 +429,136 @@ const isArchiveFormat = (
     | "dos-mz"
     | "dos-com"
     | "raw-binary"
+    | ConsoleTargetFormat
   >,
 ): format is Extract<BinaryTarget, { kind: "archive" }>["format"] =>
   isZipPackageFormat(format) || ["asar", "dmg", "pkg"].includes(format);
+
+const readConsoleBinaryTarget = async (input: {
+  readonly handle: FileHandle;
+  readonly path: string;
+  readonly sourcePath: string;
+  readonly metadata: Stats;
+  readonly format: ConsoleTargetFormat;
+  readonly entryPoint?: string | undefined;
+  readonly signal?: AbortSignal | undefined;
+}): Promise<Result<BinaryTarget, BinaryTargetError>> => {
+  const { handle, path, sourcePath, metadata, format, entryPoint, signal } =
+    input;
+  throwIfTargetResolutionCancelled(signal);
+  const probeLength = Math.min(metadata.size, CONSOLE_HEADER_PROBE_BYTES);
+  const prefix = Buffer.alloc(probeLength);
+  const observed =
+    probeLength > 0
+      ? await handle.read(prefix, 0, probeLength, 0)
+      : { bytesRead: 0 };
+  throwIfTargetResolutionCancelled(signal);
+  let trailerBytes: Buffer | undefined;
+  if (format === "wsc" && metadata.size >= 16) {
+    const trailerLen = Math.min(64, metadata.size);
+    const trailer = Buffer.alloc(trailerLen);
+    const readTrailer = await handle.read(
+      trailer,
+      0,
+      trailerLen,
+      metadata.size - trailerLen,
+    );
+    throwIfTargetResolutionCancelled(signal);
+    trailerBytes = trailer.subarray(0, readTrailer.bytesRead);
+  }
+  const admitted = admitConsoleTarget({
+    format,
+    headerBytes: prefix.subarray(0, observed.bytesRead),
+    trailerBytes,
+    fileBytes: metadata.size,
+    entryPoint,
+  });
+  if (!admitted.ok)
+    return err(
+      new BinaryTargetError(path, admitted.error.reason, {
+        constraint: admitted.error.constraint,
+      }),
+    );
+  return ok({
+    path,
+    sourcePath,
+    sha256: await sha256Handle(handle, path, metadata, signal),
+    kind: "executable",
+    format: admitted.value.format,
+    architecture: admitted.value.architecture,
+    availableArchitectures: [admitted.value.architecture],
+    entryPoint: admitted.value.entryPoint,
+    entryPointSource: admitted.value.entryPointSource,
+    consoleRom: admitted.value,
+  });
+};
+
+const tryAutoDetectConsoleBinaryTarget = async (input: {
+  readonly handle: FileHandle;
+  readonly path: string;
+  readonly sourcePath: string;
+  readonly metadata: Stats;
+  readonly signal?: AbortSignal | undefined;
+}): Promise<Result<BinaryTarget, BinaryTargetError> | undefined> => {
+  const { handle, path, sourcePath, metadata, signal } = input;
+  throwIfTargetResolutionCancelled(signal);
+  const probeLength = Math.min(metadata.size, CONSOLE_HEADER_PROBE_BYTES);
+  if (probeLength === 0) return undefined;
+  const prefix = Buffer.alloc(probeLength);
+  const observed = await handle.read(prefix, 0, probeLength, 0);
+  throwIfTargetResolutionCancelled(signal);
+  const bytes = prefix.subarray(0, observed.bytesRead);
+  const lowerPath = path.toLowerCase();
+  const detectedFormat = detectConsoleFormatFromHeader(
+    bytes,
+    metadata.size,
+    lowerPath,
+  );
+  if (detectedFormat === undefined) return undefined;
+  let trailerBytes: Buffer | undefined;
+  if (detectedFormat === "wsc" && metadata.size >= 16) {
+    const trailerLen = Math.min(64, metadata.size);
+    const trailer = Buffer.alloc(trailerLen);
+    const readTrailer = await handle.read(
+      trailer,
+      0,
+      trailerLen,
+      metadata.size - trailerLen,
+    );
+    throwIfTargetResolutionCancelled(signal);
+    trailerBytes = trailer.subarray(0, readTrailer.bytesRead);
+  }
+  const admitted = admitConsoleTarget({
+    format: detectedFormat,
+    headerBytes: bytes,
+    trailerBytes,
+    fileBytes: metadata.size,
+  });
+  if (!admitted.ok) {
+    // Magic-detected console formats report their specific admission failure;
+    // suffix-detected formats fall through if they are not valid console ROMs.
+    if (["psx-exe", "nes", "ps2-elf", "gba", "gb"].includes(detectedFormat)) {
+      return err(
+        new BinaryTargetError(path, admitted.error.reason, {
+          constraint: admitted.error.constraint,
+        }),
+      );
+    }
+    return undefined;
+  }
+  return ok({
+    path,
+    sourcePath,
+    sha256: await sha256Handle(handle, path, metadata, signal),
+    kind: "executable",
+    format: admitted.value.format,
+    architecture: admitted.value.architecture,
+    availableArchitectures: [admitted.value.architecture],
+    entryPoint: admitted.value.entryPoint,
+    entryPointSource: admitted.value.entryPointSource,
+    consoleRom: admitted.value,
+  });
+};
 
 const sha256Handle = async (
   handle: FileHandle,

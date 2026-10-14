@@ -17,8 +17,11 @@ import {
 } from "./analysisProfile.js";
 import {
   BINARY_ARCHITECTURES,
+  CONSOLE_ONLY_ARCHITECTURES,
+  isConsoleBinaryTarget,
   type BinaryTarget,
 } from "./binaryTargetTypes.js";
+import { CONSOLE_TARGET_FORMATS } from "./consoleRom.js";
 import {
   evidenceBundleForTarget,
   evidenceBundleSchema,
@@ -60,6 +63,7 @@ const formatSchema = z.enum([
   "dos-mz",
   "dos-com",
   "raw-binary",
+  ...CONSOLE_TARGET_FORMATS,
   "zip",
   "ipa",
   "apk",
@@ -92,11 +96,20 @@ const subjectFormatSchema = z.enum([
 // Snapshot entries retain the same raw-only architecture boundary as targets.
 const subjectSchema = z.discriminatedUnion("format", [
   subjectBaseSchema.extend({
-    format: subjectFormatSchema.exclude(["raw-binary"]),
-    architecture: architectureSchema.exclude(["6502"]).nullable(),
+    format: subjectFormatSchema.exclude([
+      "raw-binary",
+      ...CONSOLE_TARGET_FORMATS,
+    ]),
+    architecture: architectureSchema
+      .exclude(CONSOLE_ONLY_ARCHITECTURES)
+      .nullable(),
   }),
   subjectBaseSchema.extend({
     format: z.literal("raw-binary"),
+    architecture: architectureSchema.nullable(),
+  }),
+  subjectBaseSchema.extend({
+    format: z.enum(CONSOLE_TARGET_FORMATS),
     architecture: architectureSchema.nullable(),
   }),
 ]);
@@ -107,15 +120,21 @@ const targetIdentitySchema = z.object({
 });
 const targetSchema = z.discriminatedUnion("format", [
   targetIdentitySchema.extend({
-    format: z.enum(
-      formatSchema.options.filter((format) => format !== "raw-binary"),
-    ),
-    architecture: architectureSchema.exclude(["6502"]).nullable(),
+    format: formatSchema.exclude(["raw-binary", ...CONSOLE_TARGET_FORMATS]),
+    architecture: architectureSchema
+      .exclude(CONSOLE_ONLY_ARCHITECTURES)
+      .nullable(),
   }),
   targetIdentitySchema.extend({
     format: z.literal("raw-binary"),
     kind: z.literal("executable"),
     architecture: binaryArchitectureSchema,
+    entry_point: rawBinaryEntryPointSchema,
+  }),
+  targetIdentitySchema.extend({
+    format: z.enum(CONSOLE_TARGET_FORMATS),
+    kind: z.literal("executable"),
+    architecture: architectureSchema,
     entry_point: rawBinaryEntryPointSchema,
   }),
 ]);
@@ -348,21 +367,32 @@ const canonicalJson = (value: unknown): string => {
 };
 
 /** Project a binary into the path-free identity used for cache invalidation. */
-export const snapshotTarget = (target: BinaryTarget): AnalysisSnapshotTarget =>
-  target.format === "raw-binary"
-    ? {
-        sha256: target.sha256,
-        kind: target.kind,
-        architecture: target.architecture,
-        format: target.format,
-        entry_point: target.entryPoint,
-      }
-    : {
-        sha256: target.sha256,
-        kind: target.kind,
-        architecture: target.architecture ?? null,
-        format: target.format,
-      };
+export const snapshotTarget = (
+  target: BinaryTarget,
+): AnalysisSnapshotTarget => {
+  if (target.format === "raw-binary")
+    return {
+      sha256: target.sha256,
+      kind: target.kind,
+      architecture: target.architecture,
+      format: target.format,
+      entry_point: target.entryPoint,
+    };
+  if (isConsoleBinaryTarget(target))
+    return {
+      sha256: target.sha256,
+      kind: target.kind,
+      architecture: target.architecture,
+      format: target.format,
+      entry_point: target.entryPoint,
+    };
+  return {
+    sha256: target.sha256,
+    kind: target.kind,
+    architecture: target.architecture ?? null,
+    format: target.format,
+  };
+};
 
 /** Build the immutable provider/profile binding used by a cached snapshot. */
 export const snapshotBinding = (
@@ -377,14 +407,22 @@ export const snapshotBinding = (
 export const snapshotMatchesTarget = (
   snapshot: AnalysisSnapshotTarget,
   target: BinaryTarget,
-): boolean =>
-  snapshot.sha256 === target.sha256 &&
-  snapshot.kind === target.kind &&
-  snapshot.format === target.format &&
-  snapshot.architecture === (target.architecture ?? null) &&
-  (snapshot.format !== "raw-binary" ||
-    (target.format === "raw-binary" &&
-      snapshot.entry_point === target.entryPoint));
+): boolean => {
+  if (
+    snapshot.sha256 !== target.sha256 ||
+    snapshot.kind !== target.kind ||
+    snapshot.format !== target.format ||
+    snapshot.architecture !== (target.architecture ?? null)
+  )
+    return false;
+  if ("entry_point" in snapshot) {
+    return (
+      (target.format === "raw-binary" || isConsoleBinaryTarget(target)) &&
+      snapshot.entry_point === target.entryPoint
+    );
+  }
+  return true;
+};
 
 /** Compare a snapshot binding with the selected concrete analysis profile. */
 export const snapshotMatchesProfile = (

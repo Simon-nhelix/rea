@@ -22,7 +22,10 @@ import {
 } from "./GhidraAnalysisProfile.js";
 import { ghidraPinnedMipsLanguage } from "./GhidraMipsProfile.js";
 import type { AnalysisProfileCommitment } from "../domain/analysisProfile.js";
-import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import {
+  isConsoleBinaryTarget,
+  type BinaryTarget,
+} from "../domain/binaryTargetTypes.js";
 import {
   AnalysisCancelledError,
   AnalysisArtifactChangedError,
@@ -105,6 +108,7 @@ import {
 } from "./extensions/GhidraExtensions.js";
 import { inspectWindowsNativeReadiness } from "../process/WindowsAuthority.js";
 import { ghidraRawBinaryLanguage } from "./GhidraRawBinaryLanguage.js";
+import { isConsoleTargetFormat } from "../domain/consoleRom.js";
 
 /** Production seam for exercising provider projection without a real process. */
 export type GhidraProviderClientFactory = (
@@ -541,6 +545,9 @@ export const createGhidraProviderClient = (input: {
     target.format === "raw-binary"
       ? ghidraRawBinaryLanguage(target.architecture)
       : undefined;
+  const consoleRom = isConsoleBinaryTarget(target)
+    ? target.consoleRom
+    : undefined;
   const targetLimitations = [
     ...(target.format === "dos-mz"
       ? [
@@ -555,7 +562,14 @@ export const createGhidraProviderClient = (input: {
           "Static analysis does not emulate reset vectors, memory-mapped I/O, or firmware boot sequences.",
         ]
       : []),
-    ...(target.kind === "executable" && target.architecture === "mips"
+    ...(consoleRom !== undefined
+      ? [
+          `Console ROM/executable profile (${consoleRom.format}) maps file-backed segments and hardware RAM/MMIO regions statically using Ghidra language ${consoleRom.ghidraLanguageId}. Dynamic bank switching, DMA transfers, and hardware interrupts are not emulated.`,
+        ]
+      : []),
+    ...(target.kind === "executable" &&
+    !isConsoleTargetFormat(target.format) &&
+    target.architecture === "mips"
       ? (target.mips.limitations ?? [])
       : []),
     ...(committedProfile.parameters.mips_abi_basis ===
@@ -605,6 +619,7 @@ export const createGhidraProviderClient = (input: {
               baseAddr: target.entryPoint,
             },
           }),
+      ...(consoleRom === undefined ? {} : { consoleRom }),
       ...(importLanguage === undefined
         ? {}
         : { languageOverride: importLanguage }),
@@ -631,19 +646,24 @@ export const createGhidraProviderClient = (input: {
           expectedLanguageId: "x86:LE:16:Real Mode",
           expectedCompilerSpecId: "default",
         }
-      : rawLanguage === undefined
-        ? importLanguage === undefined
-          ? {}
+      : consoleRom !== undefined
+        ? {
+            expectedLanguageId: consoleRom.ghidraLanguageId,
+            expectedCompilerSpecId: consoleRom.compilerSpecId,
+          }
+        : rawLanguage === undefined
+          ? importLanguage === undefined
+            ? {}
+            : {
+                expectedLanguageId: importLanguage.languageId,
+                ...(importLanguage.compilerSpecId === undefined
+                  ? {}
+                  : { expectedCompilerSpecId: importLanguage.compilerSpecId }),
+              }
           : {
-              expectedLanguageId: importLanguage.languageId,
-              ...(importLanguage.compilerSpecId === undefined
-                ? {}
-                : { expectedCompilerSpecId: importLanguage.compilerSpecId }),
-            }
-        : {
-            expectedLanguageId: rawLanguage.languageId,
-            expectedCompilerSpecId: rawLanguage.compilerSpecId,
-          }),
+              expectedLanguageId: rawLanguage.languageId,
+              expectedCompilerSpecId: rawLanguage.compilerSpecId,
+            }),
     ...(psp
       ? {
           expectedLanguageId: "Allegrex:LE:32:default",

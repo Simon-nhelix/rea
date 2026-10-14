@@ -20,6 +20,7 @@ import {
   isElfMetadataArchitecture,
   type BinaryTarget,
 } from "../domain/binaryTargetTypes.js";
+import { isConsoleTargetFormat } from "../domain/consoleRom.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type { Logger } from "pino";
 import { AnalysisCapabilityUnavailableError } from "../domain/analysisErrorCore.js";
@@ -148,6 +149,14 @@ export class HopperProvider implements AnalysisProviderCandidate {
         code: "target_format_unsupported",
         reason:
           "Headerless raw-binary analysis requires the Ghidra adapter with a caller-supplied architecture and entry point.",
+        diagnostics,
+      };
+    if (isConsoleTargetFormat(target.format))
+      return {
+        status: "unsupported",
+        code: "target_format_unsupported",
+        reason:
+          "Console ROM and executable analysis requires the Ghidra adapter.",
         diagnostics,
       };
     if (target.format === "dos-mz" || target.format === "dos-com")

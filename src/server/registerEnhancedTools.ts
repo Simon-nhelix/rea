@@ -74,6 +74,8 @@ export const registerEnhancedTools = (
   const traceCallPath = toolContract("trace_call_path");
   const traceNativeUiAction = toolContract("trace_native_ui_action");
   const traceNativeValues = toolContract("trace_native_values");
+  const searchRomStrings = toolContract("search_rom_strings");
+  const scanPointerTable = toolContract("scan_pointer_table");
   server.registerTool(
     traceNativeValues.name,
     toolRegistrationOptions(traceNativeValues),
@@ -197,6 +199,24 @@ export const registerEnhancedTools = (
     (input, context) =>
       executeEnhancedTool(registration, traceNativeUiAction, {
         validatedCall: { name: "trace_native_ui_action", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    searchRomStrings.name,
+    toolRegistrationOptions(searchRomStrings),
+    (input, context) =>
+      executeEnhancedTool(registration, searchRomStrings, {
+        validatedCall: { name: "search_rom_strings", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    scanPointerTable.name,
+    toolRegistrationOptions(scanPointerTable),
+    (input, context) =>
+      executeEnhancedTool(registration, scanPointerTable, {
+        validatedCall: { name: "scan_pointer_table", input },
         context,
       }),
   );

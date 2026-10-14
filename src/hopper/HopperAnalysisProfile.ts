@@ -7,11 +7,11 @@ import type {
 } from "../application/AnalysisProvider.js";
 import { createAnalysisProfile } from "../domain/analysisProfile.js";
 import {
+  isConsoleBinaryTarget,
   isMachOFormat,
   isElfMetadataArchitecture,
   type BinaryTarget,
   type ElfMetadataArchitecture,
-  type HeaderArchitecture,
 } from "../domain/binaryTargetTypes.js";
 import {
   AnalysisCancelledError,
@@ -125,7 +125,7 @@ export const hopperLoaderArgsForTarget = (
   if (target.kind === "database") return ok([]);
   if (target.kind !== "executable")
     return err(new ProviderAdapterError("hopper", "resolve_analysis_profile"));
-  if (target.format === "raw-binary")
+  if (target.format === "raw-binary" || isConsoleBinaryTarget(target))
     return err(new ProviderAdapterError("hopper", "resolve_analysis_profile"));
   const architecture = target.architecture;
   if (isElfMetadataArchitecture(architecture))
@@ -165,7 +165,9 @@ export const hopperLoaderArgsForTarget = (
   }
 };
 
-const hopperArchitectureFlag = (architecture: HeaderArchitecture): string => {
+const hopperArchitectureFlag = (
+  architecture: "x86" | "x86_64" | "arm" | "arm64",
+): string => {
   switch (architecture) {
     case "x86":
       return "--intel-32";

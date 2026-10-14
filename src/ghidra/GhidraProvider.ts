@@ -70,6 +70,9 @@ const SUPPORTED_ARCHITECTURES = new Set([
   "arm64",
   "mips",
   "6502",
+  "65816",
+  "sh4",
+  "sm83",
   "riscv",
   "powerpc",
 ]);

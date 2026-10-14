@@ -42,6 +42,8 @@ export const CLI_COMMANDS = Object.freeze({
   readBytes: "read-bytes",
   searchBytes: "search-bytes",
   addressToFileOffset: "address-to-file-offset",
+  searchRomStrings: "search-rom-strings",
+  scanPointerTable: "scan-pointer-table",
   traceNativeValues: "trace-native-values",
   inspectNativeInstruction: "inspect-native-instruction",
   resolveNativeCallTargets: "resolve-native-call-targets",

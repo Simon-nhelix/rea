@@ -127,6 +127,13 @@ const ENHANCED_REQUIREMENTS: Readonly<
     "xrefs",
     "resolve_containing_procedure",
   ],
+  search_rom_strings: [
+    "read_bytes",
+    "search_bytes",
+    "address_to_file_offset",
+    "xrefs",
+  ],
+  scan_pointer_table: ["read_bytes", "address_to_file_offset", "xrefs"],
 };
 
 /** Contract kinds whose operations run on the active session target. */

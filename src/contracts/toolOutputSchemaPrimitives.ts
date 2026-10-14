@@ -24,6 +24,7 @@ import {
 } from "../domain/providerOperationHealth.js";
 import { analysisErrorProjectionSchema } from "./errorSchemas.js";
 import { relationshipCoverageSchema } from "../domain/relationshipCoverage.js";
+import { CONSOLE_TARGET_FORMATS } from "../domain/consoleRom.js";
 import { ZIP_PACKAGE_FORMATS } from "../domain/zipPackageFormat.js";
 
 /** Specialize the single normalized result inside a complete Evidence record. */
@@ -60,6 +61,7 @@ export const targetFormatSchema = z.enum([
   "dos-mz",
   "dos-com",
   "raw-binary",
+  ...CONSOLE_TARGET_FORMATS,
   ...ZIP_PACKAGE_FORMATS,
   "asar",
   "dmg",

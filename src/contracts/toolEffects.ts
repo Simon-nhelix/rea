@@ -560,6 +560,8 @@ export const TOOL_EFFECTS: Readonly<Record<string, ToolEffects>> = {
   inspect_native_api: effects({ mutatesSession: true, idempotent: false }),
   trace_feature: effects({ mutatesSession: true, idempotent: false }),
   trace_call_path: effects({ mutatesSession: true, idempotent: false }),
+  search_rom_strings: evidence,
+  scan_pointer_table: evidence,
   observe_native_ui: effects({
     mutatesSession: true,
     launchesProcess: true,

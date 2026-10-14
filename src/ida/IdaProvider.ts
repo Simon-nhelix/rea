@@ -5,6 +5,7 @@ import {
   isElfMetadataArchitecture,
   type BinaryTarget,
 } from "../domain/binaryTargetTypes.js";
+import { isConsoleTargetFormat } from "../domain/consoleRom.js";
 import { err, ok } from "../domain/result.js";
 import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import type {
@@ -139,6 +140,14 @@ export class IdaProvider implements AnalysisProviderCandidate {
         code: "target_format_unsupported",
         reason:
           "IDA does not admit headerless raw binaries. Open the target with Ghidra and supply architecture and entry_point.",
+        diagnostics,
+      };
+    if (isConsoleTargetFormat(target.format))
+      return {
+        status: "unsupported",
+        code: "target_format_unsupported",
+        reason:
+          "Console ROM and executable analysis requires the Ghidra adapter.",
         diagnostics,
       };
     return { status: "supported", code: null, reason: null, diagnostics };

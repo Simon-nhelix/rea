@@ -1,6 +1,12 @@
+import {
+  isConsoleTargetFormat,
+  type ConsoleArchitecture,
+  type ConsoleTargetAdmission,
+  type ConsoleTargetFormat,
+} from "./consoleRom.js";
 import type { ZipPackageFormat } from "./zipPackageFormat.js";
 
-/** Provider-neutral CPU families detected from headers or explicitly selected raw loads. */
+/** Provider-neutral CPU families detected from headers or explicitly selected raw/console loads. */
 export const BINARY_ARCHITECTURES = [
   "x86",
   "x86_64",
@@ -8,6 +14,12 @@ export const BINARY_ARCHITECTURES = [
   "arm64",
   "mips",
   "6502",
+  "65816",
+  "sh4",
+  "sm83",
+  "r3000",
+  "r5900",
+  "gekko",
   "riscv",
   "powerpc",
 ] as const;
@@ -48,10 +60,23 @@ export const isElfMetadataArchitecture = (
 ): architecture is ElfMetadataArchitecture =>
   (ELF_METADATA_ARCHITECTURES as readonly string[]).includes(architecture);
 
+/** CPU architectures used only by raw-binary or console ROM targets. */
+export const CONSOLE_ONLY_ARCHITECTURES = [
+  "6502",
+  "65816",
+  "sh4",
+  "sm83",
+  "r3000",
+  "r5900",
+  "gekko",
+] as const satisfies readonly BinaryArchitecture[];
+export type ConsoleOnlyArchitecture =
+  (typeof CONSOLE_ONLY_ARCHITECTURES)[number];
+
 /** Recognized family with no ELF metadata member; the header alone is the fact. */
 export type HeaderArchitecture = Exclude<
   BinaryArchitecture,
-  ElfMetadataArchitecture | "6502"
+  ElfMetadataArchitecture | ConsoleOnlyArchitecture
 >;
 
 /** Raw ELF facts; family recognition does not establish ISA or ABI support. */
@@ -172,17 +197,18 @@ export type BinaryTarget =
       readonly format: "raw-binary";
       readonly architecture: Exclude<
         BinaryArchitecture,
-        ElfMetadataArchitecture
+        ElfMetadataArchitecture | Exclude<ConsoleOnlyArchitecture, "6502">
       >;
       readonly availableArchitectures: readonly Exclude<
         BinaryArchitecture,
-        ElfMetadataArchitecture
+        ElfMetadataArchitecture | Exclude<ConsoleOnlyArchitecture, "6502">
       >[];
       readonly entryPoint: string;
       readonly entryPointSource: string;
       readonly executableRole?: never;
       readonly managed?: never;
     })
+  | ConsoleBinaryTarget
   | (ExecutableTarget & {
       readonly format: "pe";
       /** Provider-neutral PE image role observed from COFF characteristics. */
@@ -210,6 +236,23 @@ export type BinaryTarget =
         readonly kind: "artifact";
         readonly format: "plist" | "javascript" | "source-map";
       });
+
+export type ConsoleBinaryTarget = BinaryTargetIdentity & {
+  readonly kind: "executable";
+  readonly format: ConsoleTargetFormat;
+  readonly architecture: ConsoleArchitecture;
+  readonly availableArchitectures: readonly ConsoleArchitecture[];
+  readonly entryPoint: string;
+  readonly entryPointSource: string;
+  readonly consoleRom: ConsoleTargetAdmission;
+  readonly executableRole?: never;
+  readonly managed?: never;
+};
+
+/** Whether a parsed BinaryTarget is a video-game console ROM or executable. */
+export const isConsoleBinaryTarget = (
+  target: BinaryTarget,
+): target is ConsoleBinaryTarget => isConsoleTargetFormat(target.format);
 
 /** Whether an executable target contains a thin or universal Mach-O image. */
 export const isMachOFormat = (

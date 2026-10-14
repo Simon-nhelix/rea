@@ -1,5 +1,6 @@
 import type { GhidraLanguageOverride } from "../config/ghidraLanguageOverride.js";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import { isConsoleTargetFormat } from "../domain/consoleRom.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 
 /**
@@ -16,7 +17,11 @@ export const GHIDRA_POWERPC_LANGUAGE: GhidraLanguageOverride = {
 export const ghidraPowerPcUnsupportedReason = (
   target: BinaryTarget,
 ): string | null => {
-  if (target.kind !== "executable" || target.architecture !== "powerpc")
+  if (
+    target.kind !== "executable" ||
+    isConsoleTargetFormat(target.format) ||
+    target.architecture !== "powerpc"
+  )
     return null;
   const metadata = target.powerpc;
   if (target.format !== "elf" || metadata === undefined)
@@ -41,7 +46,9 @@ export const ghidraPowerPcUnsupportedReason = (
 export const ghidraPowerPcLanguage = (
   target: BinaryTarget,
 ): GhidraLanguageOverride | undefined =>
-  target.kind === "executable" && target.architecture === "powerpc"
+  target.kind === "executable" &&
+  !isConsoleTargetFormat(target.format) &&
+  target.architecture === "powerpc"
     ? GHIDRA_POWERPC_LANGUAGE
     : undefined;
 
@@ -51,6 +58,7 @@ export const ghidraPowerPcProfileParameters = (
 ): Readonly<Record<string, JsonValue>> => {
   if (
     target.kind !== "executable" ||
+    isConsoleTargetFormat(target.format) ||
     target.architecture !== "powerpc" ||
     target.powerpc === undefined
   )
