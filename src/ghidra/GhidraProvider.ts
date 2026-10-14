@@ -73,6 +73,12 @@ const SUPPORTED_ARCHITECTURES = new Set([
   "65816",
   "sh4",
   "sm83",
+  "r3000",
+  "r5900",
+  "allegrex",
+  "cell-ppu",
+  "xenon",
+  "gekko",
   "riscv",
   "powerpc",
 ]);

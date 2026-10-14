@@ -10,6 +10,9 @@ export const CONSOLE_TARGET_FORMATS = [
   "gba",
   "psx-exe",
   "ps2-elf",
+  "psp",
+  "ps3",
+  "xbox",
   "dc-bin",
   "gc-dol",
   "snes",
@@ -33,6 +36,9 @@ export type ConsoleArchitecture =
   | "arm"
   | "r3000"
   | "r5900"
+  | "allegrex"
+  | "cell-ppu"
+  | "xenon"
   | "sh4"
   | "gekko"
   | "65816"
@@ -115,7 +121,39 @@ export const detectConsoleFormatFromHeader = (
     return "nes";
   }
 
-  // 3. PS2 Emotion Engine ELF32 (LE MIPS with EF_MIPS_MACH_5900 = 0x00920000)
+  // 3. Original Xbox XBE ("XBEH" magic at 0x00) or Xbox 360 XEX2 ("XEX2" magic at 0x00)
+  if (
+    bytes.length >= 0x20 &&
+    (bytes.subarray(0, 4).equals(Buffer.from("XBEH", "ascii")) ||
+      bytes.subarray(0, 4).equals(Buffer.from("XEX2", "ascii")))
+  ) {
+    return "xbox";
+  }
+
+  // 4. PSP PBP ("\x00PBP" magic at 0x00) or ~PSP encrypted module ("~PSP" magic at 0x00)
+  if (
+    bytes.length >= 0x28 &&
+    ((bytes[0] === 0x00 &&
+      bytes[1] === 0x50 &&
+      bytes[2] === 0x42 &&
+      bytes[3] === 0x50) ||
+      bytes.subarray(0, 4).equals(Buffer.from("~PSP", "ascii")))
+  ) {
+    return "psp";
+  }
+
+  // 5. PS3 Signed ELF / SELF / SPRX ("SCE\0" magic at 0x00)
+  if (
+    bytes.length >= 0x20 &&
+    bytes[0] === 0x53 &&
+    bytes[1] === 0x43 &&
+    bytes[2] === 0x45 &&
+    bytes[3] === 0x00
+  ) {
+    return "ps3";
+  }
+
+  // 6. PS2 Emotion Engine ELF32 or PSP PRX / Commercial Allegrex ELF32
   if (
     bytes.length >= 0x34 &&
     bytes[0] === 0x7f &&
@@ -126,13 +164,37 @@ export const detectConsoleFormatFromHeader = (
     bytes[5] === 1 && // ELFDATA2LSB
     bytes.readUInt16LE(18) === 8 // EM_MIPS
   ) {
+    const eType = bytes.readUInt16LE(16);
     const flags = bytes.readUInt32LE(36);
     if ((flags & 0x00ff0000) === 0x00920000) {
       return "ps2-elf";
     }
+    if (
+      eType === 0xffa0 ||
+      ((flags & 0x00ff0000) === 0x00a20000 && flags !== 0x10a23001)
+    ) {
+      return "psp";
+    }
   }
 
-  // 4. GBA ROM (Nintendo logo at 0x04..0x13 and fixed 0x96 at 0xB2)
+  // 7. PS3 Cell LV2 PPU ELF64 Big-Endian (EM_PPC64 = 21 or EI_OSABI = 0x66)
+  if (
+    bytes.length >= 0x40 &&
+    bytes[0] === 0x7f &&
+    bytes[1] === 0x45 &&
+    bytes[2] === 0x4c &&
+    bytes[3] === 0x46 &&
+    bytes[4] === 2 && // ELFCLASS64
+    bytes[5] === 2 // ELFDATA2MSB
+  ) {
+    const eMachine = bytes.readUInt16BE(18);
+    const osAbi = bytes[7];
+    if (eMachine === 21 || osAbi === 0x66) {
+      return "ps3";
+    }
+  }
+
+  // 8. GBA ROM (Nintendo logo at 0x04..0x13 and fixed 0x96 at 0xB2)
   if (
     bytes.length >= 0xc0 &&
     bytes[0xb2] === 0x96 &&
@@ -141,7 +203,7 @@ export const detectConsoleFormatFromHeader = (
     return "gba";
   }
 
-  // 5. Game Boy / Game Boy Color ROM (Nintendo logo at 0x104..0x113)
+  // 9. Game Boy / Game Boy Color ROM (Nintendo logo at 0x104..0x113)
   if (
     bytes.length >= 0x150 &&
     bytes.subarray(0x104, 0x114).equals(GB_LOGO_PREFIX)
@@ -149,7 +211,7 @@ export const detectConsoleFormatFromHeader = (
     return "gb";
   }
 
-  // 6. GameCube DOL (valid section table with entry in 0x80000000..0x817fffff)
+  // 10. GameCube DOL (valid section table with entry in 0x80000000..0x817fffff)
   if (
     (lowerPath.endsWith(".dol") || bytes.length >= 0x100) &&
     isValidGameCubeDolHeader(bytes, fileSize, lowerPath.endsWith(".dol"))
@@ -157,12 +219,12 @@ export const detectConsoleFormatFromHeader = (
     return "gc-dol";
   }
 
-  // 7. SNES / Super Famicom (.sfc / .smc with valid LoROM or HiROM checksum complement)
+  // 11. SNES / Super Famicom (.sfc / .smc)
   if (lowerPath.endsWith(".sfc") || lowerPath.endsWith(".smc")) {
     return "snes";
   }
 
-  // 8. WonderSwan / WonderSwan Color (.ws / .wsc)
+  // 12. WonderSwan / WonderSwan Color (.ws / .wsc)
   if (lowerPath.endsWith(".ws") || lowerPath.endsWith(".wsc")) {
     return "wsc";
   }
@@ -241,6 +303,12 @@ export const admitConsoleTarget = (input: {
       return admitPsxExe(headerBytes, fileBytes, explicitEntry);
     case "ps2-elf":
       return admitPs2Elf(headerBytes, fileBytes, explicitEntry);
+    case "psp":
+      return admitPsp(headerBytes, fileBytes, explicitEntry);
+    case "ps3":
+      return admitPs3(headerBytes, fileBytes, explicitEntry);
+    case "xbox":
+      return admitXbox(headerBytes, fileBytes, explicitEntry);
     case "dc-bin":
       return admitDcBin(fileBytes, explicitEntry);
     case "gc-dol":
@@ -414,9 +482,47 @@ const admitPsxExe = (
   });
 };
 
+const parseElf32LeLoadMappings = (
+  elfBytes: Buffer,
+  containerOffset: number,
+  fileBytes: number,
+  relocationBase = 0,
+): ConsoleFileMapping[] => {
+  if (elfBytes.length < 0x34) return [];
+  const phOff = elfBytes.readUInt32LE(0x1c);
+  const phEntSize = elfBytes.readUInt16LE(0x2a);
+  const phNum = elfBytes.readUInt16LE(0x2c);
+  if (phOff === 0 || phEntSize < 32 || phNum === 0 || phNum > 64) return [];
+  const mappings: ConsoleFileMapping[] = [];
+  for (let i = 0; i < phNum; i++) {
+    const off = phOff + i * phEntSize;
+    if (off + 32 > elfBytes.length) break;
+    const pType = elfBytes.readUInt32LE(off);
+    if (pType !== 1) continue; // PT_LOAD
+    const pOffset = elfBytes.readUInt32LE(off + 0x04);
+    const pVaddr = elfBytes.readUInt32LE(off + 0x08);
+    const pFilesz = elfBytes.readUInt32LE(off + 0x10);
+    const pFlags = elfBytes.readUInt32LE(off + 0x18);
+    if (pFilesz === 0 || containerOffset + pOffset + pFilesz > fileBytes) {
+      continue;
+    }
+    const virtualAddr =
+      pVaddr < relocationBase ? (pVaddr + relocationBase) >>> 0 : pVaddr;
+    mappings.push({
+      name: `LOAD_${mappings.length}`,
+      virtualAddress: hex32(virtualAddr),
+      fileOffset: containerOffset + pOffset,
+      byteLength: pFilesz,
+      executable: (pFlags & 1) !== 0,
+      writable: (pFlags & 2) !== 0,
+    });
+  }
+  return mappings;
+};
+
 const admitPs2Elf = (
   headerBytes: Buffer,
-  _fileBytes: number,
+  fileBytes: number,
   explicitEntry?: { canonical: string; source: string },
 ): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
   if (
@@ -436,6 +542,7 @@ const admitPs2Elf = (
   }
   const entry = headerBytes.readUInt32LE(0x18);
   const flags = headerBytes.readUInt32LE(0x24);
+  const mappings = parseElf32LeLoadMappings(headerBytes, 0, fileBytes);
   const entryPoint =
     explicitEntry?.canonical ?? (entry !== 0 ? hex32(entry) : "0x100000");
   return ok({
@@ -444,10 +551,10 @@ const admitPs2Elf = (
     ghidraLanguageId: "MIPS:LE:64:64-32addr",
     compilerSpecId: "default",
     loader: "ElfLoader",
-    loadBase: "0x100000",
+    loadBase: mappings[0]?.virtualAddress ?? "0x100000",
     entryPoint,
     entryPointSource: explicitEntry?.source ?? entryPoint,
-    fileMappings: [],
+    fileMappings: mappings,
     memoryRegions: [
       {
         name: "EE_MAIN_RAM",
@@ -472,6 +579,613 @@ const admitPs2Elf = (
       elf_entry: hex32(entry),
       elf_flags: hex32(flags),
       emotion_engine: (flags & 0x00ff0000) === 0x00920000,
+      segment_count: mappings.length,
+    },
+  });
+};
+
+const admitPsp = (
+  headerBytes: Buffer,
+  fileBytes: number,
+  explicitEntry?: { canonical: string; source: string },
+): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
+  if (headerBytes.length < 0x28 || fileBytes < 0x28) {
+    return err({
+      reason: "psp target requires at least 40 header bytes",
+      constraint: "file_format_rejected",
+    });
+  }
+  const pspMemoryRegions: readonly ConsoleMemoryRegion[] = [
+    {
+      name: "PSP_SCRATCHPAD",
+      virtualAddress: "0x10000",
+      byteLength: 0x4000,
+      kind: "scratchpad",
+    },
+    {
+      name: "PSP_VRAM",
+      virtualAddress: "0x4000000",
+      byteLength: 0x200000,
+      kind: "vram",
+    },
+    {
+      name: "PSP_USER_RAM",
+      virtualAddress: "0x8800000",
+      byteLength: 0x1800000,
+      kind: "ram",
+    },
+  ];
+
+  // Check for PBP container ("\x00PBP" magic)
+  const isPbp =
+    headerBytes[0] === 0x00 &&
+    headerBytes[1] === 0x50 &&
+    headerBytes[2] === 0x42 &&
+    headerBytes[3] === 0x50;
+  let containerOffset = 0;
+  let pbpDataLength = fileBytes;
+  if (isPbp) {
+    const dataPspOffset = headerBytes.readUInt32LE(0x20);
+    const dataPsarOffset = headerBytes.readUInt32LE(0x24);
+    if (dataPspOffset === 0 || dataPspOffset >= fileBytes) {
+      return err({
+        reason: "PSP PBP container declares an invalid DATA.PSP offset",
+        constraint: "file_format_rejected",
+      });
+    }
+    containerOffset = dataPspOffset;
+    pbpDataLength =
+      dataPsarOffset > dataPspOffset && dataPsarOffset <= fileBytes
+        ? dataPsarOffset - dataPspOffset
+        : fileBytes - dataPspOffset;
+  }
+
+  const innerBytes =
+    containerOffset < headerBytes.length
+      ? headerBytes.subarray(containerOffset)
+      : Buffer.alloc(0);
+
+  // Check if inner payload is an ELF32 LE MIPS binary (ET_EXEC or ET_PSP_PRX 0xFFA0)
+  if (
+    innerBytes.length >= 0x34 &&
+    innerBytes[0] === 0x7f &&
+    innerBytes[1] === 0x45 &&
+    innerBytes[2] === 0x4c &&
+    innerBytes[3] === 0x46
+  ) {
+    if (
+      innerBytes[4] !== 1 ||
+      innerBytes[5] !== 1 ||
+      innerBytes.readUInt16LE(18) !== 8
+    ) {
+      return err({
+        reason: "psp ELF payload must be a little-endian 32-bit MIPS image",
+        constraint: "file_format_rejected",
+      });
+    }
+    const eType = innerBytes.readUInt16LE(0x10);
+    const rawEntry = innerBytes.readUInt32LE(0x18);
+    const flags = innerBytes.readUInt32LE(0x24);
+    const isPrx = eType === 0xffa0 || rawEntry < 0x08800000;
+    const relocBase = isPrx ? 0x08804000 : 0;
+    const mappings = parseElf32LeLoadMappings(
+      innerBytes,
+      containerOffset,
+      fileBytes,
+      relocBase,
+    );
+    const fallbackBase = mappings[0]?.virtualAddress ?? "0x8804000";
+    const resolvedEntry =
+      rawEntry === 0
+        ? fallbackBase
+        : hex32(rawEntry < relocBase ? rawEntry + relocBase : rawEntry);
+    const entryPoint = explicitEntry?.canonical ?? resolvedEntry;
+    const finalMappings: readonly ConsoleFileMapping[] =
+      mappings.length > 0
+        ? mappings
+        : [
+            {
+              name: "PSP_TEXT",
+              virtualAddress: "0x8804000",
+              fileOffset: containerOffset,
+              byteLength: pbpDataLength,
+              executable: true,
+              writable: true,
+            },
+          ];
+    return ok({
+      format: "psp",
+      architecture: "allegrex",
+      ghidraLanguageId: "MIPS:LE:32:default",
+      compilerSpecId: "default",
+      loader: "BinaryLoader",
+      loadBase: finalMappings[0]!.virtualAddress,
+      entryPoint,
+      entryPointSource: explicitEntry?.source ?? entryPoint,
+      fileMappings: finalMappings,
+      memoryRegions: pspMemoryRegions,
+      romMetadata: {
+        container: isPbp ? "PBP" : eType === 0xffa0 ? "PRX" : "ELF",
+        elf_type: hex32(eType),
+        elf_flags: hex32(flags),
+        is_prx: isPrx,
+        encrypted_kirk: false,
+        segment_count: finalMappings.length,
+      },
+    });
+  }
+
+  // ~PSP encrypted/packed module or raw PSP binary
+  const isKirkPsp =
+    innerBytes.length >= 0x28 &&
+    innerBytes.subarray(0, 4).equals(Buffer.from("~PSP", "ascii"));
+  const moduleName =
+    isKirkPsp && innerBytes.length >= 0x26
+      ? innerBytes.subarray(0x0a, 0x26).toString("ascii").replace(/\0+$/u, "")
+      : null;
+  const entryPoint = explicitEntry?.canonical ?? "0x8804000";
+  return ok({
+    format: "psp",
+    architecture: "allegrex",
+    ghidraLanguageId: "MIPS:LE:32:default",
+    compilerSpecId: "default",
+    loader: "BinaryLoader",
+    loadBase: "0x8804000",
+    entryPoint,
+    entryPointSource: explicitEntry?.source ?? "0x08804000",
+    fileMappings: [
+      {
+        name: isKirkPsp ? "PSP_KIRK_IMAGE" : "PSP_RAW_IMAGE",
+        virtualAddress: "0x8804000",
+        fileOffset: containerOffset,
+        byteLength: pbpDataLength,
+        executable: true,
+        writable: true,
+      },
+    ],
+    memoryRegions: pspMemoryRegions,
+    romMetadata: {
+      container: isPbp ? "PBP" : isKirkPsp ? "~PSP" : "RAW",
+      module_name: moduleName,
+      encrypted_kirk: isKirkPsp,
+    },
+  });
+};
+
+const admitPs3 = (
+  headerBytes: Buffer,
+  fileBytes: number,
+  explicitEntry?: { canonical: string; source: string },
+): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
+  if (headerBytes.length < 0x40 || fileBytes < 0x40) {
+    return err({
+      reason: "ps3 target requires at least a 64-byte ELF64 or SELF header",
+      constraint: "file_format_rejected",
+    });
+  }
+  const ps3MemoryRegions: readonly ConsoleMemoryRegion[] = [
+    {
+      name: "PS3_MAIN_RAM",
+      virtualAddress: "0x10000",
+      byteLength: 0x10000000,
+      kind: "ram",
+    },
+    {
+      name: "PS3_RSX_VRAM",
+      virtualAddress: "0xc0000000",
+      byteLength: 0x10000000,
+      kind: "vram",
+    },
+  ];
+
+  // 1. Check for PS3 "SCE\0" Signed ELF (SELF / SPRX)
+  if (
+    headerBytes[0] === 0x53 &&
+    headerBytes[1] === 0x43 &&
+    headerBytes[2] === 0x45 &&
+    headerBytes[3] === 0x00
+  ) {
+    const selfVersion = headerBytes.readUInt32BE(0x04);
+    const keyType = headerBytes.readUInt16BE(0x08);
+    const headerLen = Number(headerBytes.readBigUInt64BE(0x10));
+    const elfOffset =
+      headerBytes.length >= 0x38
+        ? Number(headerBytes.readBigUInt64BE(0x30))
+        : 0;
+    let embeddedEntry = 0x10200n;
+    if (
+      elfOffset > 0 &&
+      elfOffset + 0x40 <= headerBytes.length &&
+      headerBytes[elfOffset] === 0x7f &&
+      headerBytes[elfOffset + 1] === 0x45 &&
+      headerBytes[elfOffset + 2] === 0x4c &&
+      headerBytes[elfOffset + 3] === 0x46
+    ) {
+      embeddedEntry = headerBytes.readBigUInt64BE(elfOffset + 0x18);
+    }
+    const payloadOffset =
+      headerLen > 0 && headerLen < fileBytes ? headerLen : 0;
+    const payloadLength = fileBytes - payloadOffset;
+    const entryPoint =
+      explicitEntry?.canonical ??
+      (embeddedEntry !== 0n ? hex32(embeddedEntry) : "0x10200");
+    return ok({
+      format: "ps3",
+      architecture: "cell-ppu",
+      ghidraLanguageId: "PowerPC:BE:64:64-32addr",
+      compilerSpecId: "default",
+      loader: "BinaryLoader",
+      loadBase: "0x10000",
+      entryPoint,
+      entryPointSource: explicitEntry?.source ?? entryPoint,
+      fileMappings: [
+        {
+          name: "PS3_SELF_PAYLOAD",
+          virtualAddress: "0x10000",
+          fileOffset: payloadOffset,
+          byteLength: payloadLength,
+          executable: true,
+          writable: true,
+        },
+      ],
+      memoryRegions: ps3MemoryRegions,
+      romMetadata: {
+        container: "SELF",
+        self_version: selfVersion,
+        is_debug_fself: keyType === 0x8000,
+        elf_entry: hex32(embeddedEntry),
+        header_length: headerLen,
+      },
+    });
+  }
+
+  // 2. Decrypted PS3 ELF64 Big-Endian (Cell PPU EM_PPC64 = 21)
+  if (
+    headerBytes[0] !== 0x7f ||
+    headerBytes[1] !== 0x45 ||
+    headerBytes[2] !== 0x4c ||
+    headerBytes[3] !== 0x46 ||
+    headerBytes[4] !== 2 ||
+    headerBytes[5] !== 2
+  ) {
+    return err({
+      reason:
+        "ps3 requires a big-endian 64-bit Cell PPU ELF image or SCE SELF container",
+      constraint: "file_format_rejected",
+    });
+  }
+  const osAbi = headerBytes[7]!;
+  const eType = headerBytes.readUInt16BE(0x10);
+  const eMachine = headerBytes.readUInt16BE(0x12);
+  if (eMachine !== 21 && eMachine !== 20) {
+    return err({
+      reason: `ps3 ELF requires PowerPC64 (EM_PPC64=21), got e_machine=${eMachine}`,
+      constraint: "file_format_rejected",
+    });
+  }
+  const rawEntry = headerBytes.readBigUInt64BE(0x18);
+  const phOff = Number(headerBytes.readBigUInt64BE(0x20));
+  const flags = headerBytes.readUInt32BE(0x30);
+  const phEntSize = headerBytes.readUInt16BE(0x36);
+  const phNum = headerBytes.readUInt16BE(0x38);
+
+  const mappings: ConsoleFileMapping[] = [];
+  if (phOff > 0 && phEntSize >= 56 && phNum > 0 && phNum <= 64) {
+    for (let i = 0; i < phNum; i++) {
+      const off = phOff + i * phEntSize;
+      if (off + 56 > headerBytes.length) break;
+      const pType = headerBytes.readUInt32BE(off);
+      if (pType !== 1) continue; // PT_LOAD
+      const pFlags = headerBytes.readUInt32BE(off + 0x04);
+      const pOffset = Number(headerBytes.readBigUInt64BE(off + 0x08));
+      const pVaddr = headerBytes.readBigUInt64BE(off + 0x10);
+      const pFilesz = Number(headerBytes.readBigUInt64BE(off + 0x20));
+      if (pFilesz === 0 || pOffset + pFilesz > fileBytes) continue;
+      mappings.push({
+        name: `LOAD_${mappings.length}`,
+        virtualAddress: hex32(pVaddr),
+        fileOffset: pOffset,
+        byteLength: pFilesz,
+        executable: (pFlags & 1) !== 0,
+        writable: (pFlags & 2) !== 0,
+      });
+    }
+  }
+
+  // Resolve PS3 PPC64 OPD (Official Procedure Descriptor) entry point if rawEntry
+  // points into a non-executable data segment (.opd) whose first word points into code.
+  let resolvedEntry = rawEntry;
+  let tocBase: string | null = null;
+  for (const map of mappings) {
+    const mapStart = BigInt(map.virtualAddress);
+    const mapEnd = mapStart + BigInt(map.byteLength);
+    if (rawEntry >= mapStart && rawEntry + 8n <= mapEnd && !map.executable) {
+      const opdFileOffset = map.fileOffset + Number(rawEntry - mapStart);
+      if (opdFileOffset + 8 <= headerBytes.length) {
+        const candidate32 = BigInt(headerBytes.readUInt32BE(opdFileOffset));
+        const candidate32Toc = BigInt(
+          headerBytes.readUInt32BE(opdFileOffset + 4),
+        );
+        const candidate64 = headerBytes.readBigUInt64BE(opdFileOffset);
+        const candidate64Toc =
+          opdFileOffset + 16 <= headerBytes.length
+            ? headerBytes.readBigUInt64BE(opdFileOffset + 8)
+            : 0n;
+        const hitsExec = (addr: bigint): boolean =>
+          mappings.some((m) => {
+            const s = BigInt(m.virtualAddress);
+            return m.executable && addr >= s && addr < s + BigInt(m.byteLength);
+          });
+        if (candidate32 !== 0n && hitsExec(candidate32)) {
+          resolvedEntry = candidate32;
+          tocBase = hex32(candidate32Toc);
+        } else if (candidate64 !== 0n && hitsExec(candidate64)) {
+          resolvedEntry = candidate64;
+          tocBase = hex32(candidate64Toc);
+        }
+      }
+      break;
+    }
+  }
+
+  const finalMappings: readonly ConsoleFileMapping[] =
+    mappings.length > 0
+      ? mappings
+      : [
+          {
+            name: "PS3_ELF_IMAGE",
+            virtualAddress: "0x10000",
+            fileOffset: 0,
+            byteLength: fileBytes,
+            executable: true,
+            writable: true,
+          },
+        ];
+  const entryPoint =
+    explicitEntry?.canonical ??
+    (resolvedEntry !== 0n
+      ? hex32(resolvedEntry)
+      : finalMappings[0]!.virtualAddress);
+
+  return ok({
+    format: "ps3",
+    architecture: "cell-ppu",
+    ghidraLanguageId: "PowerPC:BE:64:64-32addr",
+    compilerSpecId: "default",
+    loader: "BinaryLoader",
+    loadBase: finalMappings[0]!.virtualAddress,
+    entryPoint,
+    entryPointSource: explicitEntry?.source ?? entryPoint,
+    fileMappings: finalMappings,
+    memoryRegions: ps3MemoryRegions,
+    romMetadata: {
+      container: eType === 0xffa4 ? "SPRX" : "ELF64",
+      os_abi: hex32(osAbi),
+      elf_entry: hex32(rawEntry),
+      resolved_code_entry: hex32(resolvedEntry),
+      toc_base: tocBase,
+      elf_flags: hex32(flags),
+      segment_count: finalMappings.length,
+    },
+  });
+};
+
+const admitXbox = (
+  headerBytes: Buffer,
+  fileBytes: number,
+  explicitEntry?: { canonical: string; source: string },
+): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
+  // 1. Xbox 360 XEX2 ("XEX2" magic at 0x00)
+  if (
+    headerBytes.length >= 0x20 &&
+    headerBytes.subarray(0, 4).equals(Buffer.from("XEX2", "ascii"))
+  ) {
+    const peDataOffset = headerBytes.readUInt32BE(0x08);
+    const optHeaderCount = headerBytes.readUInt32BE(0x14);
+    let xexEntry = 0x82000000;
+    let xexBase = 0x82000000;
+    const maxHeaders = Math.min(optHeaderCount, 64);
+    for (let i = 0; i < maxHeaders; i++) {
+      const dirOff = 0x18 + i * 8;
+      if (dirOff + 8 > headerBytes.length) break;
+      const key = headerBytes.readUInt32BE(dirOff);
+      const val = headerBytes.readUInt32BE(dirOff + 4);
+      if (key === 0x00010100) {
+        xexEntry = val;
+      } else if (key === 0x00010201) {
+        xexBase = val;
+      }
+    }
+    const payloadOffset =
+      peDataOffset > 0 && peDataOffset < fileBytes ? peDataOffset : 0;
+    const entryPoint = explicitEntry?.canonical ?? hex32(xexEntry);
+    return ok({
+      format: "xbox",
+      architecture: "xenon",
+      ghidraLanguageId: "PowerPC:BE:64:64-32addr",
+      compilerSpecId: "default",
+      loader: "BinaryLoader",
+      loadBase: hex32(xexBase),
+      entryPoint,
+      entryPointSource: explicitEntry?.source ?? entryPoint,
+      fileMappings: [
+        {
+          name: "XEX2_PAYLOAD",
+          virtualAddress: hex32(xexBase),
+          fileOffset: payloadOffset,
+          byteLength: fileBytes - payloadOffset,
+          executable: true,
+          writable: true,
+        },
+      ],
+      memoryRegions: [
+        {
+          name: "XBOX360_RAM",
+          virtualAddress: "0x80000000",
+          byteLength: 0x20000000,
+          kind: "ram",
+        },
+      ],
+      romMetadata: {
+        container: "XEX2",
+        image_base: hex32(xexBase),
+        entry_point: hex32(xexEntry),
+        pe_data_offset: payloadOffset,
+      },
+    });
+  }
+
+  // 2. Original Xbox XBE ("XBEH" magic at 0x00)
+  if (
+    headerBytes.length < 0x180 ||
+    fileBytes < 0x180 ||
+    !headerBytes.subarray(0, 4).equals(Buffer.from("XBEH", "ascii"))
+  ) {
+    return err({
+      reason:
+        "xbox requires an Original Xbox XBE (XBEH) or Xbox 360 XEX2 header",
+      constraint: "file_format_rejected",
+    });
+  }
+
+  const baseAddress = headerBytes.readUInt32LE(0x104) || 0x00010000;
+  const sizeOfHeaders = headerBytes.readUInt32LE(0x108);
+  const sizeOfImage = headerBytes.readUInt32LE(0x10c) || fileBytes;
+  const certAddress = headerBytes.readUInt32LE(0x118);
+  const numSections = headerBytes.readUInt32LE(0x11c);
+  const sectionHeadersAddr = headerBytes.readUInt32LE(0x120);
+  const rawEntry = headerBytes.readUInt32LE(0x128);
+  const rawKernelThunk = headerBytes.readUInt32LE(0x158);
+
+  // Decode XOR-obfuscated XBE entry point (Retail, Debug, or Chihiro)
+  const imageEnd = baseAddress + sizeOfImage;
+  const retailEntry = (rawEntry ^ 0xa8fc57ab) >>> 0;
+  const debugEntry = (rawEntry ^ 0x94859d4b) >>> 0;
+  const chihiroEntry = (rawEntry ^ 0x40b5c16e) >>> 0;
+  let decodedEntry = baseAddress;
+  let xbeBuildType = "raw";
+  if (retailEntry >= baseAddress && retailEntry < imageEnd) {
+    decodedEntry = retailEntry;
+    xbeBuildType = "retail";
+  } else if (debugEntry >= baseAddress && debugEntry < imageEnd) {
+    decodedEntry = debugEntry;
+    xbeBuildType = "debug";
+  } else if (chihiroEntry >= baseAddress && chihiroEntry < imageEnd) {
+    decodedEntry = chihiroEntry;
+    xbeBuildType = "chihiro";
+  } else if (rawEntry >= baseAddress && rawEntry < imageEnd) {
+    decodedEntry = rawEntry;
+  }
+
+  const retailThunk = (rawKernelThunk ^ 0x5b6d40b6) >>> 0;
+  const debugThunk = (rawKernelThunk ^ 0xefb1f152) >>> 0;
+  const decodedThunk =
+    xbeBuildType === "debug"
+      ? debugThunk
+      : xbeBuildType === "retail"
+        ? retailThunk
+        : rawKernelThunk;
+
+  // Read Certificate Title ID & Title Name if within headerBytes
+  let titleId: string | null = null;
+  let titleName: string | null = null;
+  if (certAddress >= baseAddress) {
+    const certOff = certAddress - baseAddress;
+    if (certOff + 0x5c <= headerBytes.length) {
+      titleId = hex32(headerBytes.readUInt32LE(certOff + 0x08));
+      const rawTitle = headerBytes
+        .subarray(certOff + 0x0c, certOff + 0x5c)
+        .toString("utf16le")
+        .replace(/\0+$/u, "");
+      if (rawTitle.length > 0) titleName = rawTitle;
+    }
+  }
+
+  // Parse XBE Section Headers (56 bytes per section)
+  const mappings: ConsoleFileMapping[] = [];
+  if (
+    sectionHeadersAddr >= baseAddress &&
+    numSections > 0 &&
+    numSections <= 64
+  ) {
+    const tableOff = sectionHeadersAddr - baseAddress;
+    for (let i = 0; i < numSections; i++) {
+      const secOff = tableOff + i * 56;
+      if (secOff + 56 > headerBytes.length) break;
+      const flags = headerBytes.readUInt32LE(secOff);
+      const vaddr = headerBytes.readUInt32LE(secOff + 0x04);
+      const rawAddr = headerBytes.readUInt32LE(secOff + 0x0c);
+      const rawSize = headerBytes.readUInt32LE(secOff + 0x10);
+      const nameAddr = headerBytes.readUInt32LE(secOff + 0x14);
+      if (rawSize === 0 || rawAddr + rawSize > fileBytes) continue;
+      let secName = `SEC_${i}`;
+      if (nameAddr >= baseAddress) {
+        const nameOff = nameAddr - baseAddress;
+        if (nameOff < headerBytes.length) {
+          const maxEnd = Math.min(headerBytes.length, nameOff + 32);
+          const sub = headerBytes.subarray(nameOff, maxEnd);
+          const nul = sub.indexOf(0);
+          const ascii = (nul >= 0 ? sub.subarray(0, nul) : sub).toString(
+            "ascii",
+          );
+          if (/^[\x20-\x7e]+$/u.test(ascii)) secName = ascii;
+        }
+      }
+      mappings.push({
+        name: secName,
+        virtualAddress: hex32(vaddr),
+        fileOffset: rawAddr,
+        byteLength: rawSize,
+        writable: (flags & 1) !== 0,
+        executable: (flags & 4) !== 0,
+      });
+    }
+  }
+
+  const finalMappings: readonly ConsoleFileMapping[] =
+    mappings.length > 0
+      ? mappings
+      : [
+          {
+            name: "XBE_IMAGE",
+            virtualAddress: hex32(baseAddress),
+            fileOffset: 0,
+            byteLength: fileBytes,
+            executable: true,
+            writable: true,
+          },
+        ];
+
+  const entryPoint = explicitEntry?.canonical ?? hex32(decodedEntry);
+  return ok({
+    format: "xbox",
+    architecture: "x86",
+    ghidraLanguageId: "x86:LE:32:default",
+    compilerSpecId: "windows",
+    loader: "BinaryLoader",
+    loadBase: hex32(baseAddress),
+    entryPoint,
+    entryPointSource: explicitEntry?.source ?? entryPoint,
+    fileMappings: finalMappings,
+    memoryRegions: [
+      {
+        name: "XBOX_MAIN_RAM",
+        virtualAddress: "0x10000",
+        byteLength: 0x3ff0000,
+        kind: "ram",
+      },
+    ],
+    romMetadata: {
+      container: "XBE",
+      build_type: xbeBuildType,
+      base_address: hex32(baseAddress),
+      size_of_headers: sizeOfHeaders,
+      size_of_image: sizeOfImage,
+      decoded_entry: hex32(decodedEntry),
+      kernel_thunk: hex32(decodedThunk),
+      title_id: titleId,
+      title_name: titleName,
+      section_count: finalMappings.length,
     },
   });
 };

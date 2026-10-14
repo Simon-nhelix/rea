@@ -19,6 +19,9 @@ export const BINARY_ARCHITECTURES = [
   "sm83",
   "r3000",
   "r5900",
+  "allegrex",
+  "cell-ppu",
+  "xenon",
   "gekko",
   "riscv",
   "powerpc",
@@ -68,6 +71,9 @@ export const CONSOLE_ONLY_ARCHITECTURES = [
   "sm83",
   "r3000",
   "r5900",
+  "allegrex",
+  "cell-ppu",
+  "xenon",
   "gekko",
 ] as const satisfies readonly BinaryArchitecture[];
 export type ConsoleOnlyArchitecture =

@@ -537,7 +537,11 @@ const tryAutoDetectConsoleBinaryTarget = async (input: {
   if (!admitted.ok) {
     // Magic-detected console formats report their specific admission failure;
     // suffix-detected formats fall through if they are not valid console ROMs.
-    if (["psx-exe", "nes", "ps2-elf", "gba", "gb"].includes(detectedFormat)) {
+    if (
+      ["psx-exe", "nes", "ps2-elf", "psp", "ps3", "xbox", "gba", "gb"].includes(
+        detectedFormat,
+      )
+    ) {
       return err(
         new BinaryTargetError(path, admitted.error.reason, {
           constraint: admitted.error.constraint,
