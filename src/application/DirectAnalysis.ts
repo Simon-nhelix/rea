@@ -220,10 +220,11 @@ const runAnalysis = async (
 ): Promise<JsonValue> => {
   const { logger, signal, snapshotPath } = options;
   if (
-    (((tool === "search_rom_strings" || tool === "scan_pointer_table") &&
-      arguments_.resolve_xrefs === false) ||
-      ((tool === "discover_pointer_tables" || tool === "find_code_caves") &&
-        arguments_.resolve_xrefs !== true)) &&
+    (tool === "search_rom_strings" ||
+      tool === "scan_pointer_table" ||
+      tool === "discover_pointer_tables" ||
+      tool === "find_code_caves") &&
+    arguments_.resolve_xrefs !== true &&
     snapshotPath === undefined &&
     options.providerId === undefined
   ) {

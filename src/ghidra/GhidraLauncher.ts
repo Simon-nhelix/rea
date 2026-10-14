@@ -169,6 +169,8 @@ export interface GhidraHeadlessLauncherOptions {
   readonly languageOverride?: GhidraLanguageOverride;
   /** Auto-analyzers disabled before default auto-analysis, as configured. */
   readonly disabledAnalyzers?: readonly string[];
+  /** Analyzers disabled only when the program has them (console preset). */
+  readonly optionalDisabledAnalyzers?: readonly string[];
   /** Caller seeds committed by the analysis profile, applied before analysis. */
   readonly analysisSeeds?: GhidraSeedCommitment;
   readonly analysisExtensions?: readonly GhidraExtension[];
@@ -307,6 +309,11 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
         ...(this.options.disabledAnalyzers === undefined
           ? {}
           : { disabledAnalyzers: this.options.disabledAnalyzers }),
+        ...(this.options.optionalDisabledAnalyzers === undefined
+          ? {}
+          : {
+              optionalDisabledAnalyzers: this.options.optionalDisabledAnalyzers,
+            }),
       });
       const scriptCommand = ghidraHeadlessCommand({
         environment: this.options.environment,
@@ -577,6 +584,8 @@ export interface GhidraHeadlessArgumentOptions {
   readonly languageOverride?: GhidraLanguageOverride;
   /** Auto-analyzers disabled by the pre-analysis options script. */
   readonly disabledAnalyzers?: readonly string[];
+  /** Analyzers the options script disables only when present. */
+  readonly optionalDisabledAnalyzers?: readonly string[];
   /** Canonical seed snapshot passed to the pre-analysis seed script. */
   readonly seedPath?: string;
 }
@@ -751,11 +760,23 @@ export const ghidraHeadlessArguments = (
     // post-analysis repair and bridge scripts start serving.
     ...(options.disabledAnalyzers === undefined ||
     options.disabledAnalyzers.length === 0
-      ? []
+      ? options.optionalDisabledAnalyzers === undefined ||
+        options.optionalDisabledAnalyzers.length === 0
+        ? []
+        : [
+            "-preScript",
+            scriptPath.join(bridgeDirectory, "ReaGhidraAnalysisOptions.java"),
+            "-",
+            options.optionalDisabledAnalyzers.join(","),
+          ]
       : [
           "-preScript",
           scriptPath.join(bridgeDirectory, "ReaGhidraAnalysisOptions.java"),
           options.disabledAnalyzers.join(","),
+          ...(options.optionalDisabledAnalyzers === undefined ||
+          options.optionalDisabledAnalyzers.length === 0
+            ? []
+            : [options.optionalDisabledAnalyzers.join(",")]),
         ]),
     ...((options.platform ?? process.platform) === "win32"
       ? []

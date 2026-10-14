@@ -338,12 +338,25 @@ const registerRomHackingCommands = (
         .describe("Maximum number of string matches to return"),
       resolveXrefs: z
         .boolean()
-        .default(true)
-        .describe("Resolve incoming cross-references and file offsets"),
+        .default(false)
+        .describe(
+          "Resolve incoming cross-references via the disassembler (opt-in; default false uses the local ROM fast path)",
+        ),
       includeXrefs: z
         .boolean()
         .optional()
         .describe("Alias for --resolve-xrefs"),
+      includeHex: z
+        .boolean()
+        .default(false)
+        .describe("Include each match's raw bytes as hex (bytes_hex)"),
+      cursor: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "next_cursor from a previous identical call to resume paging",
+        ),
       ...nativeOpenOptionFields,
     }),
     run: ({ args, options }) => {
@@ -379,6 +392,8 @@ const registerRomHackingCommands = (
               : { terminator_byte: options.terminatorByte }),
             max_results: options.maxResults,
             resolve_xrefs: resolvedXrefs,
+            include_hex: options.includeHex,
+            ...(options.cursor === undefined ? {} : { cursor: options.cursor }),
           },
           directAnalysisOptionsFromCli(logger, options),
         ),
@@ -412,6 +427,12 @@ const registerRomHackingCommands = (
         .max(512)
         .default(32)
         .describe("Number of pointer table entries to read"),
+      startIndex: z
+        .number()
+        .int()
+        .min(0)
+        .default(0)
+        .describe("First entry index to read (paging; indexes stay global)"),
       pointerSize: z
         .number()
         .int()
@@ -466,8 +487,10 @@ const registerRomHackingCommands = (
         .describe("Bytes to read at each target address for string preview"),
       resolveXrefs: z
         .boolean()
-        .default(true)
-        .describe("Resolve incoming cross-references and file offsets"),
+        .default(false)
+        .describe(
+          "Resolve incoming cross-references via the disassembler (opt-in; default false uses the local ROM fast path)",
+        ),
       includeXrefs: z
         .boolean()
         .optional()
@@ -476,6 +499,18 @@ const registerRomHackingCommands = (
         .boolean()
         .default(false)
         .describe("Emit locbatch.py-compatible manuscript records"),
+      includeHex: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Include each preview's raw bytes as hex (preview_bytes_hex)",
+        ),
+      manuscriptOnly: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Emit manuscript records and suppress pointer entries (implies --include-manuscript)",
+        ),
       ...nativeOpenOptionFields,
     }),
     run: ({ args, options }) => {
@@ -492,6 +527,7 @@ const registerRomHackingCommands = (
               ? {}
               : { table_offset: options.tableOffset }),
             count: options.count,
+            start_index: options.startIndex,
             pointer_size: options.pointerSize as 2 | 3 | 4,
             endian: options.endian,
             base_address: options.baseAddress,
@@ -509,6 +545,8 @@ const registerRomHackingCommands = (
             preview_bytes: options.previewBytes,
             resolve_xrefs: resolvedXrefs,
             include_manuscript: options.includeManuscript,
+            include_hex: options.includeHex,
+            manuscript_only: options.manuscriptOnly,
           },
           directAnalysisOptionsFromCli(logger, options),
         ),

@@ -2268,6 +2268,55 @@ const admitWsc = (
   });
 };
 
+interface ParsedMappingInterval {
+  readonly start: bigint;
+  readonly end: bigint;
+  readonly fileOffset: number;
+}
+
+interface ParsedMappingIntervals {
+  /** Declaration order; first match wins when mappings overlap. */
+  readonly intervals: readonly ParsedMappingInterval[];
+  /** Start-sorted intervals when pairwise non-overlapping, else null. */
+  readonly sortedNonOverlapping: readonly ParsedMappingInterval[] | null;
+}
+
+const mappingIntervalCache = new WeakMap<
+  ConsoleTargetAdmission,
+  ParsedMappingIntervals
+>();
+
+const parsedMappingIntervals = (
+  admission: ConsoleTargetAdmission,
+): ParsedMappingIntervals => {
+  const cached = mappingIntervalCache.get(admission);
+  if (cached !== undefined) return cached;
+  const intervals = admission.fileMappings.map((map) => {
+    const start = BigInt(map.virtualAddress);
+    return {
+      start,
+      end: start + BigInt(map.byteLength),
+      fileOffset: map.fileOffset,
+    };
+  });
+  const sorted = [...intervals].sort((a, b) =>
+    a.start < b.start ? -1 : a.start > b.start ? 1 : 0,
+  );
+  let nonOverlapping = true;
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i]!.start < sorted[i - 1]!.end) {
+      nonOverlapping = false;
+      break;
+    }
+  }
+  const parsed: ParsedMappingIntervals = {
+    intervals,
+    sortedNonOverlapping: nonOverlapping ? sorted : null,
+  };
+  mappingIntervalCache.set(admission, parsed);
+  return parsed;
+};
+
 /**
  * Resolve a console virtual address to a file offset using the admitted fileMappings
  * plus bank-window and FastROM mirror rules for SNES/GB/NES/WSC.
@@ -2346,13 +2395,31 @@ export const resolveConsoleFileOffset = (
     }
   }
 
-  // 2. Direct lookup across admitted fileMappings
+  // 2. Direct lookup across admitted fileMappings (parsed once per admission)
   const findInMappings = (candidate: bigint): number | null => {
-    for (const map of admission.fileMappings) {
-      const start = BigInt(map.virtualAddress);
-      const len = BigInt(map.byteLength);
-      if (candidate >= start && candidate < start + len) {
-        return map.fileOffset + Number(candidate - start);
+    const { intervals, sortedNonOverlapping } =
+      parsedMappingIntervals(admission);
+    if (sortedNonOverlapping !== null) {
+      let lo = 0;
+      let hi = sortedNonOverlapping.length - 1;
+      let found: ParsedMappingInterval | undefined;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        const interval = sortedNonOverlapping[mid]!;
+        if (interval.start <= candidate) {
+          found = interval;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      return found !== undefined && candidate < found.end
+        ? found.fileOffset + Number(candidate - found.start)
+        : null;
+    }
+    for (const interval of intervals) {
+      if (candidate >= interval.start && candidate < interval.end) {
+        return interval.fileOffset + Number(candidate - interval.start);
       }
     }
     return null;
@@ -2438,15 +2505,41 @@ export const resolveConsoleVirtualAddress = (
   return null;
 };
 
-/** Serialize console target mappings and regions into the TSV spec consumed by ReaGhidraPrepareConsole.java. */
+/**
+ * Serialize console target mappings and regions into the TSV spec consumed by
+ * ReaGhidraPrepareConsole.java. This is the Ghidra analysis-scope projection:
+ * for banked ROMs with many file mappings (SNES), only the entry bank is
+ * marked executable so function-start search does not scan every bank;
+ * entry-flow disassembly still reaches referenced code in other banks.
+ * The admission's own executable facts are unchanged.
+ */
 export const formatConsoleTargetSpecTsv = (
   admission: ConsoleTargetAdmission,
 ): string => {
   const lines: string[] = [
     `meta\t${admission.format}\t${admission.ghidraLanguageId}\t${admission.entryPoint}\t${admission.loader}`,
   ];
-  for (const map of admission.fileMappings) {
-    const rwx = `r${map.writable ? "w" : "-"}${map.executable ? "x" : "-"}`;
+  const entry = (() => {
+    try {
+      return BigInt(admission.entryPoint);
+    } catch {
+      return null;
+    }
+  })();
+  const { intervals } = parsedMappingIntervals(admission);
+  const entryMapped =
+    entry !== null &&
+    intervals.some(
+      (interval) => entry >= interval.start && entry < interval.end,
+    );
+  const scopeToEntryBank = admission.fileMappings.length > 8 && entryMapped;
+  for (let i = 0; i < admission.fileMappings.length; i++) {
+    const map = admission.fileMappings[i]!;
+    const interval = intervals[i]!;
+    const containsEntry =
+      entry !== null && entry >= interval.start && entry < interval.end;
+    const executable = map.executable && (!scopeToEntryBank || containsEntry);
+    const rwx = `r${map.writable ? "w" : "-"}${executable ? "x" : "-"}`;
     lines.push(
       `map\t${map.name}\t${map.virtualAddress}\t${map.fileOffset}\t${map.byteLength}\t${rwx}`,
     );

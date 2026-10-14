@@ -5,11 +5,29 @@ import {
   encodeRomQueryString,
   extractRomStringsFromBuffer,
   findCodeCavesInSlice,
+  findCodeCavesInSliceTopK,
   formatHexPattern,
   normalizeRomTextEncoding,
   parseCustomCharTable,
   readPointerValue,
+  scanPointerTableInputSchema,
+  searchRomStringsInputSchema,
 } from "./romHacking.js";
+
+describe("romHacking input defaults", () => {
+  it("defaults to provider-free Mode A with compact output", () => {
+    const search = searchRomStringsInputSchema.parse({ query: "勇者" });
+    expect(search.resolve_xrefs).toBe(false);
+    expect(search.include_hex).toBe(false);
+    expect(search.cursor).toBeUndefined();
+
+    const scan = scanPointerTableInputSchema.parse({ table_offset: 0 });
+    expect(scan.resolve_xrefs).toBe(false);
+    expect(scan.include_hex).toBe(false);
+    expect(scan.manuscript_only).toBe(false);
+    expect(scan.start_index).toBe(0);
+  });
+});
 
 describe("romHacking domain primitives", () => {
   it("encodes and decodes Shift-JIS (sjis) Japanese strings and encoding aliases", () => {
@@ -91,6 +109,43 @@ describe("romHacking domain primitives", () => {
     expect(extracted[1]?.decoded).toBe("魔法");
   });
 
+  it("scans large ASCII padding before a Shift-JIS string in one pass", () => {
+    const buf = Buffer.alloc(0x40000 + 6, 0x20);
+    buf[0x40000] = 0x00;
+    Buffer.from([0x97, 0x45, 0x8e, 0xd2, 0x00]).copy(buf, 0x40001);
+    const start = performance.now();
+    const extracted = extractRomStringsFromBuffer({
+      bytes: buf,
+      baseAddress: 0x08000000n,
+      encoding: "sjis",
+      minLength: 2,
+      terminatorByte: 0x00,
+      limit: 10,
+    });
+    // The previous cursor++ re-scan was O(n^2) here (16 KiB alone took >10s).
+    expect(performance.now() - start).toBeLessThan(2000);
+    expect(extracted).toHaveLength(1);
+    expect(extracted[0]?.offsetInBuffer).toBe(0x40001);
+    expect(extracted[0]?.decoded).toBe("勇者");
+  });
+
+  it("extracts EUC-JP strings and can skip raw hex formatting", () => {
+    // "勇者" in EUC-JP: 勇 = 0xCD 0xA6, 者 = 0xBC 0xD4
+    const buf = Buffer.from([0xcd, 0xa6, 0xbc, 0xd4, 0x00]);
+    const extracted = extractRomStringsFromBuffer({
+      bytes: buf,
+      baseAddress: 0n,
+      encoding: "euc-jp",
+      minLength: 2,
+      terminatorByte: 0x00,
+      limit: 10,
+      includeRawHex: false,
+    });
+    expect(extracted).toHaveLength(1);
+    expect(extracted[0]?.decoded).toBe("勇者");
+    expect(extracted[0]?.rawHex).toBe("");
+  });
+
   it("reads 16-bit, 24-bit, and 32-bit pointers", () => {
     const buf = Buffer.from([
       0x34, 0x12, 0x56, 0x34, 0x12, 0x00, 0x20, 0x00, 0x08,
@@ -104,7 +159,9 @@ describe("romHacking domain primitives", () => {
     const p32 = readPointerValue(buf, 5, 4, "little");
     expect(`0x${p32.toString(16)}`).toBe("0x8002000");
   });
+});
 
+describe("romHacking budgets and code caves", () => {
   it("computes pointer slot budgets and finds aligned code caves", () => {
     const budgets = computePointerSlotBudgets([
       {
@@ -141,5 +198,24 @@ describe("romHacking domain primitives", () => {
         executable: true,
       },
     ]);
+  });
+
+  it("keeps only top-K caves while counting every cave", () => {
+    const romSlice = Buffer.alloc(256, 0x11);
+    romSlice.fill(0xff, 0, 32);
+    romSlice.fill(0x00, 64, 160);
+    romSlice.fill(0xff, 192, 240);
+    const top = findCodeCavesInSliceTopK({
+      bytes: romSlice,
+      sliceFileOffset: 0,
+      regionName: "ROM",
+      executable: true,
+      minSize: 16,
+      alignment: 1,
+      toVirtualAddress: (fo) => `0x${fo.toString(16)}`,
+      limit: 2,
+    });
+    expect(top.total).toBe(3);
+    expect(top.caves.map((cave) => cave.byte_length)).toEqual([96, 48]);
   });
 });

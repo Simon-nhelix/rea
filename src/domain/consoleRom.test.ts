@@ -140,6 +140,13 @@ describe("consoleRom", () => {
     const tsv = formatConsoleTargetSpecTsv(admitted.value);
     expect(tsv).toContain("meta\tsnes\t65816:LE:16:default\t0x8000");
     expect(tsv).toContain("map\tBANK00_ROM\t0x8000\t512\t");
+    // Ghidra scope: only the entry bank is executable in the TSV projection,
+    // while the admission keeps every bank executable.
+    expect(tsv).toContain("map\tBANK00_ROM\t0x8000\t512\t32768\tr-x");
+    expect(tsv).toContain("map\tBANK01_ROM\t0x18000\t33280\t32768\tr--");
+    expect(admitted.value.fileMappings.every((map) => map.executable)).toBe(
+      true,
+    );
   });
 });
 
@@ -418,6 +425,30 @@ describe("consoleRom Saturn, NDS, Mega Drive, PCE, and multi-bank coordinates", 
       expect(resolveConsoleVirtualAddress(snes.value, 512 + 0x10100)).toBe(
         "0x28100",
       );
+
+      // Overlapping mappings keep declaration-order (first match) semantics.
+      const overlapping = {
+        ...snes.value,
+        fileMappings: [
+          {
+            name: "WIDE",
+            virtualAddress: "0x8000",
+            fileOffset: 0,
+            byteLength: 0x10000,
+            executable: true,
+            writable: false,
+          },
+          {
+            name: "INNER",
+            virtualAddress: "0x9000",
+            fileOffset: 0x9000,
+            byteLength: 0x1000,
+            executable: true,
+            writable: false,
+          },
+        ],
+      };
+      expect(resolveConsoleFileOffset(overlapping, 0x9100)).toBe(0x1100);
     }
   });
 });

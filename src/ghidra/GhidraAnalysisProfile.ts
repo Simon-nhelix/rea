@@ -47,6 +47,24 @@ import {
 const callRelationshipCoverage = "function-body-call-coverage-v5";
 
 /**
+ * Generic analyzers with no console-ROM value (library Function ID matching
+ * and media carving). They are disabled only when the program actually has
+ * them, so a language without one never fails the session.
+ */
+export const CONSOLE_GHIDRA_OPTIONAL_DISABLED_ANALYZERS: readonly string[] = [
+  "Function ID",
+  "Embedded Media",
+];
+
+/** The optional analyzer preset committed for this target, if any. */
+export const ghidraConsoleOptionalDisabledAnalyzers = (
+  target: BinaryTarget,
+): readonly string[] | undefined =>
+  isConsoleBinaryTarget(target)
+    ? CONSOLE_GHIDRA_OPTIONAL_DISABLED_ANALYZERS
+    : undefined;
+
+/**
  * The processor language REA pins for this target, or undefined when Ghidra may
  * select from the header. The committed profile and the session readback both
  * compare against this single owner rather than re-deriving a lane.
@@ -211,7 +229,7 @@ export const resolveGhidraAnalysisProfile = async (
             installation.platform === "win32"
               ? "official-headless-script-v1"
               : "inspected-jvm-launch-support-v1",
-          load_image_evidence: "console-rom-mapping-context-v1",
+          load_image_evidence: "console-rom-mapping-context-v2",
           jump_table_evidence: "typed-case-default-blocks-v1",
           decompiler_jump_loads: true,
           loader: consoleRom.loader,
@@ -221,6 +239,16 @@ export const resolveGhidraAnalysisProfile = async (
           entry_point: target.entryPoint,
           entry_seed: "external-entry-and-function-before-analysis-v1",
           ...analyzerParameters,
+          analyzer_preset: `${analyzerParameters.analyzer_preset}+console-optional-disabled:${CONSOLE_GHIDRA_OPTIONAL_DISABLED_ANALYZERS.join(",")}`,
+          analysis_options: {
+            ...(disabledAnalyzers === undefined ||
+            disabledAnalyzers.length === 0
+              ? {}
+              : { disabled_analyzers: [...disabledAnalyzers] }),
+            optional_disabled_analyzers: [
+              ...CONSOLE_GHIDRA_OPTIONAL_DISABLED_ANALYZERS,
+            ],
+          },
         }),
       }),
     );
@@ -404,6 +432,20 @@ export const ghidraProfileDisabledAnalyzers = (
   const options = parameters.analysis_options;
   if (typeof options !== "object" || options === null) return undefined;
   const disabled = (options as Record<string, unknown>).disabled_analyzers;
+  if (!Array.isArray(disabled)) return undefined;
+  return disabled.every((name) => typeof name === "string")
+    ? (disabled as readonly string[])
+    : undefined;
+};
+
+/** Read the optional (disable-if-present) analyzer commitment from a profile. */
+export const ghidraProfileOptionalDisabledAnalyzers = (
+  parameters: Readonly<Record<string, unknown>>,
+): readonly string[] | undefined => {
+  const options = parameters.analysis_options;
+  if (typeof options !== "object" || options === null) return undefined;
+  const disabled = (options as Record<string, unknown>)
+    .optional_disabled_analyzers;
   if (!Array.isArray(disabled)) return undefined;
   return disabled.every((name) => typeof name === "string")
     ? (disabled as readonly string[])

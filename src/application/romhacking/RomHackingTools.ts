@@ -22,7 +22,7 @@ import {
   decodeRomStringFromBytes,
   encodeRomQueryString,
   extractRomStringsFromBuffer,
-  findCodeCavesInSlice,
+  findCodeCavesInSliceTopK,
   formatHexPattern,
   normalizeRomTextEncoding,
   parseCustomCharTable,
@@ -52,6 +52,7 @@ const searchBytesResponseSchema = z.object({
     }),
   ),
   complete: z.boolean(),
+  next_cursor: z.string().nullable().optional(),
 });
 
 const fileOffsetResponseSchema = z.object({
@@ -67,6 +68,36 @@ interface LocalRomContext {
   readonly toVirtualAddress: (fileOffset: number) => string | null;
 }
 
+const ROM_BYTES_CACHE_LIMIT = 4;
+const romBytesCache = new Map<string, Buffer>();
+
+/** ROM bytes keyed by the resolved target identity (path + content digest). */
+const readRomBytesCached = async (
+  target: BinaryTarget & { readonly path: string; readonly sha256: string },
+): Promise<Buffer | undefined> => {
+  const key = `${target.path}\0${target.sha256}`;
+  const cached = romBytesCache.get(key);
+  if (cached !== undefined) {
+    // Refresh LRU order.
+    romBytesCache.delete(key);
+    romBytesCache.set(key, cached);
+    return cached;
+  }
+  let romBytes: Buffer;
+  try {
+    romBytes = await readFile(target.path);
+  } catch {
+    return undefined;
+  }
+  romBytesCache.set(key, romBytes);
+  while (romBytesCache.size > ROM_BYTES_CACHE_LIMIT) {
+    const oldest = romBytesCache.keys().next().value;
+    if (oldest === undefined) break;
+    romBytesCache.delete(oldest);
+  }
+  return romBytes;
+};
+
 const loadLocalRomContext = async (
   target: BinaryTarget | undefined,
 ): Promise<LocalRomContext | undefined> => {
@@ -77,12 +108,8 @@ const loadLocalRomContext = async (
   ) {
     return undefined;
   }
-  let romBytes: Buffer;
-  try {
-    romBytes = await readFile(target.path);
-  } catch {
-    return undefined;
-  }
+  const romBytes = await readRomBytesCached(target);
+  if (romBytes === undefined) return undefined;
   if (isConsoleBinaryTarget(target)) {
     const admission = target.consoleRom;
     return {
@@ -224,6 +251,122 @@ const resolveOptionalXrefs = async (
   return [];
 };
 
+/** Resolve file offsets for many addresses: one provider call per unique address, issued together. */
+const resolveFileOffsetsBatched = async (
+  analysis: AnalysisOperationPort,
+  addresses: readonly string[],
+  signal?: AbortSignal,
+): Promise<ReadonlyMap<string, number | null>> => {
+  const unique = [...new Set(addresses)];
+  const values = await Promise.all(
+    unique.map((address) =>
+      resolveOptionalFileOffset(analysis, address, signal),
+    ),
+  );
+  return new Map(unique.map((address, index) => [address, values[index]!]));
+};
+
+/** Resolve xrefs for many addresses: one provider call per unique address, issued together. */
+const resolveXrefsBatched = async (
+  analysis: AnalysisOperationPort,
+  addresses: readonly string[],
+  enabled: boolean,
+  signal?: AbortSignal,
+): Promise<ReadonlyMap<string, readonly string[]>> => {
+  if (!enabled) return new Map();
+  const unique = [...new Set(addresses)];
+  const values = await Promise.all(
+    unique.map((address) =>
+      resolveOptionalXrefs(analysis, address, true, signal),
+    ),
+  );
+  return new Map(unique.map((address, index) => [address, values[index]!]));
+};
+
+/** Whether an extracted string ran to the scan-window edge without its terminator. */
+const extractedTextTruncated = (
+  bytes: Uint8Array,
+  offsetInBuffer: number,
+  byteLength: number,
+  terminatorByte: number | null,
+  windowMayContinue: boolean,
+): boolean => {
+  if (!windowMayContinue || byteLength <= 0) return false;
+  const end = offsetInBuffer + byteLength;
+  if (end < bytes.length) return false;
+  return !(terminatorByte !== null && bytes[end - 1] === terminatorByte);
+};
+
+/** Parse an opaque search cursor (a non-negative decimal resume position). */
+const parseRomCursor = (
+  operation: string,
+  cursor: string | undefined,
+): Result<number, AnalysisError> => {
+  if (cursor === undefined) return ok(0);
+  if (!/^\d+$/u.test(cursor.trim())) {
+    return err(
+      new AnalysisInputError(operation, {
+        userMessage:
+          "Invalid cursor: pass back the next_cursor value from the previous identical call.",
+      }),
+    );
+  }
+  const value = Number(cursor.trim());
+  return Number.isSafeInteger(value)
+    ? ok(value)
+    : err(
+        new AnalysisInputError(operation, {
+          userMessage:
+            "Invalid cursor: pass back the next_cursor value from the previous identical call.",
+        }),
+      );
+};
+
+/** Whether a decode consumed the whole window without reaching its terminator. */
+const decodeWindowTruncated = (
+  buf: Uint8Array,
+  byteLength: number,
+  terminatorByte: number | null,
+  windowMayContinue: boolean,
+): boolean =>
+  windowMayContinue &&
+  byteLength >= buf.length &&
+  byteLength > 0 &&
+  !(terminatorByte !== null && buf[byteLength - 1] === terminatorByte);
+
+/** Manuscript strings are decoded to their terminator within this bound. */
+const MANUSCRIPT_MAX_BYTES = 4096;
+
+/** Collapse manuscript records sharing one target; extra slots become references. */
+const dedupManuscriptRecords = <
+  T extends {
+    readonly index: number;
+    readonly target_address: string;
+    readonly target_file_offset: number | null;
+    also_referenced_by?: number[];
+  },
+>(
+  records: readonly T[],
+): T[] => {
+  const firstByTarget = new Map<string, T>();
+  const unique: T[] = [];
+  for (const record of records) {
+    const key =
+      record.target_file_offset !== null
+        ? `off:${record.target_file_offset}`
+        : `addr:${record.target_address}`;
+    const first = firstByTarget.get(key);
+    if (first === undefined) {
+      firstByTarget.set(key, record);
+      unique.push(record);
+    } else {
+      first.also_referenced_by ??= [];
+      first.also_referenced_by.push(record.index);
+    }
+  }
+  return unique;
+};
+
 export const executeSearchRomStrings = async (
   analysis: AnalysisOperationPort,
   input: SearchRomStringsInput,
@@ -241,6 +384,16 @@ export const executeSearchRomStrings = async (
   if (!tableResult.ok) return tableResult;
   const customTable = tableResult.value;
   const localRom = await loadLocalRomContext(target);
+  // Provider query search uses the provider's own opaque cursor verbatim;
+  // local and range scans use a numeric resume offset.
+  const usesProviderCursor =
+    input.query !== undefined && localRom === undefined;
+  let pageCursor = 0;
+  if (!usesProviderCursor) {
+    const cursorResult = parseRomCursor("search_rom_strings", input.cursor);
+    if (!cursorResult.ok) return cursorResult;
+    pageCursor = cursorResult.value;
+  }
 
   if (input.query !== undefined) {
     const encodedResult = encodeRomQueryString(
@@ -279,21 +432,29 @@ export const executeSearchRomStrings = async (
           ? Math.min(input.end_offset, localRom.romBytes.length)
           : localRom.romBytes.length;
 
+      // Count every match in the range (native indexOf) while collecting
+      // only this page, starting at the cursor's file offset.
+      const pageStart = Math.max(searchStart, pageCursor);
       const foundOffsets: number[] = [];
-      let truncated = false;
-      let cursor = searchStart;
-      while (cursor + needle.length <= searchEnd) {
-        const idx = localRom.romBytes.indexOf(needle, cursor);
+      let totalMatches = 0;
+      let nextCursor: string | null = null;
+      let scanAt = searchStart;
+      while (scanAt + needle.length <= searchEnd) {
+        const idx = localRom.romBytes.indexOf(needle, scanAt);
         if (idx === -1 || idx + needle.length > searchEnd) break;
-        if (foundOffsets.length >= input.max_results) {
-          truncated = true;
-          break;
+        totalMatches++;
+        if (idx >= pageStart) {
+          if (foundOffsets.length < input.max_results) {
+            foundOffsets.push(idx);
+          } else if (nextCursor === null) {
+            nextCursor = String(idx);
+          }
         }
-        foundOffsets.push(idx);
-        cursor = idx + 1;
+        scanAt = idx + 1;
       }
+      const truncated = nextCursor !== null;
 
-      const matches = [];
+      const pendingMatches = [];
       for (const fileOffset of foundOffsets) {
         const address =
           localRom.toVirtualAddress(fileOffset) ??
@@ -319,31 +480,38 @@ export const executeSearchRomStrings = async (
           terminatorByte !== null
             ? decoded.byteLength < buf.length || buf.includes(terminatorByte)
             : decoded.byteLength < buf.length;
-        const xrefs = await resolveOptionalXrefs(
-          analysis,
-          address,
-          input.resolve_xrefs,
-          signal,
-        );
-        matches.push({
+        const textTruncated =
+          !terminated && fileOffset + buf.length < localRom.romBytes.length;
+        pendingMatches.push({
           address,
           file_offset: fileOffset,
           encoding: input.encoding,
           text,
-          bytes_hex: bytesHex,
+          ...(textTruncated ? { text_truncated: true } : {}),
+          ...(input.include_hex ? { bytes_hex: bytesHex } : {}),
           byte_length: byteLength,
           terminated,
-          xrefs,
         });
       }
+      const xrefsByAddress = await resolveXrefsBatched(
+        analysis,
+        pendingMatches.map((match) => match.address),
+        input.resolve_xrefs,
+        signal,
+      );
+      const matches = pendingMatches.map((match) => ({
+        ...match,
+        xrefs: [...(xrefsByAddress.get(match.address) ?? [])],
+      }));
 
       return ok({
         mode: "query_search",
         encoding: input.encoding,
         encoded_query_pattern: pattern,
         matches,
-        total_matches: matches.length,
+        total_matches: totalMatches,
         truncated,
+        next_cursor: nextCursor,
       });
     }
 
@@ -356,6 +524,7 @@ export const executeSearchRomStrings = async (
           ? {}
           : { start: input.start_address }),
         limit: input.max_results,
+        ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
       },
       signal,
     );
@@ -376,8 +545,12 @@ export const executeSearchRomStrings = async (
       );
     }
 
-    const matches = [];
-    for (const item of parsedSearch.data.matches.slice(0, input.max_results)) {
+    const pageMatches = parsedSearch.data.matches.slice(0, input.max_results);
+    const providerNextCursor = parsedSearch.data.next_cursor ?? null;
+    const providerTruncated =
+      providerNextCursor !== null || !parsedSearch.data.complete;
+    const pendingMatches = [];
+    for (const item of pageMatches) {
       const readRes = await callOperation(
         analysis,
         "read_bytes",
@@ -412,27 +585,37 @@ export const executeSearchRomStrings = async (
         }
       }
 
-      const fileOffset = input.resolve_xrefs
-        ? await resolveOptionalFileOffset(analysis, item.address, signal)
-        : null;
-      const xrefs = await resolveOptionalXrefs(
-        analysis,
-        item.address,
-        input.resolve_xrefs,
-        signal,
-      );
-
-      matches.push({
+      pendingMatches.push({
         address: item.address,
-        file_offset: fileOffset,
         encoding: input.encoding,
         text,
+        text_truncated: !terminated && byteLength >= 128,
         bytes_hex: bytesHex,
         byte_length: byteLength,
         terminated,
-        xrefs,
       });
     }
+    const pendingAddresses = pendingMatches.map((match) => match.address);
+    const [offsetsByAddress, xrefsByAddress] = await Promise.all([
+      resolveFileOffsetsBatched(analysis, pendingAddresses, signal),
+      resolveXrefsBatched(
+        analysis,
+        pendingAddresses,
+        input.resolve_xrefs,
+        signal,
+      ),
+    ]);
+    const matches = pendingMatches.map((match) => ({
+      address: match.address,
+      file_offset: offsetsByAddress.get(match.address) ?? null,
+      encoding: match.encoding,
+      text: match.text,
+      ...(match.text_truncated ? { text_truncated: true } : {}),
+      ...(input.include_hex ? { bytes_hex: match.bytes_hex } : {}),
+      byte_length: match.byte_length,
+      terminated: match.terminated,
+      xrefs: [...(xrefsByAddress.get(match.address) ?? [])],
+    }));
 
     return ok({
       mode: "query_search",
@@ -440,7 +623,8 @@ export const executeSearchRomStrings = async (
       encoded_query_pattern: pattern,
       matches,
       total_matches: matches.length,
-      truncated: !parsedSearch.data.complete,
+      truncated: providerTruncated,
+      next_cursor: providerNextCursor,
     });
   }
 
@@ -488,37 +672,60 @@ export const executeSearchRomStrings = async (
       Math.min(startOffset, localRom.romBytes.length),
       Math.min(localRom.romBytes.length, startOffset + scanLength),
     );
-    const extracted = extractRomStringsFromBuffer({
+    const probed = extractRomStringsFromBuffer({
       bytes: slice,
       baseAddress: baseAddrBigInt,
       encoding: input.encoding,
       minLength: input.min_length,
       terminatorByte,
       customTable,
-      limit: input.max_results,
+      limit: input.max_results + 1,
+      includeRawHex: input.include_hex,
+      startOffset: pageCursor,
     });
+    const rangeTruncated = probed.length > input.max_results;
+    const extracted = rangeTruncated
+      ? probed.slice(0, input.max_results)
+      : probed;
+    const rangeNextCursor = rangeTruncated
+      ? String(probed[input.max_results]!.offsetInBuffer)
+      : null;
 
-    const matches = [];
-    for (const item of extracted) {
+    const sliceMayContinue =
+      startOffset + slice.length < localRom.romBytes.length;
+    const pendingMatches = extracted.map((item) => {
       const fileOffset = startOffset + item.offsetInBuffer;
-      const address = localRom.toVirtualAddress(fileOffset) ?? item.address;
-      const xrefs = await resolveOptionalXrefs(
-        analysis,
-        address,
-        input.resolve_xrefs,
-        signal,
-      );
-      matches.push({
-        address,
+      return {
+        address: localRom.toVirtualAddress(fileOffset) ?? item.address,
         file_offset: fileOffset,
         encoding: input.encoding,
         text: item.decoded,
-        bytes_hex: item.rawHex.replace(/\s+/gu, "").toLowerCase(),
+        ...(extractedTextTruncated(
+          slice,
+          item.offsetInBuffer,
+          item.byteLength,
+          terminatorByte,
+          sliceMayContinue,
+        )
+          ? { text_truncated: true }
+          : {}),
+        ...(input.include_hex
+          ? { bytes_hex: item.rawHex.replace(/\s+/gu, "").toLowerCase() }
+          : {}),
         byte_length: item.byteLength,
         terminated: true,
-        xrefs,
-      });
-    }
+      };
+    });
+    const xrefsByAddress = await resolveXrefsBatched(
+      analysis,
+      pendingMatches.map((match) => match.address),
+      input.resolve_xrefs,
+      signal,
+    );
+    const matches = pendingMatches.map((match) => ({
+      ...match,
+      xrefs: [...(xrefsByAddress.get(match.address) ?? [])],
+    }));
 
     return ok({
       mode: "range_scan",
@@ -526,7 +733,8 @@ export const executeSearchRomStrings = async (
       encoded_query_pattern: null,
       matches,
       total_matches: matches.length,
-      truncated: matches.length >= input.max_results,
+      truncated: rangeTruncated,
+      next_cursor: rangeNextCursor,
     });
   }
 
@@ -564,38 +772,56 @@ export const executeSearchRomStrings = async (
   }
 
   const buffer = Buffer.from(parsedRead.data.bytes_hex, "hex");
-  const extracted = extractRomStringsFromBuffer({
+  const probed = extractRomStringsFromBuffer({
     bytes: buffer,
     baseAddress: baseAddrResult.value,
     encoding: input.encoding,
     minLength: input.min_length,
     terminatorByte,
     customTable,
-    limit: input.max_results,
+    limit: input.max_results + 1,
+    includeRawHex: input.include_hex,
+    startOffset: pageCursor,
   });
+  const rangeTruncated = probed.length > input.max_results;
+  const extracted = rangeTruncated
+    ? probed.slice(0, input.max_results)
+    : probed;
+  const rangeNextCursor = rangeTruncated
+    ? String(probed[input.max_results]!.offsetInBuffer)
+    : null;
 
-  const matches = [];
-  for (const item of extracted) {
-    const fileOffset = input.resolve_xrefs
-      ? await resolveOptionalFileOffset(analysis, item.address, signal)
-      : null;
-    const xrefs = await resolveOptionalXrefs(
+  const pendingAddresses = extracted.map((item) => item.address);
+  const [providerOffsets, providerXrefs] = await Promise.all([
+    resolveFileOffsetsBatched(analysis, pendingAddresses, signal),
+    resolveXrefsBatched(
       analysis,
-      item.address,
+      pendingAddresses,
       input.resolve_xrefs,
       signal,
-    );
-    matches.push({
-      address: item.address,
-      file_offset: fileOffset,
-      encoding: input.encoding,
-      text: item.decoded,
-      bytes_hex: item.rawHex.replace(/\s+/gu, "").toLowerCase(),
-      byte_length: item.byteLength,
-      terminated: true,
-      xrefs,
-    });
-  }
+    ),
+  ]);
+  const matches = extracted.map((item) => ({
+    address: item.address,
+    file_offset: providerOffsets.get(item.address) ?? null,
+    encoding: input.encoding,
+    text: item.decoded,
+    ...(extractedTextTruncated(
+      buffer,
+      item.offsetInBuffer,
+      item.byteLength,
+      terminatorByte,
+      true,
+    )
+      ? { text_truncated: true }
+      : {}),
+    ...(input.include_hex
+      ? { bytes_hex: item.rawHex.replace(/\s+/gu, "").toLowerCase() }
+      : {}),
+    byte_length: item.byteLength,
+    terminated: true,
+    xrefs: [...(providerXrefs.get(item.address) ?? [])],
+  }));
 
   return ok({
     mode: "range_scan",
@@ -603,7 +829,8 @@ export const executeSearchRomStrings = async (
     encoded_query_pattern: null,
     matches,
     total_matches: matches.length,
-    truncated: matches.length >= input.max_results,
+    truncated: rangeTruncated,
+    next_cursor: rangeNextCursor,
   });
 };
 
@@ -693,11 +920,18 @@ export const executeScanPointerTable = async (
     ) {
       const tableBuffer = localRom.romBytes.subarray(
         tableFileOffset,
-        Math.min(localRom.romBytes.length, tableFileOffset + totalBytesToRead),
+        Math.min(
+          localRom.romBytes.length,
+          tableFileOffset + input.start_index * stride + totalBytesToRead,
+        ),
       );
       const entries = [];
 
-      for (let index = 0; index < input.count; index += 1) {
+      for (
+        let index = input.start_index;
+        index < input.start_index + input.count;
+        index += 1
+      ) {
         const byteOffset = index * stride;
         if (byteOffset + pointerWidth > tableBuffer.length) break;
 
@@ -720,6 +954,7 @@ export const executeScanPointerTable = async (
         );
 
         let previewText: string | null = null;
+        let previewTruncated = false;
         let previewBytesHex: string | null = null;
         let previewByteLength: number | null = null;
 
@@ -744,23 +979,18 @@ export const executeScanPointerTable = async (
               customTable,
             );
             previewText = decoded.decoded;
-            previewBytesHex = decoded.rawHex.replace(/\s+/gu, "").toLowerCase();
+            previewTruncated = decodeWindowTruncated(
+              targetBuf,
+              decoded.byteLength,
+              terminatorByte,
+              targetFileOffset + targetBuf.length < localRom.romBytes.length,
+            );
+            previewBytesHex = input.include_hex
+              ? decoded.rawHex.replace(/\s+/gu, "").toLowerCase()
+              : null;
             previewByteLength = decoded.byteLength;
           }
         }
-
-        const entryXrefs = await resolveOptionalXrefs(
-          analysis,
-          entryAddress,
-          input.resolve_xrefs,
-          signal,
-        );
-        const targetXrefs = await resolveOptionalXrefs(
-          analysis,
-          targetAddress,
-          input.resolve_xrefs,
-          signal,
-        );
 
         entries.push({
           index,
@@ -770,10 +1000,21 @@ export const executeScanPointerTable = async (
           target_address: targetAddress,
           target_file_offset: targetFileOffset,
           preview_text: previewText,
+          ...(previewTruncated ? { preview_truncated: true } : {}),
           preview_bytes_hex: previewBytesHex,
           preview_byte_length: previewByteLength,
-          entry_xrefs: entryXrefs,
-          target_xrefs: targetXrefs,
+        });
+      }
+      const localXrefs = await resolveXrefsBatched(
+        analysis,
+        entries.flatMap((entry) => [entry.entry_address, entry.target_address]),
+        input.resolve_xrefs,
+        signal,
+      );
+      for (const entry of entries) {
+        Object.assign(entry, {
+          entry_xrefs: [...(localXrefs.get(entry.entry_address) ?? [])],
+          target_xrefs: [...(localXrefs.get(entry.target_address) ?? [])],
         });
       }
 
@@ -782,19 +1023,69 @@ export const executeScanPointerTable = async (
         ...entry,
         allocated_budget_bytes: budgets[idx] ?? null,
       }));
-      const manuscriptRecords = input.include_manuscript
-        ? enrichedEntries.map((entry) => ({
-            id: `ptr_${entry.index.toString().padStart(4, "0")}`,
-            index: entry.index,
-            pointer_address: entry.entry_address,
-            pointer_file_offset: entry.entry_file_offset,
-            target_address: entry.target_address,
-            target_file_offset: entry.target_file_offset,
-            byte_length: entry.preview_byte_length,
-            max_bytes: entry.allocated_budget_bytes,
-            jp: entry.preview_text ?? "",
-            ko: "",
-          }))
+      const wantsManuscript = input.include_manuscript || input.manuscript_only;
+      // Manuscript text is decoded to its terminator (not the preview cap),
+      // once per unique target.
+      const fullByTarget = new Map<
+        string,
+        { text: string; byteLength: number; truncated: boolean }
+      >();
+      if (wantsManuscript) {
+        for (const entry of enrichedEntries) {
+          const key =
+            entry.target_file_offset !== null
+              ? `off:${entry.target_file_offset}`
+              : `addr:${entry.target_address}`;
+          if (fullByTarget.has(key)) continue;
+          const off = entry.target_file_offset;
+          if (off === null || off < 0 || off >= localRom.romBytes.length) {
+            continue;
+          }
+          const buf = localRom.romBytes.subarray(
+            off,
+            Math.min(localRom.romBytes.length, off + MANUSCRIPT_MAX_BYTES),
+          );
+          const decoded = decodeRomStringFromBytes(
+            buf,
+            input.encoding,
+            terminatorByte,
+            customTable,
+          );
+          fullByTarget.set(key, {
+            text: decoded.decoded,
+            byteLength: decoded.byteLength,
+            truncated: decodeWindowTruncated(
+              buf,
+              decoded.byteLength,
+              terminatorByte,
+              off + buf.length < localRom.romBytes.length,
+            ),
+          });
+        }
+      }
+      const manuscriptRecords = wantsManuscript
+        ? dedupManuscriptRecords(
+            enrichedEntries.map((entry) => {
+              const key =
+                entry.target_file_offset !== null
+                  ? `off:${entry.target_file_offset}`
+                  : `addr:${entry.target_address}`;
+              const full = fullByTarget.get(key);
+              return {
+                id: `ptr_${entry.index.toString().padStart(4, "0")}`,
+                index: entry.index,
+                pointer_address: entry.entry_address,
+                pointer_file_offset: entry.entry_file_offset,
+                target_address: entry.target_address,
+                target_file_offset: entry.target_file_offset,
+                byte_length: full?.byteLength ?? entry.preview_byte_length,
+                max_bytes: entry.allocated_budget_bytes,
+                jp: full?.text ?? entry.preview_text ?? "",
+                ...(full?.truncated ? { truncated: true } : {}),
+                ko: "",
+              };
+            }),
+          )
         : undefined;
 
       return ok({
@@ -805,8 +1096,10 @@ export const executeScanPointerTable = async (
         base_address: `0x${baseAddrResult.value.toString(16)}`,
         stride,
         encoding: input.encoding,
-        entries: enrichedEntries,
+        entries: input.manuscript_only ? [] : enrichedEntries,
         entries_scanned: enrichedEntries.length,
+        start_index: input.start_index,
+        next_start_index: input.start_index + enrichedEntries.length,
         ...(manuscriptRecords === undefined
           ? {}
           : { manuscript_records: manuscriptRecords }),
@@ -823,10 +1116,14 @@ export const executeScanPointerTable = async (
   );
   if (!tableAddrResult.ok) return tableAddrResult;
 
+  const pageReadAddress =
+    input.start_index === 0
+      ? addressStr
+      : `0x${(tableAddrResult.value + BigInt(input.start_index * stride)).toString(16)}`;
   const readRes = await callOperation(
     analysis,
     "read_bytes",
-    { address: addressStr, length: totalBytesToRead },
+    { address: pageReadAddress, length: totalBytesToRead },
     signal,
   );
   if (!readRes.ok) return readRes;
@@ -843,111 +1140,188 @@ export const executeScanPointerTable = async (
   }
 
   const tableBuffer = Buffer.from(parsedRead.data.bytes_hex, "hex");
-  const entries = [];
-
-  for (let index = 0; index < input.count; index += 1) {
-    const byteOffset = index * stride;
+  const rawEntries = [];
+  for (let localIndex = 0; localIndex < input.count; localIndex += 1) {
+    const byteOffset = localIndex * stride;
     if (byteOffset + pointerWidth > tableBuffer.length) break;
-
-    const entryAddrBigInt = tableAddrResult.value + BigInt(byteOffset);
-    const entryAddress = `0x${entryAddrBigInt.toString(16)}`;
     const rawValue = readPointerValue(
       tableBuffer,
       byteOffset,
       pointerWidth,
       endian,
     );
-    const targetAddress = `0x${(baseAddrResult.value + rawValue).toString(16)}`;
-    const rawPointer = `0x${rawValue.toString(16).padStart(pointerWidth * 2, "0")}`;
-
-    const entryFileOffset = input.resolve_xrefs
-      ? await resolveOptionalFileOffset(analysis, entryAddress, signal)
-      : null;
-    const targetFileOffset = await resolveOptionalFileOffset(
-      analysis,
-      targetAddress,
-      signal,
-    );
-
-    let previewText: string | null = null;
-    let previewBytesHex: string | null = null;
-    let previewByteLength: number | null = null;
-
-    if (input.preview_bytes > 0) {
-      const targetRead = await callOperation(
-        analysis,
-        "read_bytes",
-        { address: targetAddress, length: input.preview_bytes },
-        signal,
-      );
-      if (targetRead.ok) {
-        const parsedTargetRead = readBytesResponseSchema.safeParse(
-          targetRead.value,
-        );
-        if (
-          parsedTargetRead.success &&
-          parsedTargetRead.data.bytes_hex.length > 0
-        ) {
-          const targetBuf = Buffer.from(parsedTargetRead.data.bytes_hex, "hex");
-          const decoded = decodeRomStringFromBytes(
-            targetBuf,
-            input.encoding,
-            terminatorByte,
-            customTable,
-          );
-          previewText = decoded.decoded;
-          previewBytesHex = decoded.rawHex.replace(/\s+/gu, "").toLowerCase();
-          previewByteLength = decoded.byteLength;
-        }
-      }
-    }
-
-    const entryXrefs = await resolveOptionalXrefs(
-      analysis,
-      entryAddress,
-      input.resolve_xrefs,
-      signal,
-    );
-    const targetXrefs = await resolveOptionalXrefs(
-      analysis,
-      targetAddress,
-      input.resolve_xrefs,
-      signal,
-    );
-
-    entries.push({
-      index,
-      entry_address: entryAddress,
-      entry_file_offset: entryFileOffset,
-      raw_pointer: rawPointer,
-      target_address: targetAddress,
-      target_file_offset: targetFileOffset,
-      preview_text: previewText,
-      preview_bytes_hex: previewBytesHex,
-      preview_byte_length: previewByteLength,
-      entry_xrefs: entryXrefs,
-      target_xrefs: targetXrefs,
+    rawEntries.push({
+      index: input.start_index + localIndex,
+      entry_address: `0x${(tableAddrResult.value + BigInt(input.start_index * stride + byteOffset)).toString(16)}`,
+      raw_pointer: `0x${rawValue.toString(16).padStart(pointerWidth * 2, "0")}`,
+      target_address: `0x${(baseAddrResult.value + rawValue).toString(16)}`,
     });
   }
+
+  // Batch every per-entry provider call: offsets and xrefs once per unique
+  // address, previews once per unique target, all issued together.
+  const allAddresses = rawEntries.flatMap((entry) => [
+    entry.entry_address,
+    entry.target_address,
+  ]);
+  const uniqueTargets = [...new Set(rawEntries.map((e) => e.target_address))];
+  const readPreview = async (
+    targetAddress: string,
+  ): Promise<{
+    readonly text: string | null;
+    readonly truncated: boolean;
+    readonly bytesHex: string | null;
+    readonly byteLength: number | null;
+  }> => {
+    if (input.preview_bytes <= 0) {
+      return { text: null, truncated: false, bytesHex: null, byteLength: null };
+    }
+    const targetRead = await callOperation(
+      analysis,
+      "read_bytes",
+      { address: targetAddress, length: input.preview_bytes },
+      signal,
+    );
+    if (!targetRead.ok) {
+      return { text: null, truncated: false, bytesHex: null, byteLength: null };
+    }
+    const parsedTargetRead = readBytesResponseSchema.safeParse(
+      targetRead.value,
+    );
+    if (
+      !parsedTargetRead.success ||
+      parsedTargetRead.data.bytes_hex.length === 0
+    ) {
+      return { text: null, truncated: false, bytesHex: null, byteLength: null };
+    }
+    const targetBuf = Buffer.from(parsedTargetRead.data.bytes_hex, "hex");
+    const decoded = decodeRomStringFromBytes(
+      targetBuf,
+      input.encoding,
+      terminatorByte,
+      customTable,
+    );
+    return {
+      text: decoded.decoded,
+      truncated: decodeWindowTruncated(
+        targetBuf,
+        decoded.byteLength,
+        terminatorByte,
+        true,
+      ),
+      bytesHex: input.include_hex
+        ? decoded.rawHex.replace(/\s+/gu, "").toLowerCase()
+        : null,
+      byteLength: decoded.byteLength,
+    };
+  };
+  const [scanOffsets, scanXrefs, previewValues] = await Promise.all([
+    resolveFileOffsetsBatched(analysis, allAddresses, signal),
+    resolveXrefsBatched(analysis, allAddresses, input.resolve_xrefs, signal),
+    Promise.all(uniqueTargets.map(readPreview)),
+  ]);
+  const previewsByTarget = new Map(
+    uniqueTargets.map((address, index) => [address, previewValues[index]!]),
+  );
+  const entries = rawEntries.map((entry) => {
+    const preview = previewsByTarget.get(entry.target_address) ?? {
+      text: null,
+      truncated: false,
+      bytesHex: null,
+      byteLength: null,
+    };
+    return {
+      index: entry.index,
+      entry_address: entry.entry_address,
+      entry_file_offset: scanOffsets.get(entry.entry_address) ?? null,
+      raw_pointer: entry.raw_pointer,
+      target_address: entry.target_address,
+      target_file_offset: scanOffsets.get(entry.target_address) ?? null,
+      preview_text: preview.text,
+      ...(preview.truncated ? { preview_truncated: true } : {}),
+      preview_bytes_hex: preview.bytesHex,
+      preview_byte_length: preview.byteLength,
+      entry_xrefs: [...(scanXrefs.get(entry.entry_address) ?? [])],
+      target_xrefs: [...(scanXrefs.get(entry.target_address) ?? [])],
+    };
+  });
 
   const budgets = computePointerSlotBudgets(entries);
   const enrichedEntries = entries.map((entry, idx) => ({
     ...entry,
     allocated_budget_bytes: budgets[idx] ?? null,
   }));
-  const manuscriptRecords = input.include_manuscript
-    ? enrichedEntries.map((entry) => ({
-        id: `ptr_${entry.index.toString().padStart(4, "0")}`,
-        index: entry.index,
-        pointer_address: entry.entry_address,
-        pointer_file_offset: entry.entry_file_offset,
-        target_address: entry.target_address,
-        target_file_offset: entry.target_file_offset,
-        byte_length: entry.preview_byte_length,
-        max_bytes: entry.allocated_budget_bytes,
-        jp: entry.preview_text ?? "",
-        ko: "",
-      }))
+  const wantsManuscript = input.include_manuscript || input.manuscript_only;
+  // Manuscript text is decoded to its terminator (not the preview cap),
+  // with one batched read per unique target.
+  const fullByTarget = new Map<
+    string,
+    { text: string; byteLength: number; truncated: boolean }
+  >();
+  if (wantsManuscript) {
+    const readFull = async (
+      targetAddress: string,
+    ): Promise<{
+      text: string;
+      byteLength: number;
+      truncated: boolean;
+    } | null> => {
+      const fullRead = await callOperation(
+        analysis,
+        "read_bytes",
+        { address: targetAddress, length: MANUSCRIPT_MAX_BYTES },
+        signal,
+      );
+      if (!fullRead.ok) return null;
+      const parsedFull = readBytesResponseSchema.safeParse(fullRead.value);
+      if (!parsedFull.success || parsedFull.data.bytes_hex.length === 0) {
+        return null;
+      }
+      const buf = Buffer.from(parsedFull.data.bytes_hex, "hex");
+      const decoded = decodeRomStringFromBytes(
+        buf,
+        input.encoding,
+        terminatorByte,
+        customTable,
+      );
+      return {
+        text: decoded.decoded,
+        byteLength: decoded.byteLength,
+        truncated: decodeWindowTruncated(
+          buf,
+          decoded.byteLength,
+          terminatorByte,
+          true,
+        ),
+      };
+    };
+    const fullValues = await Promise.all(uniqueTargets.map(readFull));
+    uniqueTargets.forEach((address, index) => {
+      const full = fullValues[index];
+      if (full !== null && full !== undefined) {
+        fullByTarget.set(`addr:${address}`, full);
+      }
+    });
+  }
+  const manuscriptRecords = wantsManuscript
+    ? dedupManuscriptRecords(
+        enrichedEntries.map((entry) => {
+          const full = fullByTarget.get(`addr:${entry.target_address}`);
+          return {
+            id: `ptr_${entry.index.toString().padStart(4, "0")}`,
+            index: entry.index,
+            pointer_address: entry.entry_address,
+            pointer_file_offset: entry.entry_file_offset,
+            target_address: entry.target_address,
+            target_file_offset: entry.target_file_offset,
+            byte_length: full?.byteLength ?? entry.preview_byte_length,
+            max_bytes: entry.allocated_budget_bytes,
+            jp: full?.text ?? entry.preview_text ?? "",
+            ...(full?.truncated ? { truncated: true } : {}),
+            ko: "",
+          };
+        }),
+      )
     : undefined;
 
   return ok({
@@ -957,8 +1331,10 @@ export const executeScanPointerTable = async (
     base_address: `0x${baseAddrResult.value.toString(16)}`,
     stride,
     encoding: input.encoding,
-    entries: enrichedEntries,
+    entries: input.manuscript_only ? [] : enrichedEntries,
     entries_scanned: enrichedEntries.length,
+    start_index: input.start_index,
+    next_start_index: input.start_index + enrichedEntries.length,
     ...(manuscriptRecords === undefined
       ? {}
       : { manuscript_records: manuscriptRecords }),
@@ -986,8 +1362,8 @@ const isLikelyValidDecodedTarget = (
     !(
       canonical === "tbl" &&
       terminatorByte === 0x00 &&
-      customTable?.decodeByLength.get(1)?.has("00") === true &&
-      !customTable.endTokens.has("00")
+      customTable?.decodeByLength.get(1)?.has(0) === true &&
+      !customTable.endTokens.has(0)
     )
   ) {
     return { valid: false, text: "", byteLength: 0 };
@@ -1001,6 +1377,7 @@ const isLikelyValidDecodedTarget = (
     terminatorByte,
     customTable,
     limit: 1,
+    includeRawHex: false,
   });
   const first = extracted[0];
   if (first === undefined || first.offsetInBuffer !== 0) {
@@ -1229,12 +1606,6 @@ export const executeDiscoverPointerTables = async (
         Math.round(
           (lengths.reduce((acc, v) => acc + v, 0) / lengths.length) * 100,
         ) / 100;
-      const tableXrefs = await resolveOptionalXrefs(
-        analysis,
-        tableAddress,
-        input.resolve_xrefs,
-        signal,
-      );
       const samples = runEntries
         .slice(0, input.sample_entries)
         .map((e, idx) => ({
@@ -1257,7 +1628,7 @@ export const executeDiscoverPointerTables = async (
         min_string_bytes: minBytes,
         max_string_bytes: maxBytes,
         avg_string_bytes: avgBytes,
-        table_xrefs: tableXrefs,
+        table_xrefs: [] as string[],
         samples,
       });
       cursor = probeOffset;
@@ -1265,6 +1636,18 @@ export const executeDiscoverPointerTables = async (
     }
 
     cursor += stepAlignment;
+  }
+
+  const discoveredXrefs = await resolveXrefsBatched(
+    analysis,
+    discoveredTables.map((table) => table.table_address),
+    input.resolve_xrefs,
+    signal,
+  );
+  for (const table of discoveredTables) {
+    Object.assign(table, {
+      table_xrefs: [...(discoveredXrefs.get(table.table_address) ?? [])],
+    });
   }
 
   return ok({
@@ -1294,6 +1677,25 @@ export const executeFindCodeCaves = async (
     readonly region_name: string | null;
     readonly executable: boolean;
   }[] = [];
+  let totalCavesFound = 0;
+  const sortRawCaves = (): void => {
+    rawCaves.sort(
+      (a, b) =>
+        b.byte_length - a.byte_length ||
+        (a.file_offset ?? 0) - (b.file_offset ?? 0),
+    );
+  };
+  const addCaves = (
+    found: readonly (typeof rawCaves)[number][],
+    total: number,
+  ): void => {
+    totalCavesFound += total;
+    rawCaves.push(...found);
+    if (rawCaves.length > input.max_results * 4) {
+      sortRawCaves();
+      rawCaves.length = input.max_results;
+    }
+  };
 
   if (localRom !== undefined) {
     const romBytes = localRom.romBytes;
@@ -1314,7 +1716,7 @@ export const executeFindCodeCaves = async (
         const end = Math.min(map.fileOffset + map.byteLength, romBytes.length);
         if (end <= start) continue;
         const mapStartVaddr = BigInt(map.virtualAddress);
-        const found = findCodeCavesInSlice({
+        const found = findCodeCavesInSliceTopK({
           bytes: romBytes.subarray(start, end),
           sliceFileOffset: start,
           regionName: map.name,
@@ -1324,8 +1726,9 @@ export const executeFindCodeCaves = async (
           fillByte: input.fill_byte,
           toVirtualAddress: (fo) =>
             `0x${(mapStartVaddr + BigInt(fo - start)).toString(16)}`,
+          limit: input.max_results,
         });
-        rawCaves.push(...found);
+        addCaves(found.caves, found.total);
       }
     } else {
       let startOffset = input.start_offset ?? 0;
@@ -1353,7 +1756,7 @@ export const executeFindCodeCaves = async (
         input.end_offset !== undefined
           ? Math.min(input.end_offset, romBytes.length)
           : romBytes.length;
-      const found = findCodeCavesInSlice({
+      const found = findCodeCavesInSliceTopK({
         bytes: romBytes.subarray(
           Math.min(startOffset, romBytes.length),
           Math.max(Math.min(startOffset, romBytes.length), endOffset),
@@ -1368,8 +1771,9 @@ export const executeFindCodeCaves = async (
         alignment: input.alignment,
         fillByte: input.fill_byte,
         toVirtualAddress: localRom.toVirtualAddress,
+        limit: input.max_results,
       });
-      rawCaves.push(...found);
+      addCaves(found.caves, found.total);
     }
   } else {
     const startAddrStr =
@@ -1403,7 +1807,7 @@ export const executeFindCodeCaves = async (
       );
     }
     const buffer = Buffer.from(parsedRead.data.bytes_hex, "hex");
-    const found = findCodeCavesInSlice({
+    const found = findCodeCavesInSliceTopK({
       bytes: buffer,
       sliceFileOffset: 0,
       regionName: null,
@@ -1412,43 +1816,43 @@ export const executeFindCodeCaves = async (
       alignment: input.alignment,
       fillByte: input.fill_byte,
       toVirtualAddress: (fo) => `0x${(baseAddr + BigInt(fo)).toString(16)}`,
+      limit: input.max_results,
     });
-    for (const cave of found) {
-      const fileOffset = input.resolve_xrefs
-        ? await resolveOptionalFileOffset(analysis, cave.address, signal)
-        : null;
-      rawCaves.push({
-        ...cave,
-        file_offset: fileOffset,
-      });
-    }
+    // Provider file offsets are resolved below, only for returned caves.
+    addCaves(
+      found.caves.map((cave) => ({ ...cave, file_offset: null })),
+      found.total,
+    );
   }
 
-  rawCaves.sort(
-    (a, b) =>
-      b.byte_length - a.byte_length ||
-      (a.file_offset ?? 0) - (b.file_offset ?? 0),
-  );
+  sortRawCaves();
 
   const selected = rawCaves.slice(0, input.max_results);
-  const caves = [];
-  for (const item of selected) {
-    const xrefs = await resolveOptionalXrefs(
+  const selectedAddresses = selected.map((item) => item.address);
+  const needsProviderOffsets = localRom === undefined && selected.length > 0;
+  const [caveOffsets, caveXrefs] = await Promise.all([
+    needsProviderOffsets
+      ? resolveFileOffsetsBatched(analysis, selectedAddresses, signal)
+      : Promise.resolve(new Map<string, number | null>()),
+    resolveXrefsBatched(
       analysis,
-      item.address,
+      selectedAddresses,
       input.resolve_xrefs,
       signal,
-    );
-    caves.push({
-      ...item,
-      xrefs,
-    });
-  }
+    ),
+  ]);
+  const caves = selected.map((item) => ({
+    ...item,
+    ...(needsProviderOffsets
+      ? { file_offset: caveOffsets.get(item.address) ?? null }
+      : {}),
+    xrefs: [...(caveXrefs.get(item.address) ?? [])],
+  }));
 
   return ok({
     min_size: input.min_size,
     alignment: input.alignment,
     caves,
-    total_caves: caves.length,
+    total_caves: totalCavesFound,
   });
 };

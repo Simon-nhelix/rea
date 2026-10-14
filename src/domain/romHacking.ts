@@ -45,22 +45,40 @@ export const normalizeRomTextEncoding = (
 
 export const romTextEncodingSchema = z.enum(ROM_TEXT_ENCODINGS);
 
+/** Packed .tbl byte-sequence key: number for up to 6 bytes, bigint beyond. */
+export type TblByteKey = number | bigint;
+
+const tblByteKey = (
+  bytes: Uint8Array,
+  pos: number,
+  len: number,
+): TblByteKey => {
+  if (len <= 6) {
+    let key = 0;
+    for (let k = 0; k < len; k++) key = key * 256 + (bytes[pos + k] ?? 0);
+    return key;
+  }
+  let key = 0n;
+  for (let k = 0; k < len; k++) key = (key << 8n) | BigInt(bytes[pos + k] ?? 0);
+  return key;
+};
+
 /** Parsed custom .tbl character mapping table for ROM hacking. */
 export interface CustomCharTable {
-  readonly decodeByLength: ReadonlyMap<number, ReadonlyMap<string, string>>;
+  readonly decodeByLength: ReadonlyMap<number, ReadonlyMap<TblByteKey, string>>;
   readonly maxByteLength: number;
   readonly encodeMap: ReadonlyMap<string, Uint8Array>;
   readonly maxTokenLength: number;
-  readonly endTokens: ReadonlySet<string>;
+  readonly endTokens: ReadonlySet<TblByteKey>;
 }
 
 /** Parse a standard ROM hacking .tbl character table (e.g. "8140= ", "00=[END]"). */
 export const parseCustomCharTable = (
   text: string,
 ): Result<CustomCharTable, string> => {
-  const decodeByLength = new Map<number, Map<string, string>>();
+  const decodeByLength = new Map<number, Map<TblByteKey, string>>();
   const encodeMap = new Map<string, Uint8Array>();
-  const endTokens = new Set<string>();
+  const endTokens = new Set<TblByteKey>();
   let maxByteLength = 1;
   let maxTokenLength = 1;
 
@@ -97,20 +115,21 @@ export const parseCustomCharTable = (
     for (let b = 0; b < byteLen; b++) {
       bytes[b] = Number.parseInt(hexKey.slice(b * 2, b * 2 + 2), 16);
     }
+    const byteKey = tblByteKey(bytes, 0, byteLen);
     const value = rhs === "" && isEndMarker ? "[END]" : rhs;
     let bucket = decodeByLength.get(byteLen);
     if (bucket === undefined) {
-      bucket = new Map<string, string>();
+      bucket = new Map<TblByteKey, string>();
       decodeByLength.set(byteLen, bucket);
     }
-    bucket.set(hexKey, value);
+    bucket.set(byteKey, value);
     if (byteLen > maxByteLength) maxByteLength = byteLen;
     if (value.length > 0 && !encodeMap.has(value)) {
       encodeMap.set(value, bytes);
       if (value.length > maxTokenLength) maxTokenLength = value.length;
     }
     if (isEndMarker) {
-      endTokens.add(hexKey);
+      endTokens.add(byteKey);
     }
   }
 
@@ -304,9 +323,13 @@ export const encodeRomQueryString = (
   }
 };
 
+const HEX_BYTE: readonly string[] = Array.from({ length: 256 }, (_, b) =>
+  b.toString(16).padStart(2, "0"),
+);
+
 /** Format a Uint8Array as space-separated hex byte pairs for search_bytes or display. */
 export const formatHexPattern = (bytes: Uint8Array): string =>
-  Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(" ");
+  Array.from(bytes, (b) => HEX_BYTE[b]!).join(" ");
 
 /** Decode a single ROM string from a byte buffer up to a terminator byte or invalid sequence. */
 export const decodeRomStringFromBytes = (
@@ -331,15 +354,12 @@ export const decodeRomStringFromBytes = (
       for (let len = maxLen; len >= 1; len--) {
         const bucket = customTable.decodeByLength.get(len);
         if (bucket === undefined) continue;
-        let hexKey = "";
-        for (let k = 0; k < len; k++) {
-          hexKey += (bytes[pos + k] ?? 0).toString(16).padStart(2, "0");
-        }
-        const found = bucket.get(hexKey);
+        const byteKey = tblByteKey(bytes, pos, len);
+        const found = bucket.get(byteKey);
         if (found !== undefined) {
           matchedText = found;
           matchedLen = len;
-          hitEndToken = customTable.endTokens.has(hexKey);
+          hitEndToken = customTable.endTokens.has(byteKey);
           break;
         }
       }
@@ -428,6 +448,10 @@ export const extractRomStringsFromBuffer = (input: {
   readonly terminatorByte: number | null;
   readonly customTable?: CustomCharTable | undefined;
   readonly limit: number;
+  /** When false, rawHex is "" and no hex formatting is paid per string. */
+  readonly includeRawHex?: boolean | undefined;
+  /** Buffer offset to start scanning from (paging resume point). */
+  readonly startOffset?: number | undefined;
 }): readonly {
   readonly offsetInBuffer: number;
   readonly address: string;
@@ -445,6 +469,8 @@ export const extractRomStringsFromBuffer = (input: {
     limit,
   } = input;
   const canonical = normalizeRomTextEncoding(encoding);
+  const rawHexFor = (slice: Uint8Array): string =>
+    input.includeRawHex === false ? "" : formatHexPattern(slice);
   const results: {
     readonly offsetInBuffer: number;
     readonly address: string;
@@ -463,10 +489,35 @@ export const extractRomStringsFromBuffer = (input: {
   const tblMapsZero =
     canonical === "tbl" &&
     customTable !== undefined &&
-    customTable.decodeByLength.get(1)?.has("00") === true &&
-    !customTable.endTokens.has("00");
+    customTable.decodeByLength.get(1)?.has(0) === true &&
+    !customTable.endTokens.has(0);
 
-  let cursor = 0;
+  const isSjisFamily = canonical === "sjis" || canonical === "cp932";
+  const unitLengthAt = (at: number): number => {
+    const b0 = bytes[at] ?? 0;
+    if (isSjisFamily) {
+      const isLead = (b0 >= 0x81 && b0 <= 0x9f) || (b0 >= 0xe0 && b0 <= 0xfc);
+      if (isLead) {
+        if (at + 1 >= bytes.length) return 0;
+        const b1 = bytes[at + 1] ?? 0;
+        return b1 >= 0x40 && b1 <= 0xfc && b1 !== 0x7f ? 2 : 0;
+      }
+      return (b0 >= 0x20 && b0 <= 0x7e) || (b0 >= 0xa1 && b0 <= 0xdf) ? 1 : 0;
+    }
+    if (b0 >= 0xa1 && b0 <= 0xfe) {
+      if (at + 1 >= bytes.length) return 0;
+      const b1 = bytes[at + 1] ?? 0;
+      return b1 >= 0xa1 && b1 <= 0xfe ? 2 : 0;
+    }
+    return b0 >= 0x20 && b0 <= 0x7e ? 1 : 0;
+  };
+  const isMultibyteUnit = (at: number, unitLength: number): boolean =>
+    unitLength === 2 || (isSjisFamily && (bytes[at] ?? 0) >= 0xa1);
+
+  let cursor = Math.min(
+    Math.max(0, Math.floor(input.startOffset ?? 0)),
+    bytes.length,
+  );
   while (cursor < bytes.length && results.length < limit) {
     if (
       terminatorByte !== null &&
@@ -488,15 +539,12 @@ export const extractRomStringsFromBuffer = (input: {
         for (let len = maxLen; len >= 1; len--) {
           const bucket = customTable.decodeByLength.get(len);
           if (bucket === undefined) continue;
-          let hexKey = "";
-          for (let k = 0; k < len; k++) {
-            hexKey += (bytes[pos + k] ?? 0).toString(16).padStart(2, "0");
-          }
-          const found = bucket.get(hexKey);
+          const byteKey = tblByteKey(bytes, pos, len);
+          const found = bucket.get(byteKey);
           if (found !== undefined) {
             matchedText = found;
             matchedLen = len;
-            hitEnd = customTable.endTokens.has(hexKey);
+            hitEnd = customTable.endTokens.has(byteKey);
             break;
           }
         }
@@ -520,7 +568,7 @@ export const extractRomStringsFromBuffer = (input: {
           address: `0x${(baseAddress + BigInt(cursor)).toString(16)}`,
           decoded: chars.join(""),
           byteLength: slice.length,
-          rawHex: formatHexPattern(slice),
+          rawHex: rawHexFor(slice),
         });
         cursor = pos;
         continue;
@@ -530,82 +578,74 @@ export const extractRomStringsFromBuffer = (input: {
     }
 
     if (sjisDecoder !== undefined) {
+      // One-pass byte-class scan: classify units without decoding, decode the
+      // accepted run once, and jump past rejected runs. Any suffix of a run
+      // rejected for length or the multibyte gate is shorter / no more
+      // multibyte, so re-scanning it (cursor++) could only repeat rejection.
       let pos = cursor;
-      const chars: string[] = [];
+      let charCount = 0;
       let multibyteCount = 0;
+      let terminated = false;
       while (pos < bytes.length) {
         const b0 = bytes[pos] ?? 0;
         if (terminatorByte !== null && b0 === terminatorByte) {
           pos++;
+          terminated = true;
           break;
         }
-        if (canonical === "sjis" || canonical === "cp932") {
-          const isLead =
-            (b0 >= 0x81 && b0 <= 0x9f) || (b0 >= 0xe0 && b0 <= 0xfc);
-          if (isLead && pos + 1 < bytes.length) {
-            const b1 = bytes[pos + 1] ?? 0;
-            const isTrail = b1 >= 0x40 && b1 <= 0xfc && b1 !== 0x7f;
-            if (isTrail) {
-              try {
-                const ch = sjisDecoder.decode(bytes.subarray(pos, pos + 2));
-                chars.push(ch);
-                multibyteCount++;
-                pos += 2;
-                continue;
-              } catch {
-                break;
-              }
-            }
-            break;
-          }
-          if ((b0 >= 0x20 && b0 <= 0x7e) || (b0 >= 0xa1 && b0 <= 0xdf)) {
+        const unitLength = unitLengthAt(pos);
+        if (unitLength === 0) break;
+        if (isMultibyteUnit(pos, unitLength)) multibyteCount++;
+        charCount++;
+        pos += unitLength;
+      }
+      if (charCount >= minLength && multibyteCount > 0) {
+        const contentEnd = terminated ? pos - 1 : pos;
+        let decoded: string | undefined;
+        let acceptedEnd = pos;
+        try {
+          decoded = sjisDecoder.decode(bytes.subarray(cursor, contentEnd));
+        } catch {
+          // A class-valid but unmapped pair rejects the one-shot decode;
+          // fall back to per-unit decoding of this run only and keep the
+          // decodable prefix, matching the previous truncation behavior.
+          const parts: string[] = [];
+          let prefixChars = 0;
+          let prefixMultibyte = 0;
+          let scan = cursor;
+          while (scan < contentEnd) {
+            const unitLength = unitLengthAt(scan);
+            if (unitLength === 0) break;
             try {
-              chars.push(sjisDecoder.decode(bytes.subarray(pos, pos + 1)));
-              if (b0 >= 0xa1) multibyteCount++;
-              pos += 1;
-              continue;
+              parts.push(
+                sjisDecoder.decode(bytes.subarray(scan, scan + unitLength)),
+              );
             } catch {
               break;
             }
+            if (isMultibyteUnit(scan, unitLength)) prefixMultibyte++;
+            prefixChars++;
+            scan += unitLength;
           }
-          break;
-        } else {
-          // euc-jp
-          if (b0 >= 0xa1 && b0 <= 0xfe && pos + 1 < bytes.length) {
-            const b1 = bytes[pos + 1] ?? 0;
-            if (b1 >= 0xa1 && b1 <= 0xfe) {
-              try {
-                chars.push(sjisDecoder.decode(bytes.subarray(pos, pos + 2)));
-                multibyteCount++;
-                pos += 2;
-                continue;
-              } catch {
-                break;
-              }
-            }
-            break;
+          if (prefixChars >= minLength && prefixMultibyte > 0) {
+            decoded = parts.join("");
+            acceptedEnd = scan;
           }
-          if (b0 >= 0x20 && b0 <= 0x7e) {
-            chars.push(String.fromCharCode(b0));
-            pos += 1;
-            continue;
-          }
-          break;
+        }
+        if (decoded !== undefined) {
+          const slice = bytes.subarray(cursor, acceptedEnd);
+          results.push({
+            offsetInBuffer: cursor,
+            address: `0x${(baseAddress + BigInt(cursor)).toString(16)}`,
+            decoded,
+            byteLength: slice.length,
+            rawHex: rawHexFor(slice),
+          });
+          cursor = Math.max(acceptedEnd, cursor + 1);
+          continue;
         }
       }
-      if (chars.length >= minLength && multibyteCount > 0) {
-        const slice = bytes.subarray(cursor, pos);
-        results.push({
-          offsetInBuffer: cursor,
-          address: `0x${(baseAddress + BigInt(cursor)).toString(16)}`,
-          decoded: chars.join(""),
-          byteLength: slice.length,
-          rawHex: formatHexPattern(slice),
-        });
-        cursor = pos;
-        continue;
-      }
-      cursor++;
+      cursor = Math.max(pos, cursor + 1);
       continue;
     }
 
@@ -641,12 +681,13 @@ export const extractRomStringsFromBuffer = (input: {
         address: `0x${(baseAddress + BigInt(cursor)).toString(16)}`,
         decoded,
         byteLength: slice.length,
-        rawHex: formatHexPattern(slice),
+        rawHex: rawHexFor(slice),
       });
       cursor = pos;
       continue;
     }
-    cursor++;
+    // A rejected printable run's suffixes are shorter, so jump past it.
+    cursor = Math.max(pos, cursor + 1);
   }
 
   return results;
@@ -659,18 +700,18 @@ export const readPointerValue = (
   width: 2 | 3 | 4,
   endianness: "little" | "big",
 ): bigint => {
+  // Width is at most 4 bytes, so the value is exact in a double; convert once.
+  let val = 0;
   if (endianness === "little") {
-    let val = 0n;
-    for (let i = 0; i < width; i++) {
-      val |= BigInt(bytes[offset + i] ?? 0) << BigInt(i * 8);
+    for (let i = width - 1; i >= 0; i--) {
+      val = val * 256 + (bytes[offset + i] ?? 0);
     }
-    return val;
+  } else {
+    for (let i = 0; i < width; i++) {
+      val = val * 256 + (bytes[offset + i] ?? 0);
+    }
   }
-  let val = 0n;
-  for (let i = 0; i < width; i++) {
-    val = (val << 8n) | BigInt(bytes[offset + i] ?? 0);
-  }
-  return val;
+  return BigInt(val);
 };
 
 export const searchRomStringsInputSchema = z.strictObject({
@@ -761,9 +802,22 @@ export const searchRomStringsInputSchema = z.strictObject({
     .describe("Maximum number of string matches to return."),
   resolve_xrefs: z
     .boolean()
-    .default(true)
+    .default(false)
     .describe(
-      "Resolve incoming cross-references and ROM file offsets for each matched string.",
+      "Resolve incoming cross-references for each matched string via the disassembler (opt-in; file offsets are always resolved). Default false keeps local ROM scans provider-free.",
+    ),
+  include_hex: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Include each match's raw bytes as hex (bytes_hex). Default false omits it to keep results compact; byte_length is always reported.",
+    ),
+  cursor: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Opaque continuation token from a previous identical call's next_cursor; resumes after the last returned match.",
     ),
 });
 
@@ -776,7 +830,8 @@ export const romStringMatchSchema = z.strictObject({
   file_offset: z.number().int().min(0).nullable(),
   encoding: z.enum(ROM_TEXT_ENCODINGS),
   text: z.string(),
-  bytes_hex: z.string(),
+  text_truncated: z.boolean().optional(),
+  bytes_hex: z.string().optional(),
   byte_length: z.number().int().min(0),
   terminated: z.boolean(),
   xrefs: z.array(z.string()),
@@ -789,6 +844,7 @@ export const searchRomStringsResultSchema = z.strictObject({
   matches: z.array(romStringMatchSchema),
   total_matches: z.number().int().min(0),
   truncated: z.boolean(),
+  next_cursor: z.string().nullable().optional(),
 });
 
 export const scanPointerTableInputSchema = z.strictObject({
@@ -814,6 +870,14 @@ export const scanPointerTableInputSchema = z.strictObject({
     .max(512)
     .default(32)
     .describe("Number of pointer table entries to read."),
+  start_index: z
+    .number()
+    .int()
+    .min(0)
+    .default(0)
+    .describe(
+      "First entry index to read (for paging tables larger than count); entry and manuscript indexes stay global across pages.",
+    ),
   pointer_size: z
     .union([z.literal(2), z.literal(3), z.literal(4)])
     .default(4)
@@ -876,15 +940,27 @@ export const scanPointerTableInputSchema = z.strictObject({
     ),
   resolve_xrefs: z
     .boolean()
-    .default(true)
+    .default(false)
     .describe(
-      "Resolve incoming cross-references to each pointer table slot and target address.",
+      "Resolve incoming cross-references to each pointer table slot and target address via the disassembler (opt-in; file offsets are always resolved). Default false keeps local ROM scans provider-free.",
     ),
   include_manuscript: z
     .boolean()
     .default(false)
     .describe(
       "Emit locbatch.py-compatible manuscript records (id, pointer_offset, target_offset, max_bytes, jp, ko) alongside pointer entries.",
+    ),
+  include_hex: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Include each preview's raw bytes as hex (preview_bytes_hex). Default false reports null there to keep results compact; preview_byte_length is always reported.",
+    ),
+  manuscript_only: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Emit manuscript records and suppress pointer entries (entries is empty, entries_scanned still reports the scanned count). Implies include_manuscript.",
     ),
 });
 
@@ -900,6 +976,7 @@ export const pointerTableEntrySchema = z.strictObject({
   target_address: z.string(),
   target_file_offset: z.number().int().min(0).nullable(),
   preview_text: z.string().nullable(),
+  preview_truncated: z.boolean().optional(),
   preview_bytes_hex: z.string().nullable(),
   preview_byte_length: z.number().int().min(0).nullable(),
   allocated_budget_bytes: z.number().int().min(0).nullable().optional(),
@@ -917,6 +994,8 @@ export const manuscriptRecordSchema = z.strictObject({
   byte_length: z.number().int().min(0).nullable(),
   max_bytes: z.number().int().min(0).nullable(),
   jp: z.string(),
+  truncated: z.boolean().optional(),
+  also_referenced_by: z.array(z.number().int().min(0)).optional(),
   ko: z.string(),
 });
 
@@ -930,6 +1009,8 @@ export const scanPointerTableResultSchema = z.strictObject({
   encoding: z.enum(ROM_TEXT_ENCODINGS),
   entries: z.array(pointerTableEntrySchema),
   entries_scanned: z.number().int().min(0),
+  start_index: z.number().int().min(0).optional(),
+  next_start_index: z.number().int().min(0).optional(),
   manuscript_records: z.array(manuscriptRecordSchema).optional(),
 });
 
@@ -1239,7 +1320,22 @@ export const findCodeCavesResultSchema = z.strictObject({
 });
 
 /** Scan a byte slice for contiguous runs of 0x00 or 0xFF (or explicit fillByte) aligned to `alignment`. */
-export const findCodeCavesInSlice = (input: {
+export interface CodeCaveSliceEntry {
+  readonly address: string;
+  readonly file_offset: number;
+  readonly byte_length: number;
+  readonly fill_byte: string;
+  readonly region_name: string | null;
+  readonly executable: boolean;
+}
+
+const compareCodeCaves = (
+  a: CodeCaveSliceEntry,
+  b: CodeCaveSliceEntry,
+): number => b.byte_length - a.byte_length || a.file_offset - b.file_offset;
+
+/** Top-K variant: counts every cave while retaining only the largest `limit`. */
+export const findCodeCavesInSliceTopK = (input: {
   readonly bytes: Uint8Array;
   readonly sliceFileOffset: number;
   readonly regionName: string | null;
@@ -1248,14 +1344,11 @@ export const findCodeCavesInSlice = (input: {
   readonly alignment: number;
   readonly fillByte?: number | undefined;
   readonly toVirtualAddress: (fileOffset: number) => string | null;
-}): readonly {
-  readonly address: string;
-  readonly file_offset: number;
-  readonly byte_length: number;
-  readonly fill_byte: string;
-  readonly region_name: string | null;
-  readonly executable: boolean;
-}[] => {
+  readonly limit?: number | undefined;
+}): {
+  readonly caves: readonly CodeCaveSliceEntry[];
+  readonly total: number;
+} => {
   const {
     bytes,
     sliceFileOffset,
@@ -1266,14 +1359,17 @@ export const findCodeCavesInSlice = (input: {
     fillByte,
     toVirtualAddress,
   } = input;
-  const caves: {
-    readonly address: string;
-    readonly file_offset: number;
-    readonly byte_length: number;
-    readonly fill_byte: string;
-    readonly region_name: string | null;
-    readonly executable: boolean;
-  }[] = [];
+  const limit =
+    input.limit === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, Math.floor(input.limit));
+  const caves: CodeCaveSliceEntry[] = [];
+  let total = 0;
+  const trimToLimit = (): void => {
+    if (caves.length <= limit) return;
+    caves.sort(compareCodeCaves);
+    caves.length = limit;
+  };
 
   let i = 0;
   while (i < bytes.length) {
@@ -1297,6 +1393,7 @@ export const findCodeCavesInSlice = (input: {
         : rawStartFileOffset + (alignment - remainder);
     const alignedLength = rawEndFileOffset - alignedStartFileOffset;
     if (alignedLength >= minSize) {
+      total++;
       const address =
         toVirtualAddress(alignedStartFileOffset) ??
         `0x${alignedStartFileOffset.toString(16)}`;
@@ -1304,13 +1401,19 @@ export const findCodeCavesInSlice = (input: {
         address,
         file_offset: alignedStartFileOffset,
         byte_length: alignedLength,
-        fill_byte: `0x${b.toString(16).padStart(2, "0")}`,
+        fill_byte: `0x${HEX_BYTE[b]!}`,
         region_name: regionName,
         executable,
       });
+      if (caves.length > limit * 2) trimToLimit();
     }
     i = end;
   }
 
-  return caves;
+  trimToLimit();
+  return { caves, total };
 };
+
+export const findCodeCavesInSlice = (
+  input: Parameters<typeof findCodeCavesInSliceTopK>[0],
+): readonly CodeCaveSliceEntry[] => findCodeCavesInSliceTopK(input).caves;

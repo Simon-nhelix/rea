@@ -419,6 +419,29 @@ describe("Ghidra disabled analyzers", () => {
     ]);
   });
 
+  it("passes optional preset analyzers as a tolerant second argument", () => {
+    const onlyOptional = ghidraHeadlessArguments({
+      ...base,
+      optionalDisabledAnalyzers: ["Function ID", "Embedded Media"],
+    });
+    const onlyIndex = onlyOptional.indexOf(
+      posix.join("/package/bridge", "ReaGhidraAnalysisOptions.java"),
+    );
+    expect(onlyOptional[onlyIndex + 1]).toBe("-");
+    expect(onlyOptional[onlyIndex + 2]).toBe("Function ID,Embedded Media");
+
+    const both = ghidraHeadlessArguments({
+      ...base,
+      disabledAnalyzers: ["Objective-C Message Analyzer"],
+      optionalDisabledAnalyzers: ["Function ID"],
+    });
+    const bothIndex = both.indexOf(
+      posix.join("/package/bridge", "ReaGhidraAnalysisOptions.java"),
+    );
+    expect(both[bothIndex + 1]).toBe("Objective-C Message Analyzer");
+    expect(both[bothIndex + 2]).toBe("Function ID");
+  });
+
   it("adds no analyzer script for an empty override", () => {
     expect(
       ghidraHeadlessArguments({ ...base, disabledAnalyzers: [] }),

@@ -281,9 +281,10 @@ analysis, and code cave discovery:
 - `search_rom_strings` (CLI `rea search-rom-strings <path>`): search or scan ROM
   bytes using `sjis`/`cp932`, `euc-jp`, `utf-8`, `utf-16le`, `utf-16be`, `ascii`,
   or custom `.tbl` character tables (`table_path` / `table_text`, multi-byte hex
-  keys, control tokens, and `terminator_byte`). Pass `resolve_xrefs: false`
-  (CLI `--no-resolve-xrefs`) to run directly on local ROM bytes without opening
-  a disassembler session.
+  keys, control tokens, and `terminator_byte`). Runs directly on local ROM
+  bytes without a disassembler session by default (`resolve_xrefs` defaults to
+  false; CLI `--resolve-xrefs` opts in). Page large result sets with
+  `next_cursor` / `cursor`; raw `bytes_hex` is omitted unless `include_hex` is set.
 - `discover_pointer_tables` (CLI `rea discover-pointer-tables <path>`): scan ROM
   regions to automatically discover candidate 16/24/32-bit string pointer tables
   with entry counts, unique target counts, string byte-width triage statistics
@@ -294,7 +295,11 @@ analysis, and code cave discovery:
   automatic bank-local 16-bit pointer resolution for `snes`, `gb`, `nes`, and
   `pce`), compute each slot's `allocated_budget_bytes` from adjacent target
   distances, and optionally emit `locbatch.py`-ready `manuscript_records` with
-  `include_manuscript: true` (CLI `--include-manuscript`).
+  `include_manuscript: true` (CLI `--include-manuscript`). Page tables larger
+  than `count` with `start_index` (entry and manuscript indexes stay global),
+  and use `manuscript_only: true` to suppress `entries` when only the
+  manuscript is needed; shared targets collapse into one record with
+  `also_referenced_by`.
 - `find_code_caves` (CLI `rea find-code-caves <path>`): find contiguous padding
   regions (`0x00` / `0xFF` or `fill_byte`) sorted largest-first for VWF font
   hooks, expanded 2-byte glyph tables, and relocated dialogue blocks.
