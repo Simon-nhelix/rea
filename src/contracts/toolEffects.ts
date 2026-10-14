@@ -562,6 +562,8 @@ export const TOOL_EFFECTS: Readonly<Record<string, ToolEffects>> = {
   trace_call_path: effects({ mutatesSession: true, idempotent: false }),
   search_rom_strings: evidence,
   scan_pointer_table: evidence,
+  discover_pointer_tables: evidence,
+  find_code_caves: evidence,
   observe_native_ui: effects({
     mutatesSession: true,
     launchesProcess: true,

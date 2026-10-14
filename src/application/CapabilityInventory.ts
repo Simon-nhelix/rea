@@ -134,6 +134,8 @@ const ENHANCED_REQUIREMENTS: Readonly<
     "xrefs",
   ],
   scan_pointer_table: ["read_bytes", "address_to_file_offset", "xrefs"],
+  discover_pointer_tables: ["read_bytes", "address_to_file_offset", "xrefs"],
+  find_code_caves: ["read_bytes", "address_to_file_offset", "xrefs"],
 };
 
 /** Contract kinds whose operations run on the active session target. */

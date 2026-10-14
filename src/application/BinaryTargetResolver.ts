@@ -434,6 +434,86 @@ const isArchiveFormat = (
 ): format is Extract<BinaryTarget, { kind: "archive" }>["format"] =>
   isZipPackageFormat(format) || ["asar", "dmg", "pkg"].includes(format);
 
+const readConsoleAuxiliarySlices = async (input: {
+  readonly handle: FileHandle;
+  readonly format: ConsoleTargetFormat;
+  readonly headerBytes: Buffer;
+  readonly fileBytes: number;
+  readonly signal?: AbortSignal | undefined;
+}): Promise<{
+  readonly innerHeaderBytes?: Buffer | undefined;
+  readonly trailerBytes?: Buffer | undefined;
+}> => {
+  const { handle, format, headerBytes, fileBytes, signal } = input;
+  let innerHeaderBytes: Buffer | undefined;
+  let trailerBytes: Buffer | undefined;
+
+  if (
+    format === "psp" &&
+    headerBytes.length >= 0x28 &&
+    headerBytes[0] === 0x00 &&
+    headerBytes[1] === 0x50 &&
+    headerBytes[2] === 0x42 &&
+    headerBytes[3] === 0x50
+  ) {
+    const dataPspOffset = headerBytes.readUInt32LE(0x20);
+    if (
+      dataPspOffset > 0 &&
+      dataPspOffset < fileBytes &&
+      dataPspOffset + 0x200 > headerBytes.length
+    ) {
+      const innerLen = Math.min(0x1000, fileBytes - dataPspOffset);
+      const innerBuf = Buffer.alloc(innerLen);
+      const readInner = await handle.read(innerBuf, 0, innerLen, dataPspOffset);
+      throwIfTargetResolutionCancelled(signal);
+      innerHeaderBytes = innerBuf.subarray(0, readInner.bytesRead);
+    }
+  }
+
+  if (format === "wsc" && fileBytes >= 16) {
+    const trailerLen = Math.min(64, fileBytes);
+    const trailer = Buffer.alloc(trailerLen);
+    const readTrailer = await handle.read(
+      trailer,
+      0,
+      trailerLen,
+      fileBytes - trailerLen,
+    );
+    throwIfTargetResolutionCancelled(signal);
+    trailerBytes = trailer.subarray(0, readTrailer.bytesRead);
+  } else if (format === "nes" && fileBytes >= 16) {
+    const hasInes =
+      headerBytes.length >= 16 &&
+      headerBytes[0] === 0x4e &&
+      headerBytes[1] === 0x45 &&
+      headerBytes[2] === 0x53 &&
+      headerBytes[3] === 0x1a;
+    const trainerBytes = hasInes && (headerBytes[6]! & 0x04) !== 0 ? 512 : 0;
+    const prgOffset = hasInes ? 16 + trainerBytes : 0;
+    const prgUnits = hasInes ? headerBytes[4]! : 0;
+    const availableBytes = Math.max(0, fileBytes - prgOffset);
+    const prgSize =
+      prgUnits > 0
+        ? Math.min(availableBytes, prgUnits * 16384)
+        : availableBytes;
+    const lastPrgEnd = prgOffset + prgSize;
+    if (lastPrgEnd > headerBytes.length && lastPrgEnd >= 16) {
+      const trailerLen = Math.min(16, lastPrgEnd);
+      const trailer = Buffer.alloc(trailerLen);
+      const readTrailer = await handle.read(
+        trailer,
+        0,
+        trailerLen,
+        lastPrgEnd - trailerLen,
+      );
+      throwIfTargetResolutionCancelled(signal);
+      trailerBytes = trailer.subarray(0, readTrailer.bytesRead);
+    }
+  }
+
+  return { innerHeaderBytes, trailerBytes };
+};
+
 const readConsoleBinaryTarget = async (input: {
   readonly handle: FileHandle;
   readonly path: string;
@@ -453,22 +533,18 @@ const readConsoleBinaryTarget = async (input: {
       ? await handle.read(prefix, 0, probeLength, 0)
       : { bytesRead: 0 };
   throwIfTargetResolutionCancelled(signal);
-  let trailerBytes: Buffer | undefined;
-  if (format === "wsc" && metadata.size >= 16) {
-    const trailerLen = Math.min(64, metadata.size);
-    const trailer = Buffer.alloc(trailerLen);
-    const readTrailer = await handle.read(
-      trailer,
-      0,
-      trailerLen,
-      metadata.size - trailerLen,
-    );
-    throwIfTargetResolutionCancelled(signal);
-    trailerBytes = trailer.subarray(0, readTrailer.bytesRead);
-  }
+  const headerBytes = prefix.subarray(0, observed.bytesRead);
+  const { innerHeaderBytes, trailerBytes } = await readConsoleAuxiliarySlices({
+    handle,
+    format,
+    headerBytes,
+    fileBytes: metadata.size,
+    signal,
+  });
   const admitted = admitConsoleTarget({
     format,
-    headerBytes: prefix.subarray(0, observed.bytesRead),
+    headerBytes,
+    innerHeaderBytes,
     trailerBytes,
     fileBytes: metadata.size,
     entryPoint,
@@ -515,22 +591,17 @@ const tryAutoDetectConsoleBinaryTarget = async (input: {
     lowerPath,
   );
   if (detectedFormat === undefined) return undefined;
-  let trailerBytes: Buffer | undefined;
-  if (detectedFormat === "wsc" && metadata.size >= 16) {
-    const trailerLen = Math.min(64, metadata.size);
-    const trailer = Buffer.alloc(trailerLen);
-    const readTrailer = await handle.read(
-      trailer,
-      0,
-      trailerLen,
-      metadata.size - trailerLen,
-    );
-    throwIfTargetResolutionCancelled(signal);
-    trailerBytes = trailer.subarray(0, readTrailer.bytesRead);
-  }
+  const { innerHeaderBytes, trailerBytes } = await readConsoleAuxiliarySlices({
+    handle,
+    format: detectedFormat,
+    headerBytes: bytes,
+    fileBytes: metadata.size,
+    signal,
+  });
   const admitted = admitConsoleTarget({
     format: detectedFormat,
     headerBytes: bytes,
+    innerHeaderBytes,
     trailerBytes,
     fileBytes: metadata.size,
   });
@@ -538,9 +609,19 @@ const tryAutoDetectConsoleBinaryTarget = async (input: {
     // Magic-detected console formats report their specific admission failure;
     // suffix-detected formats fall through if they are not valid console ROMs.
     if (
-      ["psx-exe", "nes", "ps2-elf", "psp", "ps3", "xbox", "gba", "gb"].includes(
-        detectedFormat,
-      )
+      [
+        "psx-exe",
+        "nes",
+        "ps2-elf",
+        "psp",
+        "ps3",
+        "xbox",
+        "gba",
+        "gb",
+        "saturn",
+        "nds",
+        "md",
+      ].includes(detectedFormat)
     ) {
       return err(
         new BinaryTargetError(path, admitted.error.reason, {

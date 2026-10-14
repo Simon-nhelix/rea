@@ -199,6 +199,13 @@ explicit path or endpoint and do not need it.
 - PE resource type/name/language trees and static icon group references:
   `inspect_pe_resources` with an explicit path. This portable operation requires
   no active target or engine; opaque payloads retain file ranges and SHA-256.
+- Console ROM or console executable (`psx-exe`, `ps2-elf`, `psp`, `ps3`, `xbox`,
+  `gc-dol`, `gba`, `nds`, `saturn`, `md`, `snes`, `pce`, `nes`, `gb`, `wsc`):
+  use `search_rom_strings`, `discover_pointer_tables`, `scan_pointer_table`, and
+  `find_code_caves` for string/table/cave workflows (with `resolve_xrefs: false`
+  for instant disassembler-free local ROM byte inspection), or `open_binary` for
+  Ghidra decompilation and cross-references. See
+  [references/native-and-artifacts.md](references/native-and-artifacts.md).
 - Native executable, library, or analysis database: `open_binary`, then
   use focused analysis tools directly; call `binary_overview` when metadata or
   inventory context is useful and available from the selected provider.

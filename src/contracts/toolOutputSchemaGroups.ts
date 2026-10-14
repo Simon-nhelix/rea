@@ -13,6 +13,8 @@ import {
 } from "../domain/binaryTargetTypes.js";
 import { CONSOLE_TARGET_FORMATS } from "../domain/consoleRom.js";
 import {
+  discoverPointerTablesResultSchema,
+  findCodeCavesResultSchema,
   scanPointerTableResultSchema,
   searchRomStringsResultSchema,
 } from "../domain/romHacking.js";
@@ -393,6 +395,8 @@ export const enhancedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   trace_call_path: callPathTraceOutput,
   search_rom_strings: evidenceResultOf(searchRomStringsResultSchema),
   scan_pointer_table: evidenceResultOf(scanPointerTableResultSchema),
+  discover_pointer_tables: evidenceResultOf(discoverPointerTablesResultSchema),
+  find_code_caves: evidenceResultOf(findCodeCavesResultSchema),
 };
 
 /** Exact Evidence schemas for provider-neutral native inspection. */

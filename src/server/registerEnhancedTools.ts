@@ -76,6 +76,8 @@ export const registerEnhancedTools = (
   const traceNativeValues = toolContract("trace_native_values");
   const searchRomStrings = toolContract("search_rom_strings");
   const scanPointerTable = toolContract("scan_pointer_table");
+  const discoverPointerTables = toolContract("discover_pointer_tables");
+  const findCodeCaves = toolContract("find_code_caves");
   server.registerTool(
     traceNativeValues.name,
     toolRegistrationOptions(traceNativeValues),
@@ -220,6 +222,24 @@ export const registerEnhancedTools = (
         context,
       }),
   );
+  server.registerTool(
+    discoverPointerTables.name,
+    toolRegistrationOptions(discoverPointerTables),
+    (input, context) =>
+      executeEnhancedTool(registration, discoverPointerTables, {
+        validatedCall: { name: "discover_pointer_tables", input },
+        context,
+      }),
+  );
+  server.registerTool(
+    findCodeCaves.name,
+    toolRegistrationOptions(findCodeCaves),
+    (input, context) =>
+      executeEnhancedTool(registration, findCodeCaves, {
+        validatedCall: { name: "find_code_caves", input },
+        context,
+      }),
+  );
 };
 
 const executeEnhancedTool = async (
@@ -261,10 +281,10 @@ const executeEnhancedTool = async (
       };
       const result = await logToolExecution(registration.logger, name, () =>
         executeComposedWorkflow(analysis, (observed) =>
-          new EnhancedTools(observed).executeValidated(
-            validatedCall,
-            context.mcpReq.signal,
-          ),
+          new EnhancedTools(
+            observed,
+            registration.activeTarget?.(),
+          ).executeValidated(validatedCall, context.mcpReq.signal),
         ),
       );
       await progress.report({

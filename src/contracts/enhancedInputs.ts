@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { nativeValueTraceInputSchema } from "../domain/native/nativeValueTrace.js";
 import {
+  discoverPointerTablesInputSchema,
+  findCodeCavesInputSchema,
   scanPointerTableInputSchema,
   searchRomStringsInputSchema,
 } from "../domain/romHacking.js";
@@ -74,6 +76,8 @@ export const enhancedInputSchemas = {
   }),
   search_rom_strings: searchRomStringsInputSchema,
   scan_pointer_table: scanPointerTableInputSchema,
+  discover_pointer_tables: discoverPointerTablesInputSchema,
+  find_code_caves: findCodeCavesInputSchema,
 } as const;
 
 export type EnhancedToolName = keyof typeof enhancedInputSchemas;

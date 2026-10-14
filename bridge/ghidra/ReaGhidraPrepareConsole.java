@@ -2,11 +2,18 @@ import ghidra.app.script.GhidraScript;
 import ghidra.program.database.mem.FileBytes;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSpace;
+import ghidra.program.model.data.ArrayDataType;
+import ghidra.program.model.data.ByteDataType;
+import ghidra.program.model.data.CharDataType;
+import ghidra.program.model.data.DWordDataType;
+import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.WordDataType;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.mem.MemoryBlockSourceInfo;
+import ghidra.program.model.symbol.SourceType;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -38,6 +45,65 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
         boolean writable,
         boolean executable
     ) {}
+
+    private record GbaField(long address, String name, DataType type) {}
+
+    private static final DataType U8 = ByteDataType.dataType;
+    private static final DataType U16 = WordDataType.dataType;
+    private static final DataType U32 = DWordDataType.dataType;
+    private static final long GBA_ROM_BASE = 0x08000000L;
+
+    private static GbaField gbaIo(long offset, String name, DataType type) {
+        return new GbaField(0x04000000L + offset, "REG_" + name, type);
+    }
+
+    private static final GbaField[] GBA_IO_REGISTERS = {
+        gbaIo(0x000, "DISPCNT", U16), gbaIo(0x004, "DISPSTAT", U16), gbaIo(0x006, "VCOUNT", U16),
+        gbaIo(0x008, "BG0CNT", U16), gbaIo(0x00A, "BG1CNT", U16), gbaIo(0x00C, "BG2CNT", U16), gbaIo(0x00E, "BG3CNT", U16),
+        gbaIo(0x010, "BG0HOFS", U16), gbaIo(0x012, "BG0VOFS", U16), gbaIo(0x014, "BG1HOFS", U16), gbaIo(0x016, "BG1VOFS", U16),
+        gbaIo(0x018, "BG2HOFS", U16), gbaIo(0x01A, "BG2VOFS", U16), gbaIo(0x01C, "BG3HOFS", U16), gbaIo(0x01E, "BG3VOFS", U16),
+        gbaIo(0x020, "BG2PA", U16), gbaIo(0x022, "BG2PB", U16), gbaIo(0x024, "BG2PC", U16), gbaIo(0x026, "BG2PD", U16),
+        gbaIo(0x028, "BG2X", U32), gbaIo(0x02C, "BG2Y", U32),
+        gbaIo(0x030, "BG3PA", U16), gbaIo(0x032, "BG3PB", U16), gbaIo(0x034, "BG3PC", U16), gbaIo(0x036, "BG3PD", U16),
+        gbaIo(0x038, "BG3X", U32), gbaIo(0x03C, "BG3Y", U32),
+        gbaIo(0x040, "WIN0H", U16), gbaIo(0x042, "WIN1H", U16), gbaIo(0x044, "WIN0V", U16), gbaIo(0x046, "WIN1V", U16),
+        gbaIo(0x048, "WININ", U16), gbaIo(0x04A, "WINOUT", U16), gbaIo(0x04C, "MOSAIC", U16),
+        gbaIo(0x050, "BLDCNT", U16), gbaIo(0x052, "BLDALPHA", U16), gbaIo(0x054, "BLDY", U16),
+        gbaIo(0x060, "SOUND1CNT_L", U16), gbaIo(0x062, "SOUND1CNT_H", U16), gbaIo(0x064, "SOUND1CNT_X", U16),
+        gbaIo(0x068, "SOUND2CNT_L", U16), gbaIo(0x06C, "SOUND2CNT_H", U16),
+        gbaIo(0x070, "SOUND3CNT_L", U16), gbaIo(0x072, "SOUND3CNT_H", U16), gbaIo(0x074, "SOUND3CNT_X", U16),
+        gbaIo(0x078, "SOUND4CNT_L", U16), gbaIo(0x07C, "SOUND4CNT_H", U16),
+        gbaIo(0x080, "SOUNDCNT_L", U16), gbaIo(0x082, "SOUNDCNT_H", U16), gbaIo(0x084, "SOUNDCNT_X", U16),
+        gbaIo(0x088, "SOUNDBIAS", U16),
+        gbaIo(0x090, "WAVE_RAM", new ArrayDataType(U8, 16, 1)),
+        gbaIo(0x0A0, "FIFO_A", U32), gbaIo(0x0A4, "FIFO_B", U32),
+        gbaIo(0x0B0, "DMA0SAD", U32), gbaIo(0x0B4, "DMA0DAD", U32), gbaIo(0x0B8, "DMA0CNT", U32),
+        gbaIo(0x0BC, "DMA1SAD", U32), gbaIo(0x0C0, "DMA1DAD", U32), gbaIo(0x0C4, "DMA1CNT", U32),
+        gbaIo(0x0C8, "DMA2SAD", U32), gbaIo(0x0CC, "DMA2DAD", U32), gbaIo(0x0D0, "DMA2CNT", U32),
+        gbaIo(0x0D4, "DMA3SAD", U32), gbaIo(0x0D8, "DMA3DAD", U32), gbaIo(0x0DC, "DMA3CNT", U32),
+        gbaIo(0x100, "TM0CNT_L", U16), gbaIo(0x102, "TM0CNT_H", U16), gbaIo(0x104, "TM1CNT_L", U16), gbaIo(0x106, "TM1CNT_H", U16),
+        gbaIo(0x108, "TM2CNT_L", U16), gbaIo(0x10A, "TM2CNT_H", U16), gbaIo(0x10C, "TM3CNT_L", U16), gbaIo(0x10E, "TM3CNT_H", U16),
+        gbaIo(0x120, "SIODATA32", U32), gbaIo(0x124, "SIOMULTI2", U16), gbaIo(0x126, "SIOMULTI3", U16),
+        gbaIo(0x128, "SIOCNT", U16), gbaIo(0x12A, "SIODATA8", U16),
+        gbaIo(0x130, "KEYINPUT", U16), gbaIo(0x132, "KEYCNT", U16), gbaIo(0x134, "RCNT", U16),
+        gbaIo(0x140, "JOYCNT", U16), gbaIo(0x150, "JOY_RECV", U32), gbaIo(0x154, "JOY_TRANS", U32), gbaIo(0x158, "JOYSTAT", U16),
+        gbaIo(0x200, "IE", U16), gbaIo(0x202, "IF", U16), gbaIo(0x204, "WAITCNT", U16), gbaIo(0x208, "IME", U16),
+        gbaIo(0x300, "POSTFLG", U8), gbaIo(0x301, "HALTCNT", U8),
+        new GbaField(0x03007FF8L, "BIOS_IRQ_CHECK", U16),
+        new GbaField(0x03007FFCL, "BIOS_IRQ_HANDLER", U32),
+    };
+
+    private static final GbaField[] GBA_HEADER_FIELDS = {
+        new GbaField(GBA_ROM_BASE + 0x04, "GBA_HEADER_LOGO", new ArrayDataType(U8, 156, 1)),
+        new GbaField(GBA_ROM_BASE + 0xA0, "GBA_HEADER_TITLE", new ArrayDataType(CharDataType.dataType, 12, 1)),
+        new GbaField(GBA_ROM_BASE + 0xAC, "GBA_HEADER_GAME_CODE", new ArrayDataType(CharDataType.dataType, 4, 1)),
+        new GbaField(GBA_ROM_BASE + 0xB0, "GBA_HEADER_MAKER_CODE", new ArrayDataType(CharDataType.dataType, 2, 1)),
+        new GbaField(GBA_ROM_BASE + 0xB2, "GBA_HEADER_FIXED_96", U8),
+        new GbaField(GBA_ROM_BASE + 0xB3, "GBA_HEADER_UNIT_CODE", U8),
+        new GbaField(GBA_ROM_BASE + 0xB4, "GBA_HEADER_DEVICE_TYPE", U8),
+        new GbaField(GBA_ROM_BASE + 0xBC, "GBA_HEADER_VERSION", U8),
+        new GbaField(GBA_ROM_BASE + 0xBD, "GBA_HEADER_CHECKSUM", U8),
+    };
 
     @Override
     public void run() throws Exception {
@@ -119,6 +185,7 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
 
         Memory memory = currentProgram.getMemory();
         AddressSpace space = currentProgram.getAddressFactory().getDefaultAddressSpace();
+        long maxOffset = space.getMaxAddress().getUnsignedOffset();
 
         if (loader.equals("BinaryLoader")) {
             List<FileBytes> allFileBytes = memory.getAllFileBytes();
@@ -145,8 +212,13 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
             for (FileMapSpec map : fileMaps) {
                 monitor.checkCancelled();
                 if (map.byteLength <= 0) continue;
+                long endOffset = map.address + map.byteLength - 1;
+                if (Long.compareUnsigned(map.address, maxOffset) > 0 ||
+                    Long.compareUnsigned(endOffset, maxOffset) > 0) {
+                    continue;
+                }
                 Address start = space.getAddress(map.address);
-                Address end = space.getAddress(map.address + map.byteLength - 1);
+                Address end = space.getAddress(endOffset);
                 removeOverlappingBlocks(memory, start, end, true);
                 MemoryBlock created = memory.createInitializedBlock(
                     map.name,
@@ -165,8 +237,13 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
         for (MemoryRegionSpec region : memRegions) {
             monitor.checkCancelled();
             if (region.byteLength <= 0) continue;
+            long endOffset = region.address + region.byteLength - 1;
+            if (Long.compareUnsigned(region.address, maxOffset) > 0 ||
+                Long.compareUnsigned(endOffset, maxOffset) > 0) {
+                continue;
+            }
             Address start = space.getAddress(region.address);
-            Address end = space.getAddress(region.address + region.byteLength - 1);
+            Address end = space.getAddress(endOffset);
             if (hasInitializedOverlap(memory, start, end)) {
                 continue;
             }
@@ -182,9 +259,15 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
             created.setExecute(region.executable);
             String lowerName = region.name.toLowerCase();
             if (lowerName.contains("io") || lowerName.contains("ppu") ||
-                lowerName.contains("apu") || lowerName.contains("gs")) {
+                lowerName.contains("apu") || lowerName.contains("gs") ||
+                lowerName.equals("sram")) {
                 created.setVolatile(true);
             }
+        }
+
+        if (format.equals("gba")) {
+            applyGbaFields(space, memory, maxOffset, GBA_IO_REGISTERS);
+            applyGbaFields(space, memory, maxOffset, GBA_HEADER_FIELDS);
         }
 
         if (expectedLanguage.equals("x86:LE:16:Real Mode")) {
@@ -204,17 +287,38 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
             rawEntryOffset = alignedOffset;
         }
 
-        Address entry = space.getAddress(rawEntryOffset);
-        MemoryBlock entryBlock = memory.getBlock(entry);
-        if (entryBlock != null && entryBlock.isInitialized()) {
-            addEntryPoint(entry);
-            disassemble(entry);
-            if (getFunctionAt(entry) == null) {
-                createFunction(entry, "entry");
+        if (Long.compareUnsigned(rawEntryOffset, maxOffset) <= 0) {
+            Address entry = space.getAddress(rawEntryOffset);
+            MemoryBlock entryBlock = memory.getBlock(entry);
+            if (entryBlock != null && entryBlock.isInitialized()) {
+                addEntryPoint(entry);
+                disassemble(entry);
+                if (getFunctionAt(entry) == null) {
+                    createFunction(entry, "entry");
+                }
             }
         }
 
         currentProgram.getOptions(Program.PROGRAM_INFO).setBoolean("REA console prepared", true);
+    }
+
+    private void applyGbaFields(
+        AddressSpace space,
+        Memory memory,
+        long maxOffset,
+        GbaField[] fields
+    ) throws Exception {
+        for (GbaField field : fields) {
+            long endOffset = field.address() + Math.max(1, field.type().getLength()) - 1;
+            if (Long.compareUnsigned(endOffset, maxOffset) > 0) continue;
+            Address address = space.getAddress(field.address());
+            Address fieldEnd = space.getAddress(endOffset);
+            MemoryBlock block = memory.getBlock(address);
+            if (block == null || block.getEnd().compareTo(fieldEnd) < 0) continue;
+            clearListing(address, fieldEnd);
+            createLabel(address, field.name(), true, SourceType.IMPORTED);
+            createData(address, field.type());
+        }
     }
 
     private void removeOverlappingBlocks(

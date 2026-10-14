@@ -3,6 +3,8 @@ import {
   admitConsoleTarget,
   detectConsoleFormatFromHeader,
   formatConsoleTargetSpecTsv,
+  resolveConsoleFileOffset,
+  resolveConsoleVirtualAddress,
 } from "./consoleRom.js";
 
 describe("consoleRom", () => {
@@ -282,5 +284,140 @@ describe("consoleRom PSP, Xbox, and PS3", () => {
     expect(admitted.value.architecture).toBe("cell-ppu");
     expect(admitted.value.entryPoint).toBe("0x10040");
     expect(admitted.value.romMetadata.toc_base).toBe("0x28000");
+  });
+});
+
+describe("consoleRom Saturn, NDS, Mega Drive, PCE, and multi-bank coordinates", () => {
+  it("auto-detects Sega Saturn, Nintendo DS, Mega Drive, and PC Engine ROMs", () => {
+    // Sega Saturn IP.BIN / executable
+    const saturn = Buffer.alloc(0x200, 0);
+    saturn.write("SEGA SEGASATURN ", 0x00, "ascii");
+    saturn.write("T-12345G  V1.000", 0x20, "ascii");
+    saturn.write("GRANDIA         ", 0x60, "ascii");
+    saturn.writeUInt32BE(0x00004000, 0xe0); // firstReadSize
+    saturn.writeUInt32BE(0x06004000, 0xf0); // firstReadAddress
+    expect(detectConsoleFormatFromHeader(saturn, 0x10000, "/roms/ip.bin")).toBe(
+      "saturn",
+    );
+    const satAdmitted = admitConsoleTarget({
+      format: "saturn",
+      headerBytes: saturn,
+      fileBytes: 0x10000,
+    });
+    expect(satAdmitted.ok).toBe(true);
+    if (satAdmitted.ok) {
+      expect(satAdmitted.value.architecture).toBe("sh2");
+      expect(satAdmitted.value.ghidraLanguageId).toBe("SuperH:BE:32:SH-2");
+      expect(satAdmitted.value.entryPoint).toBe("0x6004000");
+    }
+
+    // Nintendo DS (.nds)
+    const nds = Buffer.alloc(0x200, 0);
+    nds.write("CHRONOTRIGGER", 0x00, "ascii");
+    nds.write("YCTJ", 0x0c, "ascii");
+    nds.writeUInt32LE(0x00004000, 0x20); // arm9RomOffset
+    nds.writeUInt32LE(0x02000800, 0x24); // arm9EntryAddress
+    nds.writeUInt32LE(0x02000000, 0x28); // arm9RamAddress
+    nds.writeUInt32LE(0x00010000, 0x2c); // arm9Size
+    nds.writeUInt16LE(0xcf56, 0x15c); // Nintendo logo CRC
+    expect(detectConsoleFormatFromHeader(nds, 0x40000, "/roms/ct.nds")).toBe(
+      "nds",
+    );
+    const ndsAdmitted = admitConsoleTarget({
+      format: "nds",
+      headerBytes: nds,
+      fileBytes: 0x40000,
+    });
+    expect(ndsAdmitted.ok).toBe(true);
+    if (ndsAdmitted.ok) {
+      expect(ndsAdmitted.value.architecture).toBe("arm");
+      expect(ndsAdmitted.value.entryPoint).toBe("0x2000800");
+      expect(ndsAdmitted.value.fileMappings[0]?.fileOffset).toBe(0x4000);
+    }
+
+    // Sega Mega Drive / Genesis (.md)
+    const md = Buffer.alloc(0x200, 0);
+    md.writeUInt32BE(0x00fffe00, 0x00); // Initial SSP
+    md.writeUInt32BE(0x00000200, 0x04); // Reset PC
+    md.write("SEGA MEGA DRIVE ", 0x100, "ascii");
+    md.write("LANGELISSER II  ", 0x120, "ascii");
+    expect(detectConsoleFormatFromHeader(md, 0x100000, "/roms/lang2.md")).toBe(
+      "md",
+    );
+    const mdAdmitted = admitConsoleTarget({
+      format: "md",
+      headerBytes: md,
+      fileBytes: 0x100000,
+    });
+    expect(mdAdmitted.ok).toBe(true);
+    if (mdAdmitted.ok) {
+      expect(mdAdmitted.value.architecture).toBe("68000");
+      expect(mdAdmitted.value.entryPoint).toBe("0x200");
+    }
+
+    // PC Engine (.pce) with 512-byte copier header
+    const pce = Buffer.alloc(0x2200, 0);
+    pce.writeUInt16LE(0xe120, 0x200 + 0x1ffe); // Reset vector in Bank 0
+    expect(detectConsoleFormatFromHeader(pce, 0x4200, "/roms/ys.pce")).toBe(
+      "pce",
+    );
+    const pceAdmitted = admitConsoleTarget({
+      format: "pce",
+      headerBytes: pce,
+      fileBytes: 0x4200,
+    });
+    expect(pceAdmitted.ok).toBe(true);
+    if (pceAdmitted.ok) {
+      expect(pceAdmitted.value.architecture).toBe("6502");
+      expect(pceAdmitted.value.entryPoint).toBe("0xe120");
+    }
+  });
+
+  it("resolves multi-bank SNES, GB, and PS1 headerless overlay coordinates", () => {
+    // Headerless PS1 overlay with explicit entry point
+    const overlay = Buffer.alloc(0x1000, 0x11);
+    const psxOverlay = admitConsoleTarget({
+      format: "psx-exe",
+      headerBytes: overlay,
+      fileBytes: 0x1000,
+      entryPoint: "0x80120000",
+    });
+    expect(psxOverlay.ok).toBe(true);
+    if (psxOverlay.ok) {
+      expect(psxOverlay.value.loadBase).toBe("0x80120000");
+      expect(psxOverlay.value.fileMappings[0]?.virtualAddress).toBe(
+        "0x80120000",
+      );
+    }
+
+    // Multi-bank SNES LoROM (4 banks = 128 KiB + 512B SMC header)
+    const snesHeader = Buffer.alloc(0x8200, 0);
+    snesHeader.writeUInt16LE(0x8000, 0x81fc);
+    const snes = admitConsoleTarget({
+      format: "snes",
+      headerBytes: snesHeader,
+      fileBytes: 512 + 4 * 0x8000,
+    });
+    expect(snes.ok).toBe(true);
+    if (snes.ok) {
+      expect(snes.value.fileMappings).toHaveLength(4);
+      // Bank 2 ($02:8100) -> 512 + 2 * 0x8000 + 0x100
+      expect(resolveConsoleFileOffset(snes.value, 0x028100)).toBe(
+        512 + 0x10100,
+      );
+      // FastROM mirror ($82:8100) -> same file offset
+      expect(resolveConsoleFileOffset(snes.value, 0x828100)).toBe(
+        512 + 0x10100,
+      );
+      // Bank-local 16-bit pointer ($8100) inside a table located in Bank 2
+      expect(
+        resolveConsoleFileOffset(snes.value, 0x8100, {
+          tableFileOffset: 512 + 0x10000,
+        }),
+      ).toBe(512 + 0x10100);
+      expect(resolveConsoleVirtualAddress(snes.value, 512 + 0x10100)).toBe(
+        "0x28100",
+      );
+    }
   });
 });

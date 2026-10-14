@@ -1,5 +1,9 @@
 import type { ExecutableFormatHint } from "../domain/dosCom.js";
-import type { BinaryArchitecture } from "../domain/binaryTargetTypes.js";
+import {
+  isConsoleBinaryTarget,
+  type BinaryArchitecture,
+  type BinaryTarget,
+} from "../domain/binaryTargetTypes.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type { DirectAnalysisDependencies } from "./DirectAnalysisDependencies.js";
 import type { BinarySession } from "./binary/BinarySession.js";
@@ -25,7 +29,6 @@ import { access } from "node:fs/promises";
 import { readAnalysisSnapshot } from "./binary/AnalysisSnapshotFiles.js";
 import { requiresNativeSourceAdmissionBeforeReplay } from "./binary/AnalysisSnapshotCache.js";
 import { parseBinaryTarget } from "./BinaryTargetResolver.js";
-import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import {
   snapshotEvidenceForQuery,
   snapshotMatchesTarget,
@@ -79,7 +82,9 @@ type DirectAnalysisTool =
   | "trace_native_ui_action"
   | "trace_native_values"
   | "search_rom_strings"
-  | "scan_pointer_table";
+  | "scan_pointer_table"
+  | "discover_pointer_tables"
+  | "find_code_caves";
 
 /**
  * Open one binary, execute one tool, and always release provider resources.
@@ -214,6 +219,63 @@ const runAnalysis = async (
   },
 ): Promise<JsonValue> => {
   const { logger, signal, snapshotPath } = options;
+  if (
+    (((tool === "search_rom_strings" || tool === "scan_pointer_table") &&
+      arguments_.resolve_xrefs === false) ||
+      ((tool === "discover_pointer_tables" || tool === "find_code_caves") &&
+        arguments_.resolve_xrefs !== true)) &&
+    snapshotPath === undefined &&
+    options.providerId === undefined
+  ) {
+    const parsedTarget = await parseBinaryTarget(path, {
+      signal,
+      ...(options.formatHint === undefined
+        ? {}
+        : { formatHint: options.formatHint }),
+      ...(options.architecture === undefined
+        ? {}
+        : { architecture: options.architecture }),
+      ...(options.entryPoint === undefined
+        ? {}
+        : { entryPoint: options.entryPoint }),
+    });
+    if (
+      parsedTarget.ok &&
+      parsedTarget.value.kind === "executable" &&
+      (isConsoleBinaryTarget(parsedTarget.value) ||
+        parsedTarget.value.format === "raw-binary")
+    ) {
+      const { EnhancedTools } = await import("./EnhancedTools.js");
+      const noopPort = {
+        execute: () =>
+          Promise.resolve(
+            err(
+              new AnalysisInputError(tool, {
+                userMessage:
+                  "Provider operation is unavailable during local ROM fast-path execution.",
+              }),
+            ),
+          ),
+      };
+      const result = await new EnhancedTools(
+        noopPort,
+        parsedTarget.value,
+      ).execute(tool, arguments_, signal);
+      if (result.ok) {
+        return createWorkflowEvidence({
+          target: parsedTarget.value,
+          operation: tool,
+          parameters: arguments_,
+          result: result.value,
+          upstreamProfile: undefined,
+          upstreamLimitations: [
+            "Executed directly on local ROM bytes with resolve_xrefs=false (disassembler session skipped).",
+          ],
+        });
+      }
+      return cliError(result.error);
+    }
+  }
   const config = dependencies.readConfiguration();
   if (!config.ok) return cliError(config.error);
   const session = await dependencies.createBinarySession(config.value, logger);
@@ -403,11 +465,17 @@ const executeAnalysisTool = async (input: {
     tool === "trace_native_values" ||
     tool === "trace_native_ui_action" ||
     tool === "search_rom_strings" ||
-    tool === "scan_pointer_table"
+    tool === "scan_pointer_table" ||
+    tool === "discover_pointer_tables" ||
+    tool === "find_code_caves"
   ) {
     const { EnhancedTools } = await import("./EnhancedTools.js");
     const result = await executeComposedWorkflow(session, (observed) =>
-      new EnhancedTools(observed).execute(tool, input.arguments, signal),
+      new EnhancedTools(observed, input.openedTarget).execute(
+        tool,
+        input.arguments,
+        signal,
+      ),
     );
     if (!result.ok) return { output: cliError(result.error) };
     const evidence = createWorkflowEvidence({
@@ -600,7 +668,9 @@ const isWorkflowEvidenceTool = (
   tool === "trace_native_values" ||
   tool === "trace_native_ui_action" ||
   tool === "search_rom_strings" ||
-  tool === "scan_pointer_table";
+  tool === "scan_pointer_table" ||
+  tool === "discover_pointer_tables" ||
+  tool === "find_code_caves";
 
 const fileExists = async (path: string): Promise<boolean> => {
   try {

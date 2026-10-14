@@ -7,13 +7,41 @@ export const ROM_TEXT_ENCODINGS = [
   "cp932",
   "euc-jp",
   "utf-8",
+  "utf8",
   "utf-16le",
+  "utf16le",
   "utf-16be",
+  "utf16be",
   "ascii",
   "tbl",
 ] as const;
 
 export type RomTextEncoding = (typeof ROM_TEXT_ENCODINGS)[number];
+
+export type CanonicalRomTextEncoding =
+  | "sjis"
+  | "cp932"
+  | "euc-jp"
+  | "utf-8"
+  | "utf-16le"
+  | "utf-16be"
+  | "ascii"
+  | "tbl";
+
+export const normalizeRomTextEncoding = (
+  encoding: RomTextEncoding,
+): CanonicalRomTextEncoding => {
+  switch (encoding) {
+    case "utf8":
+      return "utf-8";
+    case "utf16le":
+      return "utf-16le";
+    case "utf16be":
+      return "utf-16be";
+    default:
+      return encoding;
+  }
+};
 
 export const romTextEncodingSchema = z.enum(ROM_TEXT_ENCODINGS);
 
@@ -183,7 +211,8 @@ export const encodeRomQueryString = (
   if (query.length === 0) {
     return err("Query string must not be empty");
   }
-  switch (encoding) {
+  const canonical = normalizeRomTextEncoding(encoding);
+  switch (canonical) {
     case "utf-8":
       return ok(new TextEncoder().encode(query));
     case "ascii": {
@@ -204,7 +233,7 @@ export const encodeRomQueryString = (
       const out = new Uint8Array(query.length * 2);
       for (let i = 0; i < query.length; i++) {
         const code = query.charCodeAt(i);
-        if (encoding === "utf-16le") {
+        if (canonical === "utf-16le") {
           out[i * 2] = code & 0xff;
           out[i * 2 + 1] = (code >>> 8) & 0xff;
         } else {
@@ -244,7 +273,7 @@ export const encodeRomQueryString = (
     case "tbl": {
       if (customTable === undefined) {
         return err(
-          "Encoding 'tbl' requires tbl_text or tbl_path with valid .tbl mappings",
+          "Encoding 'tbl' requires table_text or table_path with valid .tbl mappings",
         );
       }
       const chunks: number[] = [];
@@ -283,21 +312,18 @@ export const formatHexPattern = (bytes: Uint8Array): string =>
 export const decodeRomStringFromBytes = (
   bytes: Uint8Array,
   encoding: RomTextEncoding,
-  terminatorByte = 0x00,
+  terminatorByte: number | null = 0x00,
   customTable?: CustomCharTable,
 ): {
   readonly decoded: string;
   readonly byteLength: number;
   readonly rawHex: string;
 } => {
-  if (encoding === "tbl" && customTable !== undefined) {
+  const canonical = normalizeRomTextEncoding(encoding);
+  if (canonical === "tbl" && customTable !== undefined) {
     let pos = 0;
     const parts: string[] = [];
     while (pos < bytes.length) {
-      if (bytes[pos] === terminatorByte) {
-        pos += 1;
-        break;
-      }
       let matchedText: string | undefined;
       let matchedLen = 0;
       let hitEndToken = false;
@@ -317,6 +343,14 @@ export const decodeRomStringFromBytes = (
           break;
         }
       }
+      if (
+        terminatorByte !== null &&
+        bytes[pos] === terminatorByte &&
+        (matchedText === undefined || (terminatorByte !== 0x00 && !hitEndToken))
+      ) {
+        pos += 1;
+        break;
+      }
       if (matchedText === undefined) break;
       parts.push(matchedText);
       pos += matchedLen;
@@ -330,17 +364,24 @@ export const decodeRomStringFromBytes = (
     };
   }
 
-  if (encoding === "utf-16le" || encoding === "utf-16be") {
+  if (canonical === "utf-16le" || canonical === "utf-16be") {
     let end = bytes.length - (bytes.length % 2);
-    for (let i = 0; i + 1 < bytes.length; i += 2) {
-      if (bytes[i] === terminatorByte && bytes[i + 1] === terminatorByte) {
-        end = i;
-        break;
+    let foundTerminator = false;
+    if (terminatorByte !== null) {
+      for (let i = 0; i + 1 < bytes.length; i += 2) {
+        if (bytes[i] === terminatorByte && bytes[i + 1] === terminatorByte) {
+          end = i;
+          foundTerminator = true;
+          break;
+        }
       }
     }
     const content = bytes.subarray(0, end);
-    const decoder = new TextDecoder(encoding, { fatal: false });
-    const consumed = bytes.subarray(0, Math.min(end + 2, bytes.length));
+    const decoder = new TextDecoder(canonical, { fatal: false });
+    const consumed = bytes.subarray(
+      0,
+      foundTerminator ? Math.min(end + 2, bytes.length) : end,
+    );
     return {
       decoded: decoder.decode(content),
       byteLength: consumed.length,
@@ -349,18 +390,25 @@ export const decodeRomStringFromBytes = (
   }
 
   let end = bytes.length;
-  for (let i = 0; i < bytes.length; i++) {
-    if (bytes[i] === terminatorByte) {
-      end = i;
-      break;
+  let foundTerminator = false;
+  if (terminatorByte !== null) {
+    for (let i = 0; i < bytes.length; i++) {
+      if (bytes[i] === terminatorByte) {
+        end = i;
+        foundTerminator = true;
+        break;
+      }
     }
   }
   const content = bytes.subarray(0, end);
-  const consumed = bytes.subarray(0, Math.min(end + 1, bytes.length));
+  const consumed = bytes.subarray(
+    0,
+    foundTerminator ? Math.min(end + 1, bytes.length) : end,
+  );
   const decoderLabel =
-    encoding === "sjis" || encoding === "cp932"
+    canonical === "sjis" || canonical === "cp932"
       ? "shift-jis"
-      : encoding === "euc-jp"
+      : canonical === "euc-jp"
         ? "euc-jp"
         : "utf-8";
   const decoder = new TextDecoder(decoderLabel, { fatal: false });
@@ -377,7 +425,7 @@ export const extractRomStringsFromBuffer = (input: {
   readonly baseAddress: bigint;
   readonly encoding: RomTextEncoding;
   readonly minLength: number;
-  readonly terminatorByte: number;
+  readonly terminatorByte: number | null;
   readonly customTable?: CustomCharTable | undefined;
   readonly limit: number;
 }): readonly {
@@ -396,6 +444,7 @@ export const extractRomStringsFromBuffer = (input: {
     customTable,
     limit,
   } = input;
+  const canonical = normalizeRomTextEncoding(encoding);
   const results: {
     readonly offsetInBuffer: number;
     readonly address: string;
@@ -405,27 +454,33 @@ export const extractRomStringsFromBuffer = (input: {
   }[] = [];
 
   const sjisDecoder =
-    encoding === "sjis" || encoding === "cp932"
+    canonical === "sjis" || canonical === "cp932"
       ? new TextDecoder("shift-jis", { fatal: true })
-      : encoding === "euc-jp"
+      : canonical === "euc-jp"
         ? new TextDecoder("euc-jp", { fatal: true })
         : undefined;
 
+  const tblMapsZero =
+    canonical === "tbl" &&
+    customTable !== undefined &&
+    customTable.decodeByLength.get(1)?.has("00") === true &&
+    !customTable.endTokens.has("00");
+
   let cursor = 0;
   while (cursor < bytes.length && results.length < limit) {
-    if (bytes[cursor] === terminatorByte) {
+    if (
+      terminatorByte !== null &&
+      bytes[cursor] === terminatorByte &&
+      !(tblMapsZero && terminatorByte === 0x00)
+    ) {
       cursor++;
       continue;
     }
 
-    if (encoding === "tbl" && customTable !== undefined) {
+    if (canonical === "tbl" && customTable !== undefined) {
       let pos = cursor;
       const chars: string[] = [];
       while (pos < bytes.length) {
-        if (bytes[pos] === terminatorByte) {
-          pos++;
-          break;
-        }
         let matchedText: string | undefined;
         let matchedLen = 0;
         let hitEnd = false;
@@ -444,6 +499,14 @@ export const extractRomStringsFromBuffer = (input: {
             hitEnd = customTable.endTokens.has(hexKey);
             break;
           }
+        }
+        if (
+          terminatorByte !== null &&
+          bytes[pos] === terminatorByte &&
+          (matchedText === undefined || (terminatorByte !== 0x00 && !hitEnd))
+        ) {
+          pos++;
+          break;
         }
         if (matchedText === undefined) break;
         chars.push(matchedText);
@@ -472,11 +535,11 @@ export const extractRomStringsFromBuffer = (input: {
       let multibyteCount = 0;
       while (pos < bytes.length) {
         const b0 = bytes[pos] ?? 0;
-        if (b0 === terminatorByte) {
+        if (terminatorByte !== null && b0 === terminatorByte) {
           pos++;
           break;
         }
-        if (encoding === "sjis" || encoding === "cp932") {
+        if (canonical === "sjis" || canonical === "cp932") {
           const isLead =
             (b0 >= 0x81 && b0 <= 0x9f) || (b0 >= 0xe0 && b0 <= 0xfc);
           if (isLead && pos + 1 < bytes.length) {
@@ -550,7 +613,7 @@ export const extractRomStringsFromBuffer = (input: {
     let pos = cursor;
     while (pos < bytes.length) {
       const b = bytes[pos] ?? 0;
-      if (b === terminatorByte) {
+      if (terminatorByte !== null && b === terminatorByte) {
         pos++;
         break;
       }
@@ -561,14 +624,16 @@ export const extractRomStringsFromBuffer = (input: {
       break;
     }
     const charLen =
-      pos > cursor && bytes[pos - 1] === terminatorByte
+      terminatorByte !== null &&
+      pos > cursor &&
+      bytes[pos - 1] === terminatorByte
         ? pos - 1 - cursor
         : pos - cursor;
     if (charLen >= minLength) {
       const slice = bytes.subarray(cursor, pos);
       const decoded = decodeRomStringFromBytes(
         slice,
-        encoding,
+        canonical,
         terminatorByte,
       ).decoded;
       results.push({
@@ -614,7 +679,7 @@ export const searchRomStringsInputSchema = z.strictObject({
     .min(1)
     .optional()
     .describe(
-      "Literal text to encode and search in ROM memory (e.g. Japanese Shift-JIS, EUC-JP, UTF-8, or custom .tbl text). Omit when scanning an explicit address range.",
+      "Literal text to encode and search in ROM memory (e.g. Japanese Shift-JIS, EUC-JP, UTF-8, or custom .tbl text). Omit when scanning an explicit address or file-offset range.",
     ),
   encoding: z
     .enum(ROM_TEXT_ENCODINGS)
@@ -641,16 +706,32 @@ export const searchRomStringsInputSchema = z.strictObject({
     .min(1)
     .optional()
     .describe(
-      "Optional start address (hex, e.g. 0x08000000). Required when query is omitted to scan a memory region.",
+      "Optional start address (hex, e.g. 0x08000000). Required when query and start_offset are omitted to scan a memory region.",
+    ),
+  start_offset: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe(
+      "Optional starting ROM file offset in bytes (alternative to start_address).",
+    ),
+  end_offset: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(
+      "Optional ending ROM file offset in bytes (exclusive; alternative to length).",
     ),
   length: z
     .number()
     .int()
     .min(1)
-    .max(65_536)
+    .max(16_777_216)
     .default(4096)
     .describe(
-      "Byte length to scan when extracting strings from start_address without a query.",
+      "Byte length to scan when extracting strings from start_address or start_offset without a query.",
     ),
   min_length: z
     .number()
@@ -660,6 +741,16 @@ export const searchRomStringsInputSchema = z.strictObject({
     .default(2)
     .describe(
       "Minimum decoded character count when scanning an address range without a query.",
+    ),
+  terminator_byte: z
+    .number()
+    .int()
+    .min(0)
+    .max(255)
+    .nullable()
+    .default(0x00)
+    .describe(
+      "String terminator byte (0x00..0xFF, e.g. 0x00 or 0xFF), or null to rely only on .tbl end tokens.",
     ),
   max_results: z
     .number()
@@ -704,8 +795,17 @@ export const scanPointerTableInputSchema = z.strictObject({
   address: z
     .string()
     .min(1)
+    .optional()
     .describe(
-      "Starting virtual address of the pointer table (e.g. 0x08100000).",
+      "Starting virtual address of the pointer table (e.g. 0x08100000). Optional when table_offset is provided.",
+    ),
+  table_offset: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe(
+      "Starting ROM file offset of the pointer table in bytes (alternative to address).",
     ),
   count: z
     .number()
@@ -755,6 +855,16 @@ export const scanPointerTableInputSchema = z.strictObject({
     .describe(
       "Optional inline .tbl character mapping rules (HEX=CHAR per line).",
     ),
+  terminator_byte: z
+    .number()
+    .int()
+    .min(0)
+    .max(255)
+    .nullable()
+    .default(0x00)
+    .describe(
+      "String terminator byte (0x00..0xFF) used when decoding target string previews, or null for .tbl end tokens only.",
+    ),
   preview_bytes: z
     .number()
     .int()
@@ -769,6 +879,12 @@ export const scanPointerTableInputSchema = z.strictObject({
     .default(true)
     .describe(
       "Resolve incoming cross-references to each pointer table slot and target address.",
+    ),
+  include_manuscript: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Emit locbatch.py-compatible manuscript records (id, pointer_offset, target_offset, max_bytes, jp, ko) alongside pointer entries.",
     ),
 });
 
@@ -786,12 +902,27 @@ export const pointerTableEntrySchema = z.strictObject({
   preview_text: z.string().nullable(),
   preview_bytes_hex: z.string().nullable(),
   preview_byte_length: z.number().int().min(0).nullable(),
+  allocated_budget_bytes: z.number().int().min(0).nullable().optional(),
   entry_xrefs: z.array(z.string()),
   target_xrefs: z.array(z.string()),
 });
 
+export const manuscriptRecordSchema = z.strictObject({
+  id: z.string(),
+  index: z.number().int().min(0),
+  pointer_address: z.string(),
+  pointer_file_offset: z.number().int().min(0).nullable(),
+  target_address: z.string(),
+  target_file_offset: z.number().int().min(0).nullable(),
+  byte_length: z.number().int().min(0).nullable(),
+  max_bytes: z.number().int().min(0).nullable(),
+  jp: z.string(),
+  ko: z.string(),
+});
+
 export const scanPointerTableResultSchema = z.strictObject({
   table_address: z.string(),
+  table_file_offset: z.number().int().min(0).nullable().optional(),
   pointer_size: z.union([z.literal(2), z.literal(3), z.literal(4)]),
   endian: z.enum(["little", "big"]),
   base_address: z.string(),
@@ -799,4 +930,387 @@ export const scanPointerTableResultSchema = z.strictObject({
   encoding: z.enum(ROM_TEXT_ENCODINGS),
   entries: z.array(pointerTableEntrySchema),
   entries_scanned: z.number().int().min(0),
+  manuscript_records: z.array(manuscriptRecordSchema).optional(),
 });
+
+/**
+ * Compute per-entry in-place byte budgets (distance to the next higher target offset
+ * within the same string block, up to 4096 bytes; falls back to preview_byte_length).
+ */
+export const computePointerSlotBudgets = (
+  entries: readonly {
+    readonly target_file_offset: number | null;
+    readonly target_address: string;
+    readonly preview_byte_length: number | null;
+  }[],
+): readonly (number | null)[] => {
+  const useFileOffsets = entries.some((e) => e.target_file_offset !== null);
+  const coords = entries.map((e) => {
+    if (useFileOffsets) return e.target_file_offset;
+    try {
+      return Number(BigInt(e.target_address));
+    } catch {
+      return null;
+    }
+  });
+  const sortedUnique = Array.from(
+    new Set(coords.filter((c): c is number => c !== null && c >= 0)),
+  ).sort((a, b) => a - b);
+
+  const nextCoordMap = new Map<number, number>();
+  for (let i = 0; i + 1 < sortedUnique.length; i++) {
+    const curr = sortedUnique[i]!;
+    const next = sortedUnique[i + 1]!;
+    const delta = next - curr;
+    if (delta > 0 && delta <= 4096) {
+      nextCoordMap.set(curr, delta);
+    }
+  }
+
+  return entries.map((entry, idx) => {
+    const coord = coords[idx] ?? null;
+    if (coord !== null) {
+      const budget = nextCoordMap.get(coord);
+      if (budget !== undefined) return budget;
+    }
+    return entry.preview_byte_length;
+  });
+};
+
+export const discoverPointerTablesInputSchema = z.strictObject({
+  start_address: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Optional starting virtual address (hex) to scan for candidate pointer tables.",
+    ),
+  start_offset: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe(
+      "Optional starting ROM file offset in bytes to scan for candidate pointer tables.",
+    ),
+  end_offset: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(
+      "Optional ending ROM file offset in bytes (exclusive) for pointer table discovery.",
+    ),
+  length: z
+    .number()
+    .int()
+    .min(16)
+    .max(16_777_216)
+    .default(262_144)
+    .describe(
+      "Maximum byte length to scan when end_offset is not specified (default 256 KiB).",
+    ),
+  pointer_size: z
+    .union([z.literal(2), z.literal(3), z.literal(4)])
+    .default(4)
+    .describe("Pointer width in bytes: 2 (16-bit), 3 (24-bit), or 4 (32-bit)."),
+  endian: z
+    .enum(["little", "big"])
+    .default("little")
+    .describe("Pointer byte order."),
+  base_address: z
+    .string()
+    .default("0x0")
+    .describe(
+      "Base address added to each raw pointer value (e.g. 0x08000000 for 16-bit relative offsets).",
+    ),
+  stride: z
+    .number()
+    .int()
+    .min(1)
+    .max(64)
+    .optional()
+    .describe("Bytes per table entry; defaults to pointer_size."),
+  min_entries: z
+    .number()
+    .int()
+    .min(2)
+    .max(256)
+    .default(4)
+    .describe(
+      "Minimum consecutive valid string pointers required to report a candidate pointer table.",
+    ),
+  encoding: z
+    .enum(ROM_TEXT_ENCODINGS)
+    .default("sjis")
+    .describe("Character encoding used to validate and decode target strings."),
+  table_path: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Optional path to a custom .tbl character mapping file (HEX=CHAR per line).",
+    ),
+  table_text: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Optional inline .tbl character mapping rules (HEX=CHAR per line).",
+    ),
+  terminator_byte: z
+    .number()
+    .int()
+    .min(0)
+    .max(255)
+    .nullable()
+    .default(0x00)
+    .describe("String terminator byte (0x00..0xFF) or null."),
+  min_string_length: z
+    .number()
+    .int()
+    .min(1)
+    .max(64)
+    .default(2)
+    .describe(
+      "Minimum decoded character length at a pointer target to consider it a valid string.",
+    ),
+  max_tables: z
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .default(20)
+    .describe("Maximum number of candidate pointer tables to return."),
+  sample_entries: z
+    .number()
+    .int()
+    .min(1)
+    .max(16)
+    .default(3)
+    .describe("Number of sample entries to include per discovered table."),
+  resolve_xrefs: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Resolve incoming cross-references to each discovered table's starting address.",
+    ),
+});
+
+export type DiscoverPointerTablesInput = z.output<
+  typeof discoverPointerTablesInputSchema
+>;
+
+export const discoveredPointerSampleSchema = z.strictObject({
+  index: z.number().int().min(0),
+  entry_address: z.string(),
+  target_address: z.string(),
+  target_file_offset: z.number().int().min(0).nullable(),
+  preview_text: z.string(),
+  byte_length: z.number().int().min(0),
+  allocated_budget_bytes: z.number().int().min(0).nullable(),
+});
+
+export const discoveredPointerTableSchema = z.strictObject({
+  table_address: z.string(),
+  table_file_offset: z.number().int().min(0).nullable(),
+  entry_count: z.number().int().min(2),
+  unique_targets: z.number().int().min(1),
+  pointer_size: z.union([z.literal(2), z.literal(3), z.literal(4)]),
+  stride: z.number().int().min(1),
+  min_string_bytes: z.number().int().min(0),
+  max_string_bytes: z.number().int().min(0),
+  avg_string_bytes: z.number().min(0),
+  table_xrefs: z.array(z.string()),
+  samples: z.array(discoveredPointerSampleSchema),
+});
+
+export const discoverPointerTablesResultSchema = z.strictObject({
+  encoding: z.enum(ROM_TEXT_ENCODINGS),
+  pointer_size: z.union([z.literal(2), z.literal(3), z.literal(4)]),
+  endian: z.enum(["little", "big"]),
+  base_address: z.string(),
+  stride: z.number().int().min(1),
+  bytes_scanned: z.number().int().min(0),
+  tables: z.array(discoveredPointerTableSchema),
+  total_tables: z.number().int().min(0),
+});
+
+export const findCodeCavesInputSchema = z.strictObject({
+  min_size: z
+    .number()
+    .int()
+    .min(16)
+    .max(1_048_576)
+    .default(64)
+    .describe(
+      "Minimum contiguous byte length required to report a code/data cave (default 64 bytes).",
+    ),
+  fill_byte: z
+    .number()
+    .int()
+    .min(0)
+    .max(255)
+    .optional()
+    .describe(
+      "Optional specific padding byte to match (e.g. 0x00 or 0xFF). When omitted, scans for contiguous runs of either 0x00 or 0xFF.",
+    ),
+  alignment: z
+    .union([
+      z.literal(1),
+      z.literal(2),
+      z.literal(4),
+      z.literal(8),
+      z.literal(16),
+      z.literal(32),
+    ])
+    .default(4)
+    .describe(
+      "Address/offset alignment boundary for reported cave start addresses (default 4).",
+    ),
+  start_address: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Optional starting virtual address (hex) when scanning via provider.",
+    ),
+  start_offset: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe("Optional starting ROM file offset in bytes."),
+  end_offset: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe("Optional ending ROM file offset in bytes (exclusive)."),
+  length: z
+    .number()
+    .int()
+    .min(16)
+    .max(16_777_216)
+    .default(262_144)
+    .describe(
+      "Bytes to scan when reading via provider without local ROM file.",
+    ),
+  executable_only: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Restrict scan to executable mapped segments when console ROM mappings are known.",
+    ),
+  max_results: z
+    .number()
+    .int()
+    .min(1)
+    .max(200)
+    .default(32)
+    .describe(
+      "Maximum number of candidate code caves to return, sorted largest first.",
+    ),
+  resolve_xrefs: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Check incoming cross-references to each cave start address via the analysis provider.",
+    ),
+});
+
+export type FindCodeCavesInput = z.output<typeof findCodeCavesInputSchema>;
+
+export const codeCaveEntrySchema = z.strictObject({
+  address: z.string(),
+  file_offset: z.number().int().min(0).nullable(),
+  byte_length: z.number().int().min(1),
+  fill_byte: z.string(),
+  region_name: z.string().nullable(),
+  executable: z.boolean(),
+  xrefs: z.array(z.string()),
+});
+
+export const findCodeCavesResultSchema = z.strictObject({
+  min_size: z.number().int().min(16),
+  alignment: z.number().int().min(1),
+  caves: z.array(codeCaveEntrySchema),
+  total_caves: z.number().int().min(0),
+});
+
+/** Scan a byte slice for contiguous runs of 0x00 or 0xFF (or explicit fillByte) aligned to `alignment`. */
+export const findCodeCavesInSlice = (input: {
+  readonly bytes: Uint8Array;
+  readonly sliceFileOffset: number;
+  readonly regionName: string | null;
+  readonly executable: boolean;
+  readonly minSize: number;
+  readonly alignment: number;
+  readonly fillByte?: number | undefined;
+  readonly toVirtualAddress: (fileOffset: number) => string | null;
+}): readonly {
+  readonly address: string;
+  readonly file_offset: number;
+  readonly byte_length: number;
+  readonly fill_byte: string;
+  readonly region_name: string | null;
+  readonly executable: boolean;
+}[] => {
+  const {
+    bytes,
+    sliceFileOffset,
+    regionName,
+    executable,
+    minSize,
+    alignment,
+    fillByte,
+    toVirtualAddress,
+  } = input;
+  const caves: {
+    readonly address: string;
+    readonly file_offset: number;
+    readonly byte_length: number;
+    readonly fill_byte: string;
+    readonly region_name: string | null;
+    readonly executable: boolean;
+  }[] = [];
+
+  let i = 0;
+  while (i < bytes.length) {
+    const b = bytes[i]!;
+    const matchesFill =
+      fillByte !== undefined ? b === fillByte : b === 0x00 || b === 0xff;
+    if (!matchesFill) {
+      i++;
+      continue;
+    }
+    let end = i + 1;
+    while (end < bytes.length && bytes[end] === b) {
+      end++;
+    }
+    const rawStartFileOffset = sliceFileOffset + i;
+    const rawEndFileOffset = sliceFileOffset + end;
+    const remainder = rawStartFileOffset % alignment;
+    const alignedStartFileOffset =
+      remainder === 0
+        ? rawStartFileOffset
+        : rawStartFileOffset + (alignment - remainder);
+    const alignedLength = rawEndFileOffset - alignedStartFileOffset;
+    if (alignedLength >= minSize) {
+      const address =
+        toVirtualAddress(alignedStartFileOffset) ??
+        `0x${alignedStartFileOffset.toString(16)}`;
+      caves.push({
+        address,
+        file_offset: alignedStartFileOffset,
+        byte_length: alignedLength,
+        fill_byte: `0x${b.toString(16).padStart(2, "0")}`,
+        region_name: regionName,
+        executable,
+      });
+    }
+    i = end;
+  }
+
+  return caves;
+};

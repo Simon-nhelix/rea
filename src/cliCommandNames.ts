@@ -44,6 +44,8 @@ export const CLI_COMMANDS = Object.freeze({
   addressToFileOffset: "address-to-file-offset",
   searchRomStrings: "search-rom-strings",
   scanPointerTable: "scan-pointer-table",
+  discoverPointerTables: "discover-pointer-tables",
+  findCodeCaves: "find-code-caves",
   traceNativeValues: "trace-native-values",
   inspectNativeInstruction: "inspect-native-instruction",
   resolveNativeCallTargets: "resolve-native-call-targets",

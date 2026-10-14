@@ -14,6 +14,10 @@ export const CONSOLE_TARGET_FORMATS = [
   "ps3",
   "xbox",
   "dc-bin",
+  "saturn",
+  "nds",
+  "md",
+  "pce",
   "gc-dol",
   "snes",
   "nes",
@@ -39,7 +43,9 @@ export type ConsoleArchitecture =
   | "allegrex"
   | "cell-ppu"
   | "xenon"
+  | "sh2"
   | "sh4"
+  | "68000"
   | "gekko"
   | "65816"
   | "6502"
@@ -203,7 +209,46 @@ export const detectConsoleFormatFromHeader = (
     return "gba";
   }
 
-  // 9. Game Boy / Game Boy Color ROM (Nintendo logo at 0x104..0x113)
+  // 9. Nintendo DS ROM (Nintendo logo at 0xC0..0xCF and valid ARM9 load/entry fields)
+  if (
+    bytes.length >= 0x160 &&
+    bytes.subarray(0xc0, 0xd0).equals(GBA_LOGO_PREFIX)
+  ) {
+    const arm9Entry = bytes.readUInt32LE(0x24);
+    const arm9Ram = bytes.readUInt32LE(0x28);
+    if (
+      arm9Entry >= 0x02000000 &&
+      arm9Entry < 0x02400000 &&
+      arm9Ram >= 0x02000000 &&
+      arm9Ram < 0x02400000
+    ) {
+      return "nds";
+    }
+  }
+
+  // 10. Sega Saturn IP.BIN / boot header ("SEGA SEGASATURN " at 0x00)
+  if (
+    bytes.length >= 0x100 &&
+    bytes.subarray(0, 16).equals(Buffer.from("SEGA SEGASATURN ", "ascii"))
+  ) {
+    return "saturn";
+  }
+
+  // 11. Sega Mega Drive / Genesis ("SEGA MEGA DRIVE " or "SEGA GENESIS    " at 0x100)
+  if (
+    bytes.length >= 0x200 &&
+    (bytes
+      .subarray(0x100, 0x110)
+      .equals(Buffer.from("SEGA MEGA DRIVE ", "ascii")) ||
+      bytes
+        .subarray(0x100, 0x110)
+        .equals(Buffer.from("SEGA GENESIS    ", "ascii")) ||
+      bytes.subarray(0x100, 0x105).equals(Buffer.from("SEGA ", "ascii")))
+  ) {
+    return "md";
+  }
+
+  // 12. Game Boy / Game Boy Color ROM (Nintendo logo at 0x104..0x113)
   if (
     bytes.length >= 0x150 &&
     bytes.subarray(0x104, 0x114).equals(GB_LOGO_PREFIX)
@@ -211,7 +256,7 @@ export const detectConsoleFormatFromHeader = (
     return "gb";
   }
 
-  // 10. GameCube DOL (valid section table with entry in 0x80000000..0x817fffff)
+  // 13. GameCube DOL (valid section table with entry in 0x80000000..0x817fffff)
   if (
     (lowerPath.endsWith(".dol") || bytes.length >= 0x100) &&
     isValidGameCubeDolHeader(bytes, fileSize, lowerPath.endsWith(".dol"))
@@ -219,12 +264,27 @@ export const detectConsoleFormatFromHeader = (
     return "gc-dol";
   }
 
-  // 11. SNES / Super Famicom (.sfc / .smc)
+  // 14. SNES / Super Famicom (.sfc / .smc)
   if (lowerPath.endsWith(".sfc") || lowerPath.endsWith(".smc")) {
     return "snes";
   }
 
-  // 12. WonderSwan / WonderSwan Color (.ws / .wsc)
+  // 15. Nintendo DS (.nds)
+  if (lowerPath.endsWith(".nds")) {
+    return "nds";
+  }
+
+  // 16. Sega Mega Drive / Genesis (.gen / .smd)
+  if (lowerPath.endsWith(".gen") || lowerPath.endsWith(".smd")) {
+    return "md";
+  }
+
+  // 17. PC Engine / TurboGrafx-16 (.pce)
+  if (lowerPath.endsWith(".pce")) {
+    return "pce";
+  }
+
+  // 18. WonderSwan / WonderSwan Color (.ws / .wsc)
   if (lowerPath.endsWith(".ws") || lowerPath.endsWith(".wsc")) {
     return "wsc";
   }
@@ -264,11 +324,13 @@ const hex32 = (value: number | bigint): string =>
 export const admitConsoleTarget = (input: {
   readonly format: ConsoleTargetFormat;
   readonly headerBytes: Buffer;
+  readonly innerHeaderBytes?: Buffer | undefined;
   readonly trailerBytes?: Buffer | undefined;
   readonly fileBytes: number;
   readonly entryPoint?: unknown;
 }): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
-  const { format, headerBytes, trailerBytes, fileBytes } = input;
+  const { format, headerBytes, innerHeaderBytes, trailerBytes, fileBytes } =
+    input;
   if (!Number.isSafeInteger(fileBytes) || fileBytes < 1) {
     return err({
       reason: `${format} requires at least one file byte`,
@@ -304,13 +366,21 @@ export const admitConsoleTarget = (input: {
     case "ps2-elf":
       return admitPs2Elf(headerBytes, fileBytes, explicitEntry);
     case "psp":
-      return admitPsp(headerBytes, fileBytes, explicitEntry);
+      return admitPsp(headerBytes, innerHeaderBytes, fileBytes, explicitEntry);
     case "ps3":
       return admitPs3(headerBytes, fileBytes, explicitEntry);
     case "xbox":
       return admitXbox(headerBytes, fileBytes, explicitEntry);
     case "dc-bin":
       return admitDcBin(fileBytes, explicitEntry);
+    case "saturn":
+      return admitSaturn(headerBytes, fileBytes, explicitEntry);
+    case "nds":
+      return admitNds(headerBytes, fileBytes, explicitEntry);
+    case "md":
+      return admitMd(headerBytes, fileBytes, explicitEntry);
+    case "pce":
+      return admitPce(headerBytes, fileBytes, explicitEntry);
     case "gc-dol":
       return admitGcDol(headerBytes, fileBytes, explicitEntry);
     case "snes":
@@ -400,6 +470,12 @@ const admitGba = (
         byteLength: 0x400,
         kind: "vram",
       },
+      {
+        name: "SRAM",
+        virtualAddress: "0xe000000",
+        byteLength: 0x10000,
+        kind: "ram",
+      },
     ],
     romMetadata: {
       title: title || null,
@@ -423,9 +499,9 @@ const admitPsxExe = (
       constraint: "file_format_rejected",
     });
   }
-  const pc0 = hasPsxMagic ? headerBytes.readUInt32LE(0x10) : 0x80010000;
+  const pc0 = hasPsxMagic ? headerBytes.readUInt32LE(0x10) : 0;
   const gp0 = hasPsxMagic ? headerBytes.readUInt32LE(0x14) : 0;
-  const tAddr = hasPsxMagic ? headerBytes.readUInt32LE(0x18) : 0x80010000;
+  const tAddr = hasPsxMagic ? headerBytes.readUInt32LE(0x18) : 0;
   const tSize = hasPsxMagic ? headerBytes.readUInt32LE(0x1c) : fileBytes;
   const loadAddress =
     tAddr !== 0 ? hex32(tAddr) : (explicitEntry?.canonical ?? "0x80010000");
@@ -474,9 +550,9 @@ const admitPsxExe = (
     ],
     romMetadata: {
       has_psx_header: hasPsxMagic,
-      pc0: hex32(pc0),
+      pc0: hex32(pc0 !== 0 ? pc0 : BigInt(entryPoint)),
       gp0: hex32(gp0),
-      t_addr: hex32(tAddr),
+      t_addr: hex32(tAddr !== 0 ? tAddr : BigInt(loadAddress)),
       t_size: tSize,
     },
   });
@@ -586,6 +662,7 @@ const admitPs2Elf = (
 
 const admitPsp = (
   headerBytes: Buffer,
+  innerHeaderBytes: Buffer | undefined,
   fileBytes: number,
   explicitEntry?: { canonical: string; source: string },
 ): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
@@ -641,9 +718,11 @@ const admitPsp = (
   }
 
   const innerBytes =
-    containerOffset < headerBytes.length
-      ? headerBytes.subarray(containerOffset)
-      : Buffer.alloc(0);
+    innerHeaderBytes !== undefined && innerHeaderBytes.length > 0
+      ? innerHeaderBytes
+      : containerOffset < headerBytes.length
+        ? headerBytes.subarray(containerOffset)
+        : Buffer.alloc(0);
 
   // Check if inner payload is an ELF32 LE MIPS binary (ET_EXEC or ET_PSP_PRX 0xFFA0)
   if (
@@ -1246,6 +1325,478 @@ const admitDcBin = (
   });
 };
 
+const admitSaturn = (
+  headerBytes: Buffer,
+  fileBytes: number,
+  explicitEntry?: { canonical: string; source: string },
+): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
+  const hasIpHeader =
+    headerBytes.length >= 0x100 &&
+    headerBytes
+      .subarray(0, 16)
+      .equals(Buffer.from("SEGA SEGASATURN ", "ascii"));
+  const firstReadAddr =
+    hasIpHeader && headerBytes.length >= 0xf4
+      ? headerBytes.readUInt32BE(0xf0)
+      : 0;
+  const title =
+    hasIpHeader && headerBytes.length >= 0xd0
+      ? headerBytes
+          .subarray(0x60, 0xd0)
+          .toString("ascii")
+          .replace(/\0+$/u, "")
+          .trim()
+      : "";
+  const productId =
+    hasIpHeader && headerBytes.length >= 0x2a
+      ? headerBytes
+          .subarray(0x20, 0x2a)
+          .toString("ascii")
+          .replace(/\0+$/u, "")
+          .trim()
+      : "";
+
+  const defaultLoad = hasIpHeader ? 0x06002000 : 0x06004000;
+  const loadBase = explicitEntry?.canonical ?? hex32(defaultLoad);
+  const entryPoint =
+    explicitEntry?.canonical ??
+    (hasIpHeader &&
+    firstReadAddr >= 0x06002000 &&
+    firstReadAddr < 0x06002000 + fileBytes
+      ? hex32(firstReadAddr)
+      : loadBase);
+
+  return ok({
+    format: "saturn",
+    architecture: "sh2",
+    ghidraLanguageId: "SuperH:BE:32:SH-2",
+    compilerSpecId: "default",
+    loader: "BinaryLoader",
+    loadBase,
+    entryPoint,
+    entryPointSource: explicitEntry?.source ?? entryPoint,
+    fileMappings: [
+      {
+        name: hasIpHeader ? "SATURN_DISC_BOOT" : "SATURN_OVERLAY_OR_1ST_READ",
+        virtualAddress: loadBase,
+        fileOffset: 0,
+        byteLength: Math.min(fileBytes, 0x100000),
+        executable: true,
+        writable: true,
+      },
+    ],
+    memoryRegions: [
+      {
+        name: "WORK_RAM_LOW",
+        virtualAddress: "0x200000",
+        byteLength: 0x100000,
+        kind: "ram",
+      },
+      {
+        name: "WORK_RAM_HIGH",
+        virtualAddress: "0x6000000",
+        byteLength: 0x100000,
+        kind: "ram",
+      },
+      {
+        name: "VDP1_VRAM",
+        virtualAddress: "0x5c00000",
+        byteLength: 0x80000,
+        kind: "vram",
+      },
+      {
+        name: "VDP1_FB",
+        virtualAddress: "0x5c80000",
+        byteLength: 0x40000,
+        kind: "vram",
+      },
+      {
+        name: "VDP2_VRAM",
+        virtualAddress: "0x5e00000",
+        byteLength: 0x80000,
+        kind: "vram",
+      },
+      {
+        name: "VDP2_CRAM",
+        virtualAddress: "0x5f00000",
+        byteLength: 0x1000,
+        kind: "vram",
+      },
+      {
+        name: "VDP2_REG",
+        virtualAddress: "0x5f80000",
+        byteLength: 0x200,
+        kind: "mmio",
+      },
+      {
+        name: "SCU_REG",
+        virtualAddress: "0x5fe0000",
+        byteLength: 0x100,
+        kind: "mmio",
+      },
+    ],
+    romMetadata: {
+      has_ip_header: hasIpHeader,
+      title: title || null,
+      product_id: productId || null,
+      first_read_address: firstReadAddr !== 0 ? hex32(firstReadAddr) : null,
+      load_base: loadBase,
+    },
+  });
+};
+
+const admitNds = (
+  headerBytes: Buffer,
+  fileBytes: number,
+  explicitEntry?: { canonical: string; source: string },
+): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
+  const hasNdsHeader =
+    headerBytes.length >= 0x160 &&
+    fileBytes >= 0x200 &&
+    headerBytes.subarray(0xc0, 0xd0).equals(GBA_LOGO_PREFIX);
+
+  if (!hasNdsHeader && explicitEntry === undefined && fileBytes < 0x200) {
+    return err({
+      reason:
+        "nds ROM requires at least a 512-byte NDS cartridge header unless entry_point is specified",
+      constraint: "file_format_rejected",
+    });
+  }
+
+  const title =
+    headerBytes.length >= 0x0c
+      ? headerBytes.subarray(0x00, 0x0c).toString("ascii").replace(/\0+$/u, "")
+      : "";
+  const gameCode =
+    headerBytes.length >= 0x10
+      ? headerBytes.subarray(0x0c, 0x10).toString("ascii").replace(/\0+$/u, "")
+      : "";
+
+  const arm9RomOffset =
+    headerBytes.length >= 0x24 ? headerBytes.readUInt32LE(0x20) : 0;
+  const arm9Entry =
+    headerBytes.length >= 0x28 ? headerBytes.readUInt32LE(0x24) : 0x02000000;
+  const arm9Ram =
+    headerBytes.length >= 0x2c ? headerBytes.readUInt32LE(0x28) : 0x02000000;
+  const arm9Size =
+    headerBytes.length >= 0x30 ? headerBytes.readUInt32LE(0x2c) : fileBytes;
+
+  const arm7RomOffset =
+    headerBytes.length >= 0x34 ? headerBytes.readUInt32LE(0x30) : 0;
+  const arm7Entry =
+    headerBytes.length >= 0x38 ? headerBytes.readUInt32LE(0x34) : 0;
+  const arm7Ram =
+    headerBytes.length >= 0x3c ? headerBytes.readUInt32LE(0x38) : 0;
+  const arm7Size =
+    headerBytes.length >= 0x40 ? headerBytes.readUInt32LE(0x3c) : 0;
+
+  const mappings: ConsoleFileMapping[] = [];
+  if (
+    arm9Size > 0 &&
+    arm9RomOffset + arm9Size <= fileBytes &&
+    arm9Ram >= 0x01ff8000 &&
+    arm9Ram < 0x02800000
+  ) {
+    mappings.push({
+      name: "NDS_ARM9",
+      virtualAddress: hex32(arm9Ram),
+      fileOffset: arm9RomOffset,
+      byteLength: arm9Size,
+      executable: true,
+      writable: true,
+    });
+  } else {
+    const fallbackRam = explicitEntry?.canonical ?? "0x2000000";
+    mappings.push({
+      name: "NDS_ARM9_RAW",
+      virtualAddress: fallbackRam,
+      fileOffset: 0,
+      byteLength: Math.min(fileBytes, 0x400000),
+      executable: true,
+      writable: true,
+    });
+  }
+
+  if (
+    arm7Size > 0 &&
+    arm7RomOffset > 0 &&
+    arm7RomOffset + arm7Size <= fileBytes &&
+    arm7Ram >= 0x02000000 &&
+    arm7Ram < 0x04000000
+  ) {
+    const arm9Start = BigInt(mappings[0]!.virtualAddress);
+    const arm9End = arm9Start + BigInt(mappings[0]!.byteLength);
+    const arm7Start = BigInt(arm7Ram);
+    const arm7End = arm7Start + BigInt(arm7Size);
+    if (arm7End <= arm9Start || arm7Start >= arm9End) {
+      mappings.push({
+        name: "NDS_ARM7",
+        virtualAddress: hex32(arm7Ram),
+        fileOffset: arm7RomOffset,
+        byteLength: arm7Size,
+        executable: true,
+        writable: true,
+      });
+    }
+  }
+
+  const loadBase = mappings[0]!.virtualAddress;
+  const entryPoint =
+    explicitEntry?.canonical ??
+    (arm9Entry >= 0x01ff8000 && arm9Entry < 0x02800000
+      ? hex32(arm9Entry)
+      : loadBase);
+
+  return ok({
+    format: "nds",
+    architecture: "arm",
+    ghidraLanguageId: "ARM:LE:32:v5t",
+    compilerSpecId: "default",
+    loader: "BinaryLoader",
+    loadBase,
+    entryPoint,
+    entryPointSource: explicitEntry?.source ?? entryPoint,
+    fileMappings: mappings,
+    memoryRegions: [
+      {
+        name: "MAIN_RAM",
+        virtualAddress: "0x2000000",
+        byteLength: 0x400000,
+        kind: "ram",
+      },
+      {
+        name: "SHARED_WRAM",
+        virtualAddress: "0x3000000",
+        byteLength: 0x8000,
+        kind: "ram",
+      },
+      {
+        name: "ARM7_WRAM",
+        virtualAddress: "0x37f8000",
+        byteLength: 0x10000,
+        kind: "ram",
+      },
+      {
+        name: "NDS_IO",
+        virtualAddress: "0x4000000",
+        byteLength: 0x2000,
+        kind: "mmio",
+      },
+      {
+        name: "NDS_PALETTE",
+        virtualAddress: "0x5000000",
+        byteLength: 0x800,
+        kind: "vram",
+      },
+      {
+        name: "NDS_VRAM",
+        virtualAddress: "0x6000000",
+        byteLength: 0x100000,
+        kind: "vram",
+      },
+      {
+        name: "NDS_OAM",
+        virtualAddress: "0x7000000",
+        byteLength: 0x800,
+        kind: "vram",
+      },
+    ],
+    romMetadata: {
+      title: title || null,
+      game_code: gameCode || null,
+      arm9_rom_offset: arm9RomOffset,
+      arm9_entry: hex32(arm9Entry),
+      arm9_ram_address: hex32(arm9Ram),
+      arm9_size: arm9Size,
+      arm7_rom_offset: arm7RomOffset,
+      arm7_entry: arm7Entry !== 0 ? hex32(arm7Entry) : null,
+      arm7_ram_address: arm7Ram !== 0 ? hex32(arm7Ram) : null,
+      arm7_size: arm7Size,
+    },
+  });
+};
+
+const admitMd = (
+  headerBytes: Buffer,
+  fileBytes: number,
+  explicitEntry?: { canonical: string; source: string },
+): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
+  if (fileBytes < 0x200 && explicitEntry === undefined) {
+    return err({
+      reason:
+        "md ROM requires at least a 512-byte 68000 vector + Sega header unless entry_point is specified",
+      constraint: "file_format_rejected",
+    });
+  }
+  const initialSsp =
+    headerBytes.length >= 4 ? headerBytes.readUInt32BE(0x00) : 0x00fffe00;
+  const resetVector =
+    headerBytes.length >= 8 ? headerBytes.readUInt32BE(0x04) : 0x00000200;
+  const domesticTitle =
+    headerBytes.length >= 0x150
+      ? headerBytes
+          .subarray(0x120, 0x150)
+          .toString("ascii")
+          .replace(/\0+$/u, "")
+          .trim()
+      : "";
+  const overseasTitle =
+    headerBytes.length >= 0x180
+      ? headerBytes
+          .subarray(0x150, 0x180)
+          .toString("ascii")
+          .replace(/\0+$/u, "")
+          .trim()
+      : "";
+  const serial =
+    headerBytes.length >= 0x18e
+      ? headerBytes
+          .subarray(0x180, 0x18e)
+          .toString("ascii")
+          .replace(/\0+$/u, "")
+          .trim()
+      : "";
+
+  const resolvedReset =
+    resetVector > 0 && resetVector < Math.min(fileBytes, 0x400000)
+      ? hex32(resetVector)
+      : "0x200";
+  const entryPoint = explicitEntry?.canonical ?? resolvedReset;
+
+  return ok({
+    format: "md",
+    architecture: "68000",
+    ghidraLanguageId: "68000:BE:32:default",
+    compilerSpecId: "default",
+    loader: "BinaryLoader",
+    loadBase: "0x0",
+    entryPoint,
+    entryPointSource: explicitEntry?.source ?? entryPoint,
+    fileMappings: [
+      {
+        name: "MD_ROM",
+        virtualAddress: "0x0",
+        fileOffset: 0,
+        byteLength: Math.min(fileBytes, 0x400000),
+        executable: true,
+        writable: false,
+      },
+    ],
+    memoryRegions: [
+      {
+        name: "Z80_RAM",
+        virtualAddress: "0xa00000",
+        byteLength: 0x2000,
+        kind: "ram",
+      },
+      {
+        name: "MD_IO",
+        virtualAddress: "0xa10000",
+        byteLength: 0x1000,
+        kind: "mmio",
+      },
+      {
+        name: "VDP_PORT",
+        virtualAddress: "0xc00000",
+        byteLength: 0x20,
+        kind: "mmio",
+      },
+      {
+        name: "WORK_RAM",
+        virtualAddress: "0xff0000",
+        byteLength: 0x10000,
+        kind: "ram",
+      },
+    ],
+    romMetadata: {
+      domestic_title: domesticTitle || null,
+      overseas_title: overseasTitle || null,
+      serial: serial || null,
+      initial_ssp: hex32(initialSsp),
+      reset_vector: hex32(resetVector),
+    },
+  });
+};
+
+const admitPce = (
+  headerBytes: Buffer,
+  fileBytes: number,
+  explicitEntry?: { canonical: string; source: string },
+): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
+  const copierOffset =
+    fileBytes >= 0x2200 && fileBytes % 0x2000 === 512 ? 512 : 0;
+  const romBytes = fileBytes - copierOffset;
+  if (romBytes < 0x2000) {
+    return err({
+      reason: "pce ROM requires at least one 8 KiB bank (0x2000 bytes)",
+      constraint: "file_format_rejected",
+    });
+  }
+  let resetVector = 0xe000;
+  if (headerBytes.length >= copierOffset + 0x2000) {
+    const candidate = headerBytes.readUInt16LE(copierOffset + 0x1ffe);
+    if (candidate >= 0xe000 && candidate <= 0xffff) {
+      resetVector = candidate;
+    }
+  }
+  const entryPoint = explicitEntry?.canonical ?? hex32(resetVector);
+  const bank0Size = Math.min(romBytes, 0x2000);
+  const lowWindowSize =
+    romBytes > 0x2000 ? Math.min(romBytes - 0x2000, 0xa000) : 0;
+
+  return ok({
+    format: "pce",
+    architecture: "6502",
+    ghidraLanguageId: "6502:LE:16:default",
+    compilerSpecId: "default",
+    loader: "BinaryLoader",
+    loadBase: "0xe000",
+    entryPoint,
+    entryPointSource: explicitEntry?.source ?? entryPoint,
+    fileMappings: [
+      {
+        name: "PCE_ROM_BANK0",
+        virtualAddress: "0xe000",
+        fileOffset: copierOffset,
+        byteLength: bank0Size,
+        executable: true,
+        writable: false,
+      },
+      ...(lowWindowSize > 0
+        ? [
+            {
+              name: "PCE_ROM_WINDOW",
+              virtualAddress: "0x4000",
+              fileOffset: copierOffset + 0x2000,
+              byteLength: lowWindowSize,
+              executable: true,
+              writable: false,
+            },
+          ]
+        : []),
+    ],
+    memoryRegions: [
+      {
+        name: "PCE_IO",
+        virtualAddress: "0x0",
+        byteLength: 0x2000,
+        kind: "mmio",
+      },
+      {
+        name: "PCE_RAM",
+        virtualAddress: "0x2000",
+        byteLength: 0x2000,
+        kind: "ram",
+      },
+    ],
+    romMetadata: {
+      copier_header_bytes: copierOffset,
+      reset_vector: hex32(resetVector),
+      bank_count: Math.ceil(romBytes / 0x2000),
+    },
+  });
+};
+
 const admitGcDol = (
   headerBytes: Buffer,
   fileBytes: number,
@@ -1359,6 +1910,46 @@ const admitSnes = (
   const resetVector = isHiRom ? hi.reset : lo.reset;
   const entryPoint = explicitEntry?.canonical ?? hex32(resetVector);
   const firstBankSize = Math.min(romBytes, 0x8000);
+  const mappings: ConsoleFileMapping[] = [];
+  if (isHiRom) {
+    mappings.push({
+      name: "BANK00_ROM",
+      virtualAddress: "0x8000",
+      fileOffset: smcOffset + (romBytes >= 0x10000 ? 0x8000 : 0),
+      byteLength: firstBankSize,
+      executable: true,
+      writable: false,
+    });
+    const bankCount = Math.min(64, Math.ceil(romBytes / 0x10000));
+    for (let i = 0; i < bankCount; i++) {
+      const bankOffset = i * 0x10000;
+      const bankSize = Math.min(romBytes - bankOffset, 0x10000);
+      if (bankSize <= 0) break;
+      mappings.push({
+        name: `HIROM_BANK${i.toString(16).toUpperCase().padStart(2, "0")}`,
+        virtualAddress: hex32(0xc00000 + bankOffset),
+        fileOffset: smcOffset + bankOffset,
+        byteLength: bankSize,
+        executable: true,
+        writable: false,
+      });
+    }
+  } else {
+    const bankCount = Math.min(125, Math.ceil(romBytes / 0x8000));
+    for (let i = 0; i < bankCount; i++) {
+      const bankOffset = i * 0x8000;
+      const bankSize = Math.min(romBytes - bankOffset, 0x8000);
+      if (bankSize <= 0) break;
+      mappings.push({
+        name: `BANK${i.toString(16).toUpperCase().padStart(2, "0")}_ROM`,
+        virtualAddress: hex32(i * 0x10000 + 0x8000),
+        fileOffset: smcOffset + bankOffset,
+        byteLength: bankSize,
+        executable: true,
+        writable: false,
+      });
+    }
+  }
   return ok({
     format: "snes",
     architecture: "65816",
@@ -1368,16 +1959,7 @@ const admitSnes = (
     loadBase: "0x8000",
     entryPoint,
     entryPointSource: explicitEntry?.source ?? entryPoint,
-    fileMappings: [
-      {
-        name: "BANK00_ROM",
-        virtualAddress: "0x8000",
-        fileOffset: smcOffset + (isHiRom && romBytes >= 0x10000 ? 0x8000 : 0),
-        byteLength: firstBankSize,
-        executable: true,
-        writable: false,
-      },
-    ],
+    fileMappings: mappings,
     memoryRegions: [
       {
         name: "LOW_WRAM",
@@ -1397,11 +1979,20 @@ const admitSnes = (
         byteLength: 0x200,
         kind: "mmio",
       },
+      {
+        name: "WRAM_7E",
+        virtualAddress: "0x7e0000",
+        byteLength: 0x20000,
+        kind: "ram",
+      },
     ],
     romMetadata: {
       mapping_mode: isHiRom ? "HiROM" : "LoROM",
       copier_header_bytes: smcOffset,
       reset_vector: hex32(resetVector),
+      bank_count: isHiRom
+        ? Math.min(64, Math.ceil(romBytes / 0x10000))
+        : Math.min(125, Math.ceil(romBytes / 0x8000)),
     },
   });
 };
@@ -1441,11 +2032,7 @@ const admitNes = (
   if (lastPrgEnd >= 6 && lastPrgEnd <= headerBytes.length) {
     const candidate = headerBytes.readUInt16LE(lastPrgEnd - 4);
     if (candidate >= 0x8000) resetVector = candidate;
-  } else if (
-    trailerBytes !== undefined &&
-    trailerBytes.length >= 6 &&
-    lastPrgEnd === fileBytes
-  ) {
+  } else if (trailerBytes !== undefined && trailerBytes.length >= 6) {
     const candidate = trailerBytes.readUInt16LE(trailerBytes.length - 4);
     if (candidate >= 0x8000) resetVector = candidate;
   }
@@ -1679,6 +2266,176 @@ const admitWsc = (
       fixed_bank_offset: fixedBankOffset,
     },
   });
+};
+
+/**
+ * Resolve a console virtual address to a file offset using the admitted fileMappings
+ * plus bank-window and FastROM mirror rules for SNES/GB/NES/WSC.
+ */
+export const resolveConsoleFileOffset = (
+  admission: ConsoleTargetAdmission,
+  virtualAddress: bigint | number,
+  options?: {
+    readonly tableFileOffset?: number | undefined;
+    readonly fileBytes?: number | undefined;
+  },
+): number | null => {
+  const vaddr = BigInt(virtualAddress);
+  if (vaddr < 0n) return null;
+  const tableFileOffset = options?.tableFileOffset;
+  const maxFileBytes = options?.fileBytes;
+
+  // 1. Bank-local 16-bit pointer resolution when a tableFileOffset is in a known bank
+  if (tableFileOffset !== undefined && tableFileOffset >= 0) {
+    if (
+      admission.format === "gb" &&
+      vaddr >= 0x4000n &&
+      vaddr < 0x8000n &&
+      tableFileOffset >= 0x4000
+    ) {
+      const bankBase = Math.floor(tableFileOffset / 0x4000) * 0x4000;
+      const resolved = bankBase + Number(vaddr - 0x4000n);
+      if (maxFileBytes === undefined || resolved < maxFileBytes) {
+        return resolved;
+      }
+    }
+    if (admission.format === "snes" && vaddr >= 0x8000n && vaddr <= 0xffffn) {
+      const smcOffset = Number(admission.romMetadata.copier_header_bytes ?? 0);
+      if (tableFileOffset >= smcOffset) {
+        const isHiRom = admission.romMetadata.mapping_mode === "HiROM";
+        const bankSize = isHiRom ? 0x10000 : 0x8000;
+        const bankIndex = Math.floor((tableFileOffset - smcOffset) / bankSize);
+        const offsetWithinBank = isHiRom
+          ? Number(vaddr)
+          : Number(vaddr - 0x8000n);
+        const resolved = smcOffset + bankIndex * bankSize + offsetWithinBank;
+        if (maxFileBytes === undefined || resolved < maxFileBytes) {
+          return resolved;
+        }
+      }
+    }
+    if (admission.format === "nes" && vaddr >= 0x8000n && vaddr < 0xc000n) {
+      const prgOffset = admission.fileMappings[0]?.fileOffset ?? 16;
+      const prgSize = Number(admission.romMetadata.prg_rom_bytes ?? 0);
+      if (prgSize > 0x4000 && tableFileOffset >= prgOffset) {
+        const bankIndex = Math.floor((tableFileOffset - prgOffset) / 0x4000);
+        const resolved =
+          prgOffset + bankIndex * 0x4000 + Number(vaddr - 0x8000n);
+        if (
+          resolved < prgOffset + prgSize &&
+          (maxFileBytes === undefined || resolved < maxFileBytes)
+        ) {
+          return resolved;
+        }
+      }
+    }
+    if (admission.format === "pce" && vaddr >= 0x4000n && vaddr < 0xe000n) {
+      const copierOffset = Number(
+        admission.romMetadata.copier_header_bytes ?? 0,
+      );
+      if (tableFileOffset >= copierOffset) {
+        const bankIndex = Math.floor((tableFileOffset - copierOffset) / 0x2000);
+        const resolved =
+          copierOffset +
+          bankIndex * 0x2000 +
+          Number((vaddr - 0x4000n) & 0x1fffn);
+        if (maxFileBytes === undefined || resolved < maxFileBytes) {
+          return resolved;
+        }
+      }
+    }
+  }
+
+  // 2. Direct lookup across admitted fileMappings
+  const findInMappings = (candidate: bigint): number | null => {
+    for (const map of admission.fileMappings) {
+      const start = BigInt(map.virtualAddress);
+      const len = BigInt(map.byteLength);
+      if (candidate >= start && candidate < start + len) {
+        return map.fileOffset + Number(candidate - start);
+      }
+    }
+    return null;
+  };
+
+  const direct = findInMappings(vaddr);
+  if (direct !== null) return direct;
+
+  // 3. SNES FastROM ($80..$FF) mirror resolution
+  if (admission.format === "snes" && vaddr >= 0x800000n && vaddr <= 0xffffffn) {
+    const isHiRom = admission.romMetadata.mapping_mode === "HiROM";
+    if (!isHiRom && (vaddr & 0xffffn) >= 0x8000n) {
+      const mirrored = findInMappings(vaddr & 0x7fffffn);
+      if (mirrored !== null) return mirrored;
+    } else if (isHiRom && vaddr < 0xc00000n && (vaddr & 0xffffn) >= 0x8000n) {
+      const mirrored = findInMappings(vaddr - 0x800000n + 0xc00000n);
+      if (mirrored !== null) return mirrored;
+    }
+  }
+
+  return null;
+};
+
+/**
+ * Resolve a file offset in a console ROM/executable to its canonical virtual address.
+ */
+export const resolveConsoleVirtualAddress = (
+  admission: ConsoleTargetAdmission,
+  fileOffset: number,
+): string | null => {
+  if (!Number.isSafeInteger(fileOffset) || fileOffset < 0) return null;
+
+  // For SNES HiROM, prefer the full 24-bit HIROM_BANKxx mapping over the 16-bit BANK00_ROM mirror
+  if (
+    admission.format === "snes" &&
+    admission.romMetadata.mapping_mode === "HiROM"
+  ) {
+    for (const map of admission.fileMappings) {
+      if (map.name === "BANK00_ROM") continue;
+      if (
+        fileOffset >= map.fileOffset &&
+        fileOffset < map.fileOffset + map.byteLength
+      ) {
+        return hex32(
+          BigInt(map.virtualAddress) + BigInt(fileOffset - map.fileOffset),
+        );
+      }
+    }
+  }
+
+  for (const map of admission.fileMappings) {
+    if (
+      fileOffset >= map.fileOffset &&
+      fileOffset < map.fileOffset + map.byteLength
+    ) {
+      return hex32(
+        BigInt(map.virtualAddress) + BigInt(fileOffset - map.fileOffset),
+      );
+    }
+  }
+
+  // Bank-window fallback for 16-bit banked ROMs whose upper banks share a switchable window
+  if (admission.format === "gb" && fileOffset >= 0x4000) {
+    return hex32(0x4000 + (fileOffset % 0x4000));
+  }
+  if (admission.format === "nes") {
+    const prgOffset = admission.fileMappings[0]?.fileOffset ?? 16;
+    const prgSize = Number(admission.romMetadata.prg_rom_bytes ?? 0);
+    if (fileOffset >= prgOffset && fileOffset < prgOffset + prgSize) {
+      return hex32(0x8000 + ((fileOffset - prgOffset) % 0x4000));
+    }
+  }
+  if (admission.format === "pce") {
+    const copierOffset = Number(admission.romMetadata.copier_header_bytes ?? 0);
+    if (fileOffset >= copierOffset) {
+      return hex32(0x4000 + ((fileOffset - copierOffset) % 0x2000));
+    }
+  }
+  if (admission.format === "wsc") {
+    return hex32(0x20000 + (fileOffset % 0x10000));
+  }
+
+  return null;
 };
 
 /** Serialize console target mappings and regions into the TSV spec consumed by ReaGhidraPrepareConsole.java. */

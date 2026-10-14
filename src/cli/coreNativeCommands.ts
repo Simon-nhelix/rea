@@ -254,6 +254,8 @@ export const registerCoreNativeCommands = (
   registerRomHackingCommands(cli, logger, runDirectAnalysis);
 };
 
+import { ROM_TEXT_ENCODINGS } from "../domain/romHacking.js";
+
 const registerRomHackingCommands = (
   cli: CliInstance,
   logger: Logger,
@@ -272,16 +274,7 @@ const registerRomHackingCommands = (
         .optional()
         .describe("Text query to encode and search across ROM memory"),
       encoding: z
-        .enum([
-          "sjis",
-          "cp932",
-          "euc-jp",
-          "utf-8",
-          "utf-16le",
-          "utf-16be",
-          "ascii",
-          "tbl",
-        ])
+        .enum(ROM_TEXT_ENCODINGS)
         .default("sjis")
         .describe("Character encoding for query and decoded results"),
       tablePath: z
@@ -289,23 +282,39 @@ const registerRomHackingCommands = (
         .min(1)
         .optional()
         .describe("Path to custom .tbl character mapping file"),
+      tblPath: z.string().min(1).optional().describe("Alias for --table-path"),
       tableText: z
         .string()
         .min(1)
         .optional()
         .describe("Inline .tbl character mapping rules"),
+      tblText: z.string().min(1).optional().describe("Alias for --table-text"),
       startAddress: z
         .string()
         .min(1)
         .optional()
         .describe("Start address (hex) for range scan or bounded query search"),
+      startOffset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Starting ROM file offset in bytes"),
+      endOffset: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("Ending ROM file offset in bytes (exclusive)"),
       length: z
         .number()
         .int()
         .min(1)
-        .max(65_536)
+        .max(16_777_216)
         .default(4096)
-        .describe("Bytes to scan when startAddress is used without query"),
+        .describe(
+          "Bytes to scan when startAddress/startOffset is used without query",
+        ),
       minLength: z
         .number()
         .int()
@@ -313,6 +322,13 @@ const registerRomHackingCommands = (
         .max(256)
         .default(2)
         .describe("Minimum decoded character count for range scan"),
+      terminatorByte: z
+        .number()
+        .int()
+        .min(0)
+        .max(255)
+        .optional()
+        .describe("String terminator byte (0..255, default 0)"),
       maxResults: z
         .number()
         .int()
@@ -324,33 +340,50 @@ const registerRomHackingCommands = (
         .boolean()
         .default(true)
         .describe("Resolve incoming cross-references and file offsets"),
+      includeXrefs: z
+        .boolean()
+        .optional()
+        .describe("Alias for --resolve-xrefs"),
       ...nativeOpenOptionFields,
     }),
-    run: ({ args, options }) =>
-      logCliCommand(logger, CLI_COMMANDS.searchRomStrings, () =>
+    run: ({ args, options }) => {
+      const resolvedTablePath = options.tablePath ?? options.tblPath;
+      const resolvedTableText = options.tableText ?? options.tblText;
+      const resolvedXrefs = options.includeXrefs ?? options.resolveXrefs;
+      return logCliCommand(logger, CLI_COMMANDS.searchRomStrings, () =>
         runDirectAnalysis(
           args.path,
           "search_rom_strings",
           {
             ...(options.query === undefined ? {} : { query: options.query }),
             encoding: options.encoding,
-            ...(options.tablePath === undefined
+            ...(resolvedTablePath === undefined
               ? {}
-              : { table_path: options.tablePath }),
-            ...(options.tableText === undefined
+              : { table_path: resolvedTablePath }),
+            ...(resolvedTableText === undefined
               ? {}
-              : { table_text: options.tableText }),
+              : { table_text: resolvedTableText }),
             ...(options.startAddress === undefined
               ? {}
               : { start_address: options.startAddress }),
+            ...(options.startOffset === undefined
+              ? {}
+              : { start_offset: options.startOffset }),
+            ...(options.endOffset === undefined
+              ? {}
+              : { end_offset: options.endOffset }),
             length: options.length,
             min_length: options.minLength,
+            ...(options.terminatorByte === undefined
+              ? {}
+              : { terminator_byte: options.terminatorByte }),
             max_results: options.maxResults,
-            resolve_xrefs: options.resolveXrefs,
+            resolve_xrefs: resolvedXrefs,
           },
           directAnalysisOptionsFromCli(logger, options),
         ),
-      ),
+      );
+    },
   });
 
   cli.command(CLI_COMMANDS.scanPointerTable, {
@@ -358,9 +391,20 @@ const registerRomHackingCommands = (
       "Scan a 16/24/32-bit pointer table in console ROM or executable memory with string previews and xrefs",
     args: z.object({
       path: z.string().describe("Console ROM or executable path"),
-      address: z.string().describe("Pointer table start address (hex)"),
+      address: z
+        .string()
+        .optional()
+        .describe(
+          "Pointer table start address (hex); optional if --table-offset is set",
+        ),
     }),
     options: z.object({
+      tableOffset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Pointer table starting ROM file offset in bytes"),
       count: z
         .number()
         .int()
@@ -369,7 +413,10 @@ const registerRomHackingCommands = (
         .default(32)
         .describe("Number of pointer table entries to read"),
       pointerSize: z
-        .union([z.literal(2), z.literal(3), z.literal(4)])
+        .number()
+        .int()
+        .min(2)
+        .max(4)
         .default(4)
         .describe("Pointer width in bytes (2, 3, or 4)"),
       endian: z
@@ -388,16 +435,7 @@ const registerRomHackingCommands = (
         .optional()
         .describe("Bytes per table entry (defaults to pointerSize)"),
       encoding: z
-        .enum([
-          "sjis",
-          "cp932",
-          "euc-jp",
-          "utf-8",
-          "utf-16le",
-          "utf-16be",
-          "ascii",
-          "tbl",
-        ])
+        .enum(ROM_TEXT_ENCODINGS)
         .default("sjis")
         .describe("Text encoding used to decode target string previews"),
       tablePath: z
@@ -405,11 +443,20 @@ const registerRomHackingCommands = (
         .min(1)
         .optional()
         .describe("Path to custom .tbl character mapping file"),
+      tblPath: z.string().min(1).optional().describe("Alias for --table-path"),
       tableText: z
         .string()
         .min(1)
         .optional()
         .describe("Inline .tbl character mapping rules"),
+      tblText: z.string().min(1).optional().describe("Alias for --table-text"),
+      terminatorByte: z
+        .number()
+        .int()
+        .min(0)
+        .max(255)
+        .optional()
+        .describe("String terminator byte (0..255, default 0)"),
       previewBytes: z
         .number()
         .int()
@@ -421,33 +468,320 @@ const registerRomHackingCommands = (
         .boolean()
         .default(true)
         .describe("Resolve incoming cross-references and file offsets"),
+      includeXrefs: z
+        .boolean()
+        .optional()
+        .describe("Alias for --resolve-xrefs"),
+      includeManuscript: z
+        .boolean()
+        .default(false)
+        .describe("Emit locbatch.py-compatible manuscript records"),
       ...nativeOpenOptionFields,
     }),
-    run: ({ args, options }) =>
-      logCliCommand(logger, CLI_COMMANDS.scanPointerTable, () =>
+    run: ({ args, options }) => {
+      const resolvedTablePath = options.tablePath ?? options.tblPath;
+      const resolvedTableText = options.tableText ?? options.tblText;
+      const resolvedXrefs = options.includeXrefs ?? options.resolveXrefs;
+      return logCliCommand(logger, CLI_COMMANDS.scanPointerTable, () =>
         runDirectAnalysis(
           args.path,
           "scan_pointer_table",
           {
-            address: args.address,
+            ...(args.address === undefined ? {} : { address: args.address }),
+            ...(options.tableOffset === undefined
+              ? {}
+              : { table_offset: options.tableOffset }),
             count: options.count,
-            pointer_size: options.pointerSize,
+            pointer_size: options.pointerSize as 2 | 3 | 4,
             endian: options.endian,
             base_address: options.baseAddress,
             ...(options.stride === undefined ? {} : { stride: options.stride }),
             encoding: options.encoding,
-            ...(options.tablePath === undefined
+            ...(resolvedTablePath === undefined
               ? {}
-              : { table_path: options.tablePath }),
-            ...(options.tableText === undefined
+              : { table_path: resolvedTablePath }),
+            ...(resolvedTableText === undefined
               ? {}
-              : { table_text: options.tableText }),
+              : { table_text: resolvedTableText }),
+            ...(options.terminatorByte === undefined
+              ? {}
+              : { terminator_byte: options.terminatorByte }),
             preview_bytes: options.previewBytes,
-            resolve_xrefs: options.resolveXrefs,
+            resolve_xrefs: resolvedXrefs,
+            include_manuscript: options.includeManuscript,
           },
           directAnalysisOptionsFromCli(logger, options),
         ),
-      ),
+      );
+    },
+  });
+
+  cli.command(CLI_COMMANDS.discoverPointerTables, {
+    description:
+      "Automatically discover candidate string pointer tables in console ROM or executable memory",
+    args: z.object({
+      path: z.string().describe("Console ROM or executable path"),
+    }),
+    options: z.object({
+      startAddress: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Starting virtual address (hex) to scan"),
+      startOffset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Starting ROM file offset in bytes"),
+      endOffset: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("Ending ROM file offset in bytes (exclusive)"),
+      length: z
+        .number()
+        .int()
+        .min(16)
+        .max(16_777_216)
+        .default(262_144)
+        .describe("Maximum byte length to scan when endOffset is omitted"),
+      pointerSize: z
+        .number()
+        .int()
+        .min(2)
+        .max(4)
+        .default(4)
+        .describe("Pointer width in bytes (2, 3, or 4)"),
+      endian: z
+        .enum(["little", "big"])
+        .default("little")
+        .describe("Pointer byte order"),
+      baseAddress: z
+        .string()
+        .default("0x0")
+        .describe("Base address added to each raw pointer value"),
+      stride: z
+        .number()
+        .int()
+        .min(1)
+        .max(64)
+        .optional()
+        .describe("Bytes per table entry (defaults to pointerSize)"),
+      minEntries: z
+        .number()
+        .int()
+        .min(2)
+        .max(256)
+        .default(4)
+        .describe("Minimum consecutive valid string pointers per table"),
+      encoding: z
+        .enum(ROM_TEXT_ENCODINGS)
+        .default("sjis")
+        .describe("Text encoding used to validate target strings"),
+      tablePath: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Path to custom .tbl character mapping file"),
+      tblPath: z.string().min(1).optional().describe("Alias for --table-path"),
+      tableText: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Inline .tbl character mapping rules"),
+      tblText: z.string().min(1).optional().describe("Alias for --table-text"),
+      terminatorByte: z
+        .number()
+        .int()
+        .min(0)
+        .max(255)
+        .optional()
+        .describe("String terminator byte (0..255, default 0)"),
+      minStringLength: z
+        .number()
+        .int()
+        .min(1)
+        .max(64)
+        .default(2)
+        .describe("Minimum decoded characters at pointer target"),
+      maxTables: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .default(20)
+        .describe("Maximum number of candidate tables to return"),
+      sampleEntries: z
+        .number()
+        .int()
+        .min(1)
+        .max(16)
+        .default(3)
+        .describe("Number of sample entries per discovered table"),
+      resolveXrefs: z
+        .boolean()
+        .default(false)
+        .describe("Resolve incoming cross-references to table start addresses"),
+      includeXrefs: z
+        .boolean()
+        .optional()
+        .describe("Alias for --resolve-xrefs"),
+      ...nativeOpenOptionFields,
+    }),
+    run: ({ args, options }) => {
+      const resolvedTablePath = options.tablePath ?? options.tblPath;
+      const resolvedTableText = options.tableText ?? options.tblText;
+      const resolvedXrefs = options.includeXrefs ?? options.resolveXrefs;
+      return logCliCommand(logger, CLI_COMMANDS.discoverPointerTables, () =>
+        runDirectAnalysis(
+          args.path,
+          "discover_pointer_tables",
+          {
+            ...(options.startAddress === undefined
+              ? {}
+              : { start_address: options.startAddress }),
+            ...(options.startOffset === undefined
+              ? {}
+              : { start_offset: options.startOffset }),
+            ...(options.endOffset === undefined
+              ? {}
+              : { end_offset: options.endOffset }),
+            length: options.length,
+            pointer_size: options.pointerSize as 2 | 3 | 4,
+            endian: options.endian,
+            base_address: options.baseAddress,
+            ...(options.stride === undefined ? {} : { stride: options.stride }),
+            min_entries: options.minEntries,
+            encoding: options.encoding,
+            ...(resolvedTablePath === undefined
+              ? {}
+              : { table_path: resolvedTablePath }),
+            ...(resolvedTableText === undefined
+              ? {}
+              : { table_text: resolvedTableText }),
+            ...(options.terminatorByte === undefined
+              ? {}
+              : { terminator_byte: options.terminatorByte }),
+            min_string_length: options.minStringLength,
+            max_tables: options.maxTables,
+            sample_entries: options.sampleEntries,
+            resolve_xrefs: resolvedXrefs,
+          },
+          directAnalysisOptionsFromCli(logger, options),
+        ),
+      );
+    },
+  });
+
+  cli.command(CLI_COMMANDS.findCodeCaves, {
+    description:
+      "Find contiguous padding caves (0x00/0xFF) in console ROM or executable segments for font hooks and relocated text",
+    args: z.object({
+      path: z.string().describe("Console ROM or executable path"),
+    }),
+    options: z.object({
+      minSize: z
+        .number()
+        .int()
+        .min(16)
+        .max(1_048_576)
+        .default(64)
+        .describe("Minimum cave byte length (default 64)"),
+      fillByte: z
+        .number()
+        .int()
+        .min(0)
+        .max(255)
+        .optional()
+        .describe(
+          "Specific padding byte (e.g. 0 or 255); omit to scan both 0x00 and 0xFF",
+        ),
+      alignment: z
+        .number()
+        .int()
+        .min(1)
+        .max(32)
+        .default(4)
+        .describe(
+          "Cave start alignment boundary (1, 2, 4, 8, 16, or 32; default 4)",
+        ),
+      startAddress: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Starting virtual address (hex)"),
+      startOffset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Starting ROM file offset in bytes"),
+      endOffset: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("Ending ROM file offset in bytes (exclusive)"),
+      length: z
+        .number()
+        .int()
+        .min(16)
+        .max(16_777_216)
+        .default(262_144)
+        .describe("Bytes to scan when reading via provider"),
+      executableOnly: z
+        .boolean()
+        .default(false)
+        .describe("Restrict scan to executable mapped segments"),
+      maxResults: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .default(32)
+        .describe("Maximum number of candidate caves to return"),
+      resolveXrefs: z
+        .boolean()
+        .default(false)
+        .describe("Check incoming cross-references to cave start addresses"),
+      includeXrefs: z
+        .boolean()
+        .optional()
+        .describe("Alias for --resolve-xrefs"),
+      ...nativeOpenOptionFields,
+    }),
+    run: ({ args, options }) => {
+      const resolvedXrefs = options.includeXrefs ?? options.resolveXrefs;
+      return logCliCommand(logger, CLI_COMMANDS.findCodeCaves, () =>
+        runDirectAnalysis(
+          args.path,
+          "find_code_caves",
+          {
+            min_size: options.minSize,
+            ...(options.fillByte === undefined
+              ? {}
+              : { fill_byte: options.fillByte }),
+            alignment: options.alignment as 1 | 2 | 4 | 8 | 16 | 32,
+            ...(options.startAddress === undefined
+              ? {}
+              : { start_address: options.startAddress }),
+            ...(options.startOffset === undefined
+              ? {}
+              : { start_offset: options.startOffset }),
+            ...(options.endOffset === undefined
+              ? {}
+              : { end_offset: options.endOffset }),
+            length: options.length,
+            executable_only: options.executableOnly,
+            max_results: options.maxResults,
+            resolve_xrefs: resolvedXrefs,
+          },
+          directAnalysisOptionsFromCli(logger, options),
+        ),
+      );
+    },
   });
 };
 

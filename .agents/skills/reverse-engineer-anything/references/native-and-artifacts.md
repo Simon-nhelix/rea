@@ -267,3 +267,34 @@ with two complete inspection Evidence records (or current-session retained
 references) and explicit scope. Preserve unknown types/duplicate names; static
 interface equality is not runtime compatibility. CLI accepts complete inline
 Evidence in `rea compare-wasm-interfaces input.json --json`.
+
+## Console ROMs and game localization
+
+REA auto-detects 15 console ROM and executable formats (`psx-exe`, `ps2-elf`,
+`psp`, `ps3`, `xbox`, `gc-dol`, `gba`, `nds`, `saturn`, `md`, `snes`, `pce`,
+`nes`, `gb`, `wsc`) and configures architecture/bank memory maps (plus GBA
+hardware IO register symbols `REG_*`) when opening in headless Ghidra.
+
+Four specialized workflows support console ROM string extraction, pointer table
+analysis, and code cave discovery:
+
+- `search_rom_strings` (CLI `rea search-rom-strings <path>`): search or scan ROM
+  bytes using `sjis`/`cp932`, `euc-jp`, `utf-8`, `utf-16le`, `utf-16be`, `ascii`,
+  or custom `.tbl` character tables (`table_path` / `table_text`, multi-byte hex
+  keys, control tokens, and `terminator_byte`). Pass `resolve_xrefs: false`
+  (CLI `--no-resolve-xrefs`) to run directly on local ROM bytes without opening
+  a disassembler session.
+- `discover_pointer_tables` (CLI `rea discover-pointer-tables <path>`): scan ROM
+  regions to automatically discover candidate 16/24/32-bit string pointer tables
+  with entry counts, unique target counts, string byte-width triage statistics
+  (`min_string_bytes`, `max_string_bytes`, `avg_string_bytes`), and decoded
+  samples.
+- `scan_pointer_table` (CLI `rea scan-pointer-table <path> [address]`): decode a
+  pointer table by virtual `address` or ROM file `table_offset` (including
+  automatic bank-local 16-bit pointer resolution for `snes`, `gb`, `nes`, and
+  `pce`), compute each slot's `allocated_budget_bytes` from adjacent target
+  distances, and optionally emit `locbatch.py`-ready `manuscript_records` with
+  `include_manuscript: true` (CLI `--include-manuscript`).
+- `find_code_caves` (CLI `rea find-code-caves <path>`): find contiguous padding
+  regions (`0x00` / `0xFF` or `fill_byte`) sorted largest-first for VWF font
+  hooks, expanded 2-byte glyph tables, and relocated dialogue blocks.

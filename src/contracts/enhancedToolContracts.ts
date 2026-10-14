@@ -93,7 +93,17 @@ export const ENHANCED_TOOL_CONTRACTS = [
   ),
   enhanced(
     "scan_pointer_table",
-    "Scan a 16-bit, 24-bit, or 32-bit pointer table in console ROM or executable memory with configurable endianness, bank base_address, and entry stride. Resolves each slot's target virtual address, ROM file offset, decoded string preview (Shift-JIS/EUC-JP/UTF/ASCII/.tbl), and incoming cross-references.",
+    "Scan a 16-bit, 24-bit, or 32-bit pointer table in console ROM or executable memory with configurable endianness, bank base_address, and entry stride. Resolves each slot's target virtual address, ROM file offset, in-place byte budget, decoded string preview (Shift-JIS/EUC-JP/UTF/ASCII/.tbl), optional locbatch.py manuscript records, and incoming cross-references.",
     enhancedInputSchemas.scan_pointer_table,
+  ),
+  enhanced(
+    "discover_pointer_tables",
+    "Automatically discover candidate 16-bit, 24-bit, or 32-bit string pointer tables in console ROM or executable memory by scanning for contiguous sequences of pointers whose targets decode to valid strings in Shift-JIS, EUC-JP, UTF, ASCII, or custom .tbl character tables. Reports entry counts, unique target counts, min/max/average string byte lengths for UI width triage, and sample string previews.",
+    enhancedInputSchemas.discover_pointer_tables,
+  ),
+  enhanced(
+    "find_code_caves",
+    "Find contiguous sequences of unreferenced padding bytes (0x00 or 0xFF, or an explicit fill_byte) in console ROM or executable segments suitable for injecting VWF font hooks, glyph tables, or relocated localized strings. Returns virtual addresses, ROM file offsets, aligned byte lengths, region names, and optional incoming cross-references.",
+    enhancedInputSchemas.find_code_caves,
   ),
 ] as const satisfies readonly ToolContract[];

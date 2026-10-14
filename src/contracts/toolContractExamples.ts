@@ -54,6 +54,12 @@ export const TOOL_EXAMPLE_OVERRIDES: Readonly<
   trace_native_ui_action: { action: "buildTapped:" },
   search_rom_strings: { query: "勇者", encoding: "sjis" },
   scan_pointer_table: { address: "0x08001000", count: 16 },
+  discover_pointer_tables: {
+    pointer_size: 4,
+    min_entries: 4,
+    encoding: "sjis",
+  },
+  find_code_caves: { min_size: 64, alignment: 4 },
   open_binary: { path: "/tmp/fixture" },
   export_evidence_bundle: { path: "/tmp/evidence.json" },
   get_evidence_bundle: {

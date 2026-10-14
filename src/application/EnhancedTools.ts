@@ -47,9 +47,12 @@ import { resolveProcedureAddress } from "./ProcedureAddressResolution.js";
 import { traceLiteralFeature } from "./EnhancedLiteralTracing.js";
 import { projectNativeApiInspection } from "./native/NativeApiInspection.js";
 import {
+  executeDiscoverPointerTables,
+  executeFindCodeCaves,
   executeScanPointerTable,
   executeSearchRomStrings,
 } from "./romhacking/RomHackingTools.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 
 /**
  * Composes direct provider operations into bounded reverse-engineering tools.
@@ -57,7 +60,10 @@ import {
  * `executeValidated` so an MCP input is parsed exactly once.
  */
 export class EnhancedTools {
-  constructor(private readonly analysis: AnalysisOperationPort) {}
+  constructor(
+    private readonly analysis: AnalysisOperationPort,
+    private readonly target?: BinaryTarget,
+  ) {}
 
   /** Parse an untrusted direct-call input once, then dispatch exhaustively. */
   execute(
@@ -143,6 +149,19 @@ export class EnhancedTools {
           ? this.executeValidated({ name, input: parsed.data }, signal)
           : invalidEnhancedInput(name, parsed.error);
       }
+      case "discover_pointer_tables": {
+        const parsed =
+          enhancedInputSchemas.discover_pointer_tables.safeParse(input);
+        return parsed.success
+          ? this.executeValidated({ name, input: parsed.data }, signal)
+          : invalidEnhancedInput(name, parsed.error);
+      }
+      case "find_code_caves": {
+        const parsed = enhancedInputSchemas.find_code_caves.safeParse(input);
+        return parsed.success
+          ? this.executeValidated({ name, input: parsed.data }, signal)
+          : invalidEnhancedInput(name, parsed.error);
+      }
     }
   }
 
@@ -199,9 +218,33 @@ export class EnhancedTools {
         return traceNativeUiAction(this.analysis, call.input, signal);
       }
       case "search_rom_strings":
-        return executeSearchRomStrings(this.analysis, call.input, signal);
+        return executeSearchRomStrings(
+          this.analysis,
+          call.input,
+          signal,
+          this.target,
+        );
       case "scan_pointer_table":
-        return executeScanPointerTable(this.analysis, call.input, signal);
+        return executeScanPointerTable(
+          this.analysis,
+          call.input,
+          signal,
+          this.target,
+        );
+      case "discover_pointer_tables":
+        return executeDiscoverPointerTables(
+          this.analysis,
+          call.input,
+          signal,
+          this.target,
+        );
+      case "find_code_caves":
+        return executeFindCodeCaves(
+          this.analysis,
+          call.input,
+          signal,
+          this.target,
+        );
     }
   }
 
