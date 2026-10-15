@@ -22,6 +22,7 @@ import { jsonValueSchema } from "../domain/jsonValue.js";
 import { parseConfig } from "../config/parseConfig.js";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import { parseExecutableHeader } from "../domain/binaryTarget.js";
+import { admitConsoleTarget } from "../domain/consoleRom.js";
 import { GhidraProvider } from "./GhidraProvider.js";
 import type { GhidraTargetSnapshot } from "./GhidraClient.js";
 import type { GhidraProviderClientFactory } from "./GhidraProviderClient.js";
@@ -2463,4 +2464,67 @@ describe("Ghidra queries after the owned provider is lost", () => {
       "Call open_binary",
     );
   });
+});
+
+it("commits PCE mapping scope into profile identity without changing other console profiles", async () => {
+  const header = Buffer.alloc(0x2000);
+  header.writeUInt16LE(0xe0f3, 0x1ffe);
+  const admission = admitConsoleTarget({
+    format: "pce",
+    headerBytes: header,
+    fileBytes: 0x40000,
+  });
+  if (!admission.ok) throw new Error(admission.error.reason);
+  const target = {
+    path: "/fixture/syscard.pce",
+    sha256: "a".repeat(64),
+    kind: "executable" as const,
+    format: "pce" as const,
+    architecture: admission.value.architecture,
+    availableArchitectures: [admission.value.architecture],
+    entryPoint: admission.value.entryPoint,
+    entryPointSource: admission.value.entryPointSource,
+    consoleRom: admission.value,
+  };
+  const ghidra = provider();
+  const current = await ghidra.resolveAnalysisProfile(target);
+  const prior = await ghidra.resolveAnalysisProfile({
+    ...target,
+    consoleRom: {
+      ...target.consoleRom,
+      romMetadata: {
+        ...target.consoleRom.romMetadata,
+        mapping_scope: "legacy-unknown-bank-windows",
+      },
+    },
+  });
+  if (!current.ok) throw current.error;
+  if (!prior.ok) throw prior.error;
+  expect(current.value.profile?.parameters.console_mapping_scope).toBe(
+    "reset-bank0-window-only",
+  );
+  expect(current.value.profile?.digest).not.toBe(prior.value.profile?.digest);
+  const nesHeader = Buffer.alloc(0x4010);
+  nesHeader.write("NES\x1a", "ascii");
+  nesHeader[4] = 1;
+  const nes = admitConsoleTarget({
+    format: "nes",
+    headerBytes: nesHeader,
+    fileBytes: nesHeader.length,
+  });
+  if (!nes.ok) throw new Error(nes.error.reason);
+  const nonPce = await ghidra.resolveAnalysisProfile({
+    ...target,
+    path: "/fixture/game.nes",
+    format: "nes",
+    architecture: nes.value.architecture,
+    availableArchitectures: [nes.value.architecture],
+    entryPoint: nes.value.entryPoint,
+    entryPointSource: nes.value.entryPointSource,
+    consoleRom: nes.value,
+  });
+  if (!nonPce.ok) throw nonPce.error;
+  expect(nonPce.value.profile?.parameters).not.toHaveProperty(
+    "console_mapping_scope",
+  );
 });

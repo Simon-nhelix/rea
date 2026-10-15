@@ -1746,17 +1746,16 @@ const admitPce = (
       constraint: "file_format_rejected",
     });
   }
-  let resetVector = 0xe000;
-  if (headerBytes.length >= copierOffset + 0x2000) {
-    const candidate = headerBytes.readUInt16LE(copierOffset + 0x1ffe);
-    if (candidate >= 0xe000 && candidate <= 0xffff) {
-      resetVector = candidate;
-    }
+  if (headerBytes.length < copierOffset + 0x2000) {
+    return err({
+      reason:
+        "pce reset-vector admission requires the complete first 8 KiB bank",
+      constraint: "file_format_rejected",
+    });
   }
+  const resetVector = headerBytes.readUInt16LE(copierOffset + 0x1ffe);
   const entryPoint = explicitEntry?.canonical ?? hex32(resetVector);
   const bank0Size = Math.min(romBytes, 0x2000);
-  const lowWindowSize =
-    romBytes > 0x2000 ? Math.min(romBytes - 0x2000, 0xa000) : 0;
 
   return ok({
     format: "pce",
@@ -1776,36 +1775,17 @@ const admitPce = (
         executable: true,
         writable: false,
       },
-      ...(lowWindowSize > 0
-        ? [
-            {
-              name: "PCE_ROM_WINDOW",
-              virtualAddress: "0x4000",
-              fileOffset: copierOffset + 0x2000,
-              byteLength: lowWindowSize,
-              executable: true,
-              writable: false,
-            },
-          ]
-        : []),
     ],
-    memoryRegions: [
-      {
-        name: "PCE_IO",
-        virtualAddress: "0x0",
-        byteLength: 0x2000,
-        kind: "mmio",
-      },
-      {
-        name: "PCE_RAM",
-        virtualAddress: "0x2000",
-        byteLength: 0x2000,
-        kind: "ram",
-      },
-    ],
+    // Logical zero page/stack operands are CPU-defined, but their physical
+    // storage and other logical windows depend on MPR state. Do not infer the
+    // usual post-boot IO/RAM configuration from a headerless cartridge image.
+    memoryRegions: [],
     romMetadata: {
       copier_header_bytes: copierOffset,
       reset_vector: hex32(resetVector),
+      mapping_scope: "reset-bank0-window-only",
+      mpr7_reset_bank: 0,
+      runtime_mpr_state: "unknown",
       bank_count: Math.ceil(romBytes / 0x2000),
     },
   });
@@ -2432,21 +2412,6 @@ export const resolveConsoleFileOffset = (
         }
       }
     }
-    if (admission.format === "pce" && vaddr >= 0x4000n && vaddr < 0xe000n) {
-      const copierOffset = Number(
-        admission.romMetadata.copier_header_bytes ?? 0,
-      );
-      if (tableFileOffset >= copierOffset) {
-        const bankIndex = Math.floor((tableFileOffset - copierOffset) / 0x2000);
-        const resolved =
-          copierOffset +
-          bankIndex * 0x2000 +
-          Number((vaddr - 0x4000n) & 0x1fffn);
-        if (maxFileBytes === undefined || resolved < maxFileBytes) {
-          return resolved;
-        }
-      }
-    }
   }
 
   // 2. Direct lookup across admitted fileMappings (parsed once per admission)
@@ -2532,12 +2497,6 @@ export const resolveConsoleVirtualAddress = (
     const prgSize = Number(admission.romMetadata.prg_rom_bytes ?? 0);
     if (fileOffset >= prgOffset && fileOffset < prgOffset + prgSize) {
       return hex32(0x8000 + ((fileOffset - prgOffset) % 0x4000));
-    }
-  }
-  if (admission.format === "pce") {
-    const copierOffset = Number(admission.romMetadata.copier_header_bytes ?? 0);
-    if (fileOffset >= copierOffset) {
-      return hex32(0x4000 + ((fileOffset - copierOffset) % 0x2000));
     }
   }
   if (admission.format === "wsc") {

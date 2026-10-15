@@ -595,7 +595,7 @@ export const createGhidraProviderClient = (input: {
               ]
             : consoleRom.format === "pce"
               ? [
-                  "PC Engine uses an experimental dedicated HuC6280 language. SET/T-mode redirected ALU behavior is not modeled; pseudocode after SET can be incorrect. TAM/TMA and block transfers expose opaque userops without MMR remapping or defined copy effects. Instruction flags and calling convention have not been comprehensively validated. Use instruction bytes and disassembly as primary evidence; decompiler output is provisional.",
+                  "PC Engine uses an experimental dedicated HuC6280 language with bounded T-mode, arithmetic and logical-memory block-transfer validation. TAM/TMA remain opaque and do not remap memory. Only the reset bank0 window at 0xe000..0xffff is established from the cartridge image; other MPR windows, their pointer targets and CD-loaded RAM/overlays remain unresolved. Mapping state may change during execution, including MPR7. Hardware timing, interrupts, MMIO effects and game-specific calling conventions are not established; decompiler output is provisional.",
                 ]
               : []),
         ]

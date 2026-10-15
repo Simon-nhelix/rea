@@ -548,3 +548,69 @@ describe("consoleRom multi-bank and overlay coordinate resolution", () => {
     }
   });
 });
+
+describe("PCE reset mapping provenance", () => {
+  it.each([0, 512])(
+    "maps only reset bank zero with %i copier bytes",
+    (copierBytes) => {
+      const header = Buffer.alloc(copierBytes + 0x2000);
+      header.writeUInt16LE(0xe0f3, copierBytes + 0x1ffe);
+      const admitted = admitConsoleTarget({
+        format: "pce",
+        headerBytes: header,
+        fileBytes: copierBytes + 0x40000,
+      });
+      if (!admitted.ok) throw new Error(admitted.error.reason);
+      expect(admitted.value.fileMappings).toEqual([
+        {
+          name: "PCE_ROM_BANK0",
+          virtualAddress: "0xe000",
+          fileOffset: copierBytes,
+          byteLength: 0x2000,
+          executable: true,
+          writable: false,
+        },
+      ]);
+      expect(admitted.value.memoryRegions).toEqual([]);
+      expect(admitted.value.romMetadata.mapping_scope).toBe(
+        "reset-bank0-window-only",
+      );
+      expect(resolveConsoleFileOffset(admitted.value, 0xe0f3)).toBe(
+        copierBytes + 0xf3,
+      );
+      expect(
+        resolveConsoleVirtualAddress(admitted.value, copierBytes + 0xf3),
+      ).toBe("0xe0f3");
+      // A pointer table's own physical bank does not establish any MPR mapping.
+      for (const address of [
+        0x0000, 0x2000, 0x4000, 0x6000, 0x8000, 0xa000, 0xc000, 0xcb0f,
+      ]) {
+        expect(
+          resolveConsoleFileOffset(admitted.value, address, {
+            tableFileOffset: copierBytes + 0x2b00,
+            fileBytes: copierBytes + 0x40000,
+          }),
+        ).toBeNull();
+      }
+      expect(
+        resolveConsoleVirtualAddress(admitted.value, copierBytes + 0x2b0f),
+      ).toBeNull();
+      expect(formatConsoleTargetSpecTsv(admitted.value)).not.toContain(
+        "PCE_ROM_WINDOW",
+      );
+    },
+  );
+
+  it("preserves an unresolvable reset vector instead of inventing E000", () => {
+    const header = Buffer.alloc(0x2000);
+    header.writeUInt16LE(0x4100, 0x1ffe);
+    const admitted = admitConsoleTarget({
+      format: "pce",
+      headerBytes: header,
+      fileBytes: 0x40000,
+    });
+    if (!admitted.ok) throw new Error(admitted.error.reason);
+    expect(admitted.value.entryPoint).toBe("0x4100");
+    expect(resolveConsoleFileOffset(admitted.value, 0x4100)).toBeNull();
+  });
+});

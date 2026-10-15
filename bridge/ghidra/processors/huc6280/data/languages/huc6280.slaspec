@@ -25,28 +25,24 @@ OPTB:   imm8      is tbb=1; imm8  { local ptr:2 = 0x2000 + imm8; export *:1 ptr;
 OPTB:   imm16     is tbb=3; imm16 { export *:1 imm16; }
 
 # Absolute Indexed Indirect
-ADDRIX: (imm16,X) is X; imm16     { addr:2 = imm16 + zext(X); tmp:2 = *:2 addr; export tmp; }
+ADDRIX: (imm16,X) is X; imm16     { addr:2 = imm16 + zext(X); lo:1 = *:1 addr; addr = addr + 1; hi:1 = *:1 addr; target:2 = (zext(hi) << 8) | zext(lo); export target; }
 
 # Instructions
 
 :ADC ZIOP                      is (cc=2 & aaa=3) ... & ZIOP
 {
-    local op1 = ZIOP;
-    local tmpC = C;
-
-    C = carry(A, op1);
-    A = A + op1 + tmpC;
-    resultFlags(A);
-    V = C;
+ local operand:1 = ZIOP;
+ hucAdc(operand);
 }
 
 :AND ZIOP                      is (cc=2 & aaa=1) ... & ZIOP
 {
-    A = A & ZIOP;
-    resultFlags(A);
+ local operand:1 = ZIOP;
+ hucAnd(operand);
 }
 
 :BBR "#"bitindex, imm8, REL    is (action=0 & optype=0xF) & bitindex ; imm8 ; REL {
+ T = 0;
     local ptr:2 = 0x2000 + imm8;
     local value:1 = *:1 ptr;
     local jump = (value & (1 << bitindex)) == 0;
@@ -54,6 +50,7 @@ ADDRIX: (imm16,X) is X; imm16     { addr:2 = imm16 + zext(X); tmp:2 = *:2 addr; 
 }
 
 :BBS "#"bitindex, imm8, REL    is (action=1 & optype=0xF) & bitindex ; imm8 ; REL {
+ T = 0;
     local ptr:2 = 0x2000 + imm8;
     local value:1 = *:1 ptr;
     local jump = (value & (1 << bitindex)) != 0;
@@ -62,6 +59,7 @@ ADDRIX: (imm16,X) is X; imm16     { addr:2 = imm16 + zext(X); tmp:2 = *:2 addr; 
 
 :BIT "#"imm8                   is op=0x89; imm8
 {
+ T = 0;
     local value:1 = imm8;
     N = (value & 0x80) == 0x80;
     V = (value & 0x40) == 0x40;
@@ -71,19 +69,23 @@ ADDRIX: (imm16,X) is X; imm16     { addr:2 = imm16 + zext(X); tmp:2 = *:2 addr; 
 
 :BIT OP2                       is (op=0x34 | op=0x3C) ... & OP2
 {
-    N = (OP2 & 0x80) == 0x80;
-    V = (OP2 & 0x40) == 0x40;
-    local value = A & OP2;
+ T = 0;
+ local operand:1 = OP2;
+    N = (operand & 0x80) == 0x80;
+    V = (operand & 0x40) == 0x40;
+    local value = A & operand;
     Z = (value == 0);
 }
 
 :BRA  REL                      is op=0x80; REL
 {
+ T = 0;
     goto REL;
 }
 
 :CMP ZIOP                      is (cc=2 & aaa=6) ... & ZIOP
 {
+ T = 0;
     local op1 = ZIOP;
     local tmp = A - op1;
     resultFlags(tmp);
@@ -92,6 +94,7 @@ ADDRIX: (imm16,X) is X; imm16     { addr:2 = imm16 + zext(X); tmp:2 = *:2 addr; 
 
 :DEC A                         is op=0x3A & A
 {
+ T = 0;
     local tmp = A - 1;
     A = tmp;
     resultFlags(tmp);
@@ -99,57 +102,64 @@ ADDRIX: (imm16,X) is X; imm16     { addr:2 = imm16 + zext(X); tmp:2 = *:2 addr; 
 
 :EOR ZIOP                      is (cc=2 & aaa=2) ... & ZIOP
 {
-    local op1 = ZIOP;
-    A = A ^ op1;
-    resultFlags(A);
+ local operand:1 = ZIOP;
+ hucEor(operand);
 }
 
 :INC A                         is op=0x1A & A
 {
+ T = 0;
     A = A + 1;
     resultFlags(A);
 }
 
 :JMP ADDRIX                    is (op=0x7C); ADDRIX
 {
+ T = 0;
     goto [ADDRIX];
 }
 
 :LDA ZIOP                      is (cc=2 & aaa=5) ... & ZIOP
 {
+ T = 0;
     A = ZIOP;
     resultFlags(A);
 }
 
 :ORA  ZIOP                     is (cc=2 & aaa=0) ... & ZIOP
 {
-    A = A | ZIOP;
-    resultFlags(A);
+ local operand:1 = ZIOP;
+ hucOra(operand);
 }
 
 :PHX                           is op=0xDA
 {
+ T = 0;
     hucPush8(X);
 }
 
 :PLX                           is op=0xFA
 {
+ T = 0;
     hucPop8(X);
     resultFlags(X);
 }
 
 :PHY                           is op=0x5A
 {
+ T = 0;
     hucPush8(Y);
 }
 
 :PLY                           is op=0x7A
 {
+ T = 0;
     hucPop8(Y);
     resultFlags(Y);
 }
 
 :RMB "#"bitindex, imm8         is (action=0 & optype=7) & bitindex ; imm8 {
+ T = 0;
     local ptr:2 = 0x2000 + imm8;
     local value:1 = *:1 ptr;
     value = value & ~(1 << bitindex);
@@ -158,14 +168,12 @@ ADDRIX: (imm16,X) is X; imm16     { addr:2 = imm16 + zext(X); tmp:2 = *:2 addr; 
 
 :SBC ZIOP                      is (cc=2 & aaa=7) ... & ZIOP
 {
-    local op1 = ZIOP;
-    local result = A - op1 - !C;
-
-    subtraction_flags1(A, op1, result);
-    A = result;
+ local operand:1 = ZIOP;
+ hucSbc(operand);
 }
 
 :SMB "#"bitindex, imm8         is (action=1 & optype=7) & bitindex ; imm8 {
+ T = 0;
     local ptr:2 = 0x2000 + imm8;
     local value:1 = *:1 ptr;
     value = value | (1 << bitindex);
@@ -174,45 +182,56 @@ ADDRIX: (imm16,X) is X; imm16     { addr:2 = imm16 + zext(X); tmp:2 = *:2 addr; 
 
 :STA ZIOP                      is (cc=2 & aaa=4) ... & ZIOP
 {
+ T = 0;
     ZIOP = A;
 }
 
 :STZ imm8                      is op=0x64 ; imm8
 {
+ T = 0;
     local tmp:2 = 0x2000 + imm8;
     *:1 tmp = 0;
 }
 
 :STZ imm8,X                    is op=0x74 & X ; imm8
 {
+ T = 0;
     local tmp:2 = 0x2000 + zext(imm8 + X);
     *:1 tmp = 0;
 }
 
 :STZ imm16                     is op=0x9C ; imm16
 {
+ T = 0;
     local tmp:2 = imm16;
     *:1 tmp = 0;
 }
 
 :STZ imm16,X                   is op=0x9E & X ; imm16
 {
+ T = 0;
     local tmp:2 = imm16 + zext(X);
     *:1 tmp = 0;
 }
 
 :TRB OPTB                      is (tcc=0 & taaa=0 & td=1) ... & OPTB
 {
+ T = 0;
     local op1 = OPTB;
     local result = (~A) & op1;
+    N = (op1 & 0x80) != 0;
+    V = (op1 & 0x40) != 0;
     OPTB = result;
     Z = result == 0;
 }
 
 :TSB OPTB                      is (tcc=0 & taaa=0 & td=0) ... & OPTB
 {
+ T = 0;
     local op1 = OPTB;
     local result = A | op1;
+    N = (op1 & 0x80) != 0;
+    V = (op1 & 0x40) != 0;
     OPTB = result;
     Z = result == 0;
 }
@@ -221,16 +240,10 @@ ADDRIX: (imm16,X) is X; imm16     { addr:2 = imm16 + zext(X); tmp:2 = *:2 addr; 
 define pcodeop huc6280_st0;
 define pcodeop huc6280_st1;
 define pcodeop huc6280_st2;
-define pcodeop huc6280_set;
 define pcodeop huc6280_clock_low;
 define pcodeop huc6280_clock_high;
 define pcodeop huc6280_tam;
 define pcodeop huc6280_tma;
-define pcodeop huc6280_tii;
-define pcodeop huc6280_tdd;
-define pcodeop huc6280_tin;
-define pcodeop huc6280_tia;
-define pcodeop huc6280_tai;
 
 TST_ZPX: imm8,X is imm8 & X { local zp:1 = imm8 + X; local addr:2 = 0x2000 + zext(zp); export *:1 addr; }
 TST_ABSX: imm16,X is imm16 & X { local addr:2 = imm16 + zext(X); export *:1 addr; }
@@ -241,6 +254,7 @@ LEN16: imm16 is imm16 { local tmp:2 = imm16; export tmp; }
 
 :SXY                           is op=0x02
 {
+ T = 0;
     local tmp:1 = X;
     X = Y;
     Y = tmp;
@@ -248,6 +262,7 @@ LEN16: imm16 is imm16 { local tmp:2 = imm16; export tmp; }
 
 :SAX                           is op=0x22
 {
+ T = 0;
     local tmp:1 = A;
     A = X;
     X = tmp;
@@ -255,6 +270,7 @@ LEN16: imm16 is imm16 { local tmp:2 = imm16; export tmp; }
 
 :SAY                           is op=0x42
 {
+ T = 0;
     local tmp:1 = A;
     A = Y;
     Y = tmp;
@@ -262,72 +278,84 @@ LEN16: imm16 is imm16 { local tmp:2 = imm16; export tmp; }
 
 :CLA                           is op=0x62
 {
+ T = 0;
     A = 0;
 }
 
 :CLX                           is op=0x82
 {
+ T = 0;
     X = 0;
 }
 
 :CLY                           is op=0xC2
 {
+ T = 0;
     Y = 0;
 }
 
 :CSL                           is op=0x54
 {
+ T = 0;
     huc6280_clock_low();
 }
 
 :CSH                           is op=0xD4
 {
+ T = 0;
     huc6280_clock_high();
 }
 
 :SET                           is op=0xF4
 {
-    huc6280_set();
+    T = 1;
 }
 
 :ST0 "#"imm8                   is op=0x03; imm8
 {
+ T = 0;
     local value:1 = imm8;
     huc6280_st0(value);
 }
 
 :ST1 "#"imm8                   is op=0x13; imm8
 {
+ T = 0;
     local value:1 = imm8;
     huc6280_st1(value);
 }
 
 :ST2 "#"imm8                   is op=0x23; imm8
 {
+ T = 0;
     local value:1 = imm8;
     huc6280_st2(value);
 }
 
 :TMA "#"imm8                   is op=0x43; imm8
 {
+ T = 0;
     local mask:1 = imm8;
     A = huc6280_tma(mask);
 }
 
 :TAM "#"imm8                   is op=0x53; imm8
 {
+ T = 0;
     local mask:1 = imm8;
     huc6280_tam(mask, A);
 }
 
 :BSR REL                       is op=0x44; REL
 {
+ T = 0;
     hucPush16(inst_next - 1);
     call REL;
 }
 
 :TST "#"imm8, ADDR8            is op=0x83; imm8; ADDR8
 {
+ T = 0;
     local mask:1 = imm8;
     local val:1 = ADDR8;
     N = (val & 0x80) == 0x80;
@@ -337,6 +365,7 @@ LEN16: imm16 is imm16 { local tmp:2 = imm16; export tmp; }
 
 :TST "#"imm8, ADDR16           is op=0x93; imm8; ADDR16
 {
+ T = 0;
     local mask:1 = imm8;
     local val:1 = ADDR16;
     N = (val & 0x80) == 0x80;
@@ -346,6 +375,7 @@ LEN16: imm16 is imm16 { local tmp:2 = imm16; export tmp; }
 
 :TST "#"imm8, TST_ZPX          is op=0xA3; imm8; TST_ZPX
 {
+ T = 0;
     local mask:1 = imm8;
     local val:1 = TST_ZPX;
     N = (val & 0x80) == 0x80;
@@ -355,6 +385,7 @@ LEN16: imm16 is imm16 { local tmp:2 = imm16; export tmp; }
 
 :TST "#"imm8, TST_ABSX         is op=0xB3; imm8; TST_ABSX
 {
+ T = 0;
     local mask:1 = imm8;
     local val:1 = TST_ABSX;
     N = (val & 0x80) == 0x80;
@@ -364,26 +395,94 @@ LEN16: imm16 is imm16 { local tmp:2 = imm16; export tmp; }
 
 :TII SRC16, DST16, LEN16       is op=0x73; SRC16; DST16; LEN16
 {
-    huc6280_tii(SRC16, DST16, LEN16);
+ T = 0;
+    hucPush8(Y); hucPush8(A); hucPush8(X);
+    local source:2 = SRC16;
+    local destination:2 = DST16;
+    local count:2 = LEN16;
+    <copy>
+    local value:1 = *:1 source;
+    *:1 destination = value;
+    source = source + 1;
+    destination = destination + 1;
+    count = count - 1;
+    if (count != 0) goto <copy>;
+    hucPop8(X); hucPop8(A); hucPop8(Y);
 }
 
 :TDD SRC16, DST16, LEN16       is op=0xC3; SRC16; DST16; LEN16
 {
-    huc6280_tdd(SRC16, DST16, LEN16);
+ T = 0;
+    hucPush8(Y); hucPush8(A); hucPush8(X);
+    local source:2 = SRC16;
+    local destination:2 = DST16;
+    local count:2 = LEN16;
+    <copy>
+    local value:1 = *:1 source;
+    *:1 destination = value;
+    source = source - 1;
+    destination = destination - 1;
+    count = count - 1;
+    if (count != 0) goto <copy>;
+    hucPop8(X); hucPop8(A); hucPop8(Y);
 }
 
 :TIN SRC16, DST16, LEN16       is op=0xD3; SRC16; DST16; LEN16
 {
-    huc6280_tin(SRC16, DST16, LEN16);
+ T = 0;
+    hucPush8(Y); hucPush8(A); hucPush8(X);
+    local source:2 = SRC16;
+    local destination:2 = DST16;
+    local count:2 = LEN16;
+    <copy>
+    local value:1 = *:1 source;
+    *:1 destination = value;
+    source = source + 1;
+    count = count - 1;
+    if (count != 0) goto <copy>;
+    hucPop8(X); hucPop8(A); hucPop8(Y);
 }
 
 :TIA SRC16, DST16, LEN16       is op=0xE3; SRC16; DST16; LEN16
 {
-    huc6280_tia(SRC16, DST16, LEN16);
+ T = 0;
+    hucPush8(Y); hucPush8(A); hucPush8(X);
+    local source:2 = SRC16;
+    local destination:2 = DST16;
+    local count:2 = LEN16;
+    local alternate:2 = 0;
+    <copy>
+    local alternating:2 = destination + alternate;
+    local value:1 = *:1 source;
+    *:1 alternating = value;
+    source = source + 1;
+    alternate = alternate ^ 1;
+    count = count - 1;
+    if (count != 0) goto <copy>;
+    hucPop8(X); hucPop8(A); hucPop8(Y);
 }
 
 :TAI SRC16, DST16, LEN16       is op=0xF3; SRC16; DST16; LEN16
 {
-    huc6280_tai(SRC16, DST16, LEN16);
+ T = 0;
+    hucPush8(Y); hucPush8(A); hucPush8(X);
+    local source:2 = SRC16;
+    local destination:2 = DST16;
+    local count:2 = LEN16;
+    local alternate:2 = 0;
+    <copy>
+    local alternating:2 = source + alternate;
+    local value:1 = *:1 alternating;
+    *:1 destination = value;
+    destination = destination + 1;
+    alternate = alternate ^ 1;
+    count = count - 1;
+    if (count != 0) goto <copy>;
+    hucPop8(X); hucPop8(A); hucPop8(Y);
 }
 
+
+# Undefined HuC6280 opcode slots execute as one-byte NOPs (Mesen opcode table).
+:NOP is op=0x0b | op=0x1b | op=0x2b | op=0x33 | op=0x3b | op=0x4b | op=0x5b | op=0x5c | op=0x63 | op=0x6b | op=0x7b | op=0x8b | op=0x9b | op=0xab | op=0xbb | op=0xcb | op=0xdb | op=0xdc | op=0xe2 | op=0xeb | op=0xfb | op=0xfc {
+ T = 0;
+}

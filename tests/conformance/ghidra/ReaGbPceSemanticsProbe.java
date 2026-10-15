@@ -73,7 +73,8 @@ public class ReaGbPceSemanticsProbe extends HeadlessScript {
         emu=emulator(call);
         try {emu.writeRegister("SP",0x2100);step(emu);require(reg(emu,"SP")==0x21fe,"JSR per-byte stack wrapping");require((emu.readMemoryByte(toAddr(0x2100))&255)==0xe4 && (emu.readMemoryByte(toAddr(0x21ff))&255)==2,"JSR saves last operand address");require(emu.getExecutionAddress().getOffset()==0xe800,"JSR target");step(emu);require(reg(emu,"SP")==0x2100 && emu.getExecutionAddress().getOffset()==0xe403,"RTS wraps stack and restores next PC");} finally {emu.dispose();}
         var set=fixture(0xe500,0xf4);
-        require(set!=null && set.getPcode().length>0 && set.getPcode()[0].getOpcode()==PcodeOp.CALLOTHER,"experimental SET exposes opaque effect");
+        emu=emulator(set);
+        try {emu.writeRegister("T",0);step(emu);require(reg(emu,"T")==1,"SET establishes runtime T flag");} finally {emu.dispose();}
     }
     @Override public void run() throws Exception {
         String id=currentProgram.getLanguageID().toString();

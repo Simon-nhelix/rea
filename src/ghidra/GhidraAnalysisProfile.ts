@@ -230,6 +230,12 @@ export const resolveGhidraAnalysisProfile = async (
               ? "official-headless-script-v1"
               : "inspected-jvm-launch-support-v1",
           load_image_evidence: "console-rom-mapping-context-v2",
+          ...(consoleRom.format === "pce"
+            ? {
+                console_mapping_scope:
+                  consoleRom.romMetadata.mapping_scope ?? null,
+              }
+            : {}),
           jump_table_evidence: "typed-case-default-blocks-v1",
           decompiler_jump_loads: true,
           loader: consoleRom.loader,

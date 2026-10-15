@@ -89,11 +89,11 @@ installation. REA setup does not install them or modify Ghidra. Back up an
 existing processor module and compile with that installation's Sleigh compiler.
 Generated SLA files and ROMs do not belong in the repository.
 
-| Target    | Selected language            | Scope                                                                                                                                                                                                                                      |
-| --------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| SNES      | `65816:LE:16:default`        | [Pinned source patch](https://github.com/morluto/rea/tree/main/bridge/ghidra/processors/65816). Restored call/return, stack, status and addressing semantics; dynamic mode boundaries remain limited.                                      |
-| Game Boy  | `SM83:LE:16:default`         | [Dedicated SM83 source](https://github.com/morluto/rea/tree/main/bridge/ghidra/processors/sm83), rather than a Z80 mode patch. Hardware timing and mapper transitions are not emulated.                                                    |
-| PC Engine | `HuC6280:LE:16:experimental` | [Experimental HuC6280 source](https://github.com/morluto/rea/tree/main/bridge/ghidra/processors/huc6280). T-directed ALU effects are missing; MMR changes and block transfers are opaque. Pseudocode is provisional, especially after SET. |
+| Target    | Selected language            | Scope                                                                                                                                                                                                                                                           |
+| --------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SNES      | `65816:LE:16:default`        | [Pinned source patch](https://github.com/morluto/rea/tree/main/bridge/ghidra/processors/65816). Restored call/return, stack, status and addressing semantics; dynamic mode boundaries remain limited.                                                           |
+| Game Boy  | `SM83:LE:16:default`         | [Dedicated SM83 source](https://github.com/morluto/rea/tree/main/bridge/ghidra/processors/sm83), rather than a Z80 mode patch. Hardware timing and mapper transitions are not emulated.                                                                         |
+| PC Engine | `HuC6280:LE:16:experimental` | [Experimental HuC6280 source](https://github.com/morluto/rea/tree/main/bridge/ghidra/processors/huc6280). T-mode arithmetic and logical block transfers have bounded validation. MPR remapping and CD-loaded code remain unresolved; pseudocode is provisional. |
 
 Missing dedicated processor IDs fail instead of falling back to stock Z80 or
 65C02. The source directories preserve upstream revisions, licenses, rebuild
@@ -107,6 +107,22 @@ Saturn standalone IP.BIN boot analysis is distinct from the separately loaded
 game executable. NDS entry analysis covers the selected ARM9 image; it does not
 establish ARM7 or runtime overlay coverage. Bank-switched consoles expose
 static mapped windows, not every possible runtime bank selection.
+
+PC Engine cartridge admission establishes only bank0 at `$E000..$FFFF` for
+reset analysis. The reset value is preserved even when it points outside that
+known window. Neither a pointer's storage location nor its file offset proves
+the MPR mapping of its target. In the tested System Card 3 BIOS, `TAM #$40`
+sets MPR6 to 1 before `JSR $CB0F`: romlab reads file `$2B0F` there. The former
+fixed-window assumption selected file `$AB0F`, which contains unrelated data.
+The revised mapping leaves this destination unresolved. Its mapping scope is
+included in the analysis profile digest.
+
+CD-loaded game code requires a distinct memory snapshot and bank/source model;
+it cannot be analyzed as a cartridge bank inferred from a BIOS image. In the
+tested Ziria Korean build, the font hook at `$6286` calls `$8E88` in CD RAM
+(RAM offsets `$2286` and `$4E88` with observed MPR3=`$81`, MPR4=`$82`).
+romlab established the call and return stack bytes; the cartridge workflow
+does not establish a disc-file origin or decompile those loaded routines.
 
 ## Match static analysis to execution
 
@@ -136,6 +152,13 @@ Ghidra p-code emulation: `Rea65816SemanticsProbe.java` and
 `ReaGbPceSemanticsProbe.java`. Require their explicit success markers; Ghidra's
 process exit status alone can hide a failed script. Their bounded assertions
 do not establish exhaustive ISA or hardware conformance.
+
+`ReaHuC6280SemanticsProbe.java` extends this with 256 opcode decode slots,
+arithmetic and T-flag sequences, pointer wrapping, and five logical-memory
+block transfers. Its 17 observed-state cases match the self-authored
+`pce-fixture.mjs` HuCard executed through romlab, including final PC, registers,
+flags and 32 RAM bytes. This does not validate hardware timing, interrupt
+interleaving, MPR remapping or MMIO transfer side effects.
 
 For caller-owned real ROMs, use a private manifest with a unique `id`, absolute
 `path`, `format`, and optional `procedures`, `xrefs`, `mappings`, `instructions`,
