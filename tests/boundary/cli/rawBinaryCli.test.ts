@@ -131,3 +131,39 @@ cliTest(
     );
   },
 );
+
+cliTest(
+  "propagates a distinct HuC6280 load address before provider selection",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-huc-cli-base-");
+    const path = join(root, "memory.bin");
+    await writeFile(path, Buffer.alloc(16));
+    const result = await cli.run({
+      arguments: [
+        "inspect",
+        path,
+        "--target-format",
+        "raw-binary",
+        "--architecture",
+        "huc6280",
+        "--load-address",
+        "0x4000",
+        "--entry-point",
+        "0x6286",
+        "--provider",
+        "ghidra",
+        "--json",
+      ],
+      environment: { HOME: root, XDG_CONFIG_HOME: root, XDG_CACHE_HOME: root },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.json).toMatchObject({
+      code: "invalid_request",
+      details: {
+        reason: expect.stringContaining(
+          "entry_point 0x6286 must lie within the loaded file extent 0x4000..0x400f",
+        ),
+      },
+    });
+  },
+);

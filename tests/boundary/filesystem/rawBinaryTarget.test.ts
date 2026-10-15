@@ -140,3 +140,29 @@ describe("raw-binary admission", () => {
     ).toMatchObject({ ok: false, error: { _tag: "BinaryTargetError" } });
   });
 });
+
+it("resolves a paused HuC6280 memory file with distinct logical load and code entry", async () => {
+  const directory = await createTestTempDirectory("rea-huc-snapshot-target-");
+  const path = join(directory, "paused-memory.bin");
+  const bytes = Buffer.alloc(0xc000);
+  bytes.set([0x60], 0x2286);
+  await writeFile(path, bytes);
+  const target = await parseBinaryTarget(path, {
+    formatHint: "raw-binary",
+    architecture: "huc6280",
+    loadAddress: "0x04000",
+    entryPoint: "0x06286",
+  });
+  expect(target).toMatchObject({
+    ok: true,
+    value: {
+      format: "raw-binary",
+      architecture: "huc6280",
+      loadAddress: "0x4000",
+      loadAddressSource: "0x04000",
+      entryPoint: "0x6286",
+      entryPointSource: "0x06286",
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    },
+  });
+});

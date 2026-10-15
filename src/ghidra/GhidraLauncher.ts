@@ -163,6 +163,7 @@ export interface GhidraHeadlessLauncherOptions {
     readonly languageId: string;
     readonly compilerSpecId: string;
     readonly baseAddr: string;
+    readonly entryPoint: string;
   };
   readonly consoleRom?: ConsoleTargetAdmission;
   /** Explicit import language committed by the analysis profile. */
@@ -573,6 +574,7 @@ export interface GhidraHeadlessArgumentOptions {
     readonly languageId: string;
     readonly compilerSpecId: string;
     readonly baseAddr: string;
+    readonly entryPoint: string;
   };
   readonly consoleRom?: {
     readonly loader: "BinaryLoader" | "ElfLoader";
@@ -742,6 +744,7 @@ export const ghidraHeadlessArguments = (
           scriptPath.join(bridgeDirectory, "ReaGhidraPrepareRaw.java"),
           rawBinary.languageId,
           rawBinary.baseAddr,
+          rawBinary.entryPoint,
         ]),
     ...(consoleRom === undefined
       ? []

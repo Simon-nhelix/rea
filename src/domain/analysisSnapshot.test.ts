@@ -102,6 +102,8 @@ describe("analysis snapshot target identity", () => {
       availableArchitectures: ["arm"],
       entryPoint: "0x8000000",
       entryPointSource: "0x08000000",
+      loadAddress: "0x8000000",
+      loadAddressSource: "0x08000000",
     };
     const snapshot = snapshotTarget(target);
     const binding = snapshotBinding(ANALYSIS_SNAPSHOT_PROFILE);
@@ -527,4 +529,45 @@ describe("analysis snapshot Evidence binding", () => {
       );
     }
   });
+});
+
+it("partitions raw memory snapshots by canonical load address independently from code entry", () => {
+  const target: BinaryTarget = {
+    path: "/fixture/memory.bin",
+    sha256: ANALYSIS_SNAPSHOT_TARGET.sha256,
+    kind: "executable",
+    format: "raw-binary",
+    architecture: "huc6280",
+    availableArchitectures: ["huc6280"],
+    entryPoint: "0x6286",
+    entryPointSource: "0x06286",
+    loadAddress: "0x4000",
+    loadAddressSource: "0x04000",
+  };
+  const first = snapshotTarget(target);
+  const shifted = {
+    ...target,
+    loadAddress: "0x2000",
+    loadAddressSource: "0x02000",
+  };
+  const binding = snapshotBinding(ANALYSIS_SNAPSHOT_PROFILE);
+  expect(snapshotMatchesTarget(first, shifted)).toBe(false);
+  expect(analysisQueryId(first, binding, "list_procedures", {})).not.toBe(
+    analysisQueryId(snapshotTarget(shifted), binding, "list_procedures", {}),
+  );
+  expect(
+    snapshotMatchesTarget(first, { ...target, loadAddressSource: "0x4000" }),
+  ).toBe(true);
+  const implicit = { ...target, loadAddress: target.entryPoint };
+  const identity = snapshotTarget(implicit);
+  const parsed = analysisSnapshotSchema.parse({
+    target: { ...identity, entry_point: "0x06286", load_address: "0x06286" },
+    binding,
+    entries: [],
+    workflow_entries: [],
+    unknowns: [],
+    evidence_bundle: createEvidenceBundle([]),
+  });
+  expect(parsed.target).toEqual(identity);
+  expect(snapshotMatchesTarget(parsed.target, implicit)).toBe(true);
 });

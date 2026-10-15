@@ -211,6 +211,9 @@ const registerOpenLifecycleTool = (
           ...(input.entry_point === undefined
             ? {}
             : { entryPoint: input.entry_point }),
+          ...(input.load_address === undefined
+            ? {}
+            : { loadAddress: input.load_address }),
           ...(input.provider_id === undefined
             ? {}
             : { providerId: input.provider_id }),

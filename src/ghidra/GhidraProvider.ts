@@ -70,6 +70,7 @@ const SUPPORTED_ARCHITECTURES = new Set([
   "arm64",
   "mips",
   "6502",
+  "huc6280",
   "65816",
   "sh2",
   "sh4",
@@ -221,7 +222,7 @@ export class GhidraProvider implements AnalysisProviderCandidate {
         status: "unsupported",
         code: "architecture_unsupported",
         reason:
-          "Ghidra v1 requires a supported x86, x86_64, arm, arm64, MIPS, RISC-V, or raw 6502 target profile.",
+          "Ghidra v1 requires a supported x86, x86_64, arm, arm64, MIPS, RISC-V, or raw 6502/HuC6280 target profile.",
         diagnostics,
       };
     return {

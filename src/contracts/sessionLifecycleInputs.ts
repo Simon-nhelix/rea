@@ -4,6 +4,7 @@ import { localPathStringSchema } from "../domain/localPath.js";
 import {
   binaryArchitectureSchema,
   rawBinaryEntryPointSchema,
+  rawBinaryLoadAddressSchema,
   rawBinarySelectionError,
 } from "../domain/rawBinary.js";
 import { z } from "zod";
@@ -36,7 +37,7 @@ export const openBinaryInputSchema = z
     format: executableFormatHintSchema
       .optional()
       .describe(
-        "Explicit headerless interpretation: dos-com or raw-binary. Omission preserves header-based detection.",
+        "Explicit format selection, including dos-com, raw-binary, and console formats. Omission preserves format detection.",
       ),
     architecture: binaryArchitectureSchema
       .optional()
@@ -46,7 +47,12 @@ export const openBinaryInputSchema = z
     entry_point: rawBinaryEntryPointSchema
       .optional()
       .describe(
-        "Caller-supplied load and entry address (0xhex). File offset 0 is mapped here. Required with format=raw-binary; rejected otherwise.",
+        "Caller-supplied code entry address (0xhex). Required for raw-binary; optional for an explicitly selected console format.",
+      ),
+    load_address: rawBinaryLoadAddressSchema
+      .optional()
+      .describe(
+        "Address mapped to file offset 0. Defaults to entry_point; raw-binary only.",
       ),
     provider_id: analysisProviderSelectorSchema.optional(),
     snapshot_path: snapshotPathSchema.optional(),
@@ -57,6 +63,9 @@ export const openBinaryInputSchema = z
       ...(value.architecture === undefined
         ? {}
         : { architecture: value.architecture }),
+      ...(value.load_address === undefined
+        ? {}
+        : { loadAddress: value.load_address }),
       ...(value.entry_point === undefined
         ? {}
         : { entryPoint: value.entry_point }),
@@ -65,13 +74,15 @@ export const openBinaryInputSchema = z
     context.addIssue({
       code: "custom",
       path:
-        value.format === "raw-binary"
-          ? value.architecture === undefined
-            ? ["architecture"]
-            : ["entry_point"]
-          : value.architecture === undefined
-            ? ["entry_point"]
-            : ["architecture"],
+        value.load_address !== undefined && value.format !== "raw-binary"
+          ? ["load_address"]
+          : value.format === "raw-binary"
+            ? value.architecture === undefined
+              ? ["architecture"]
+              : ["entry_point"]
+            : value.architecture === undefined
+              ? ["entry_point"]
+              : ["architecture"],
       message: pairing,
     });
   });

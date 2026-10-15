@@ -55,6 +55,8 @@ describe("raw-binary admission", () => {
         architecture: "6502",
         entryPoint,
         entryPointSource: entryPoint,
+        loadAddress: entryPoint,
+        loadAddressSource: entryPoint,
       });
     }
   });
@@ -90,6 +92,8 @@ describe("raw-binary admission", () => {
         architecture: "arm",
         entryPoint: "0x8000000",
         entryPointSource: "0x8000000",
+        loadAddress: "0x8000000",
+        loadAddressSource: "0x8000000",
       },
     });
   });
@@ -191,5 +195,56 @@ describe("raw-binary selection pairing", () => {
     expect(
       rawBinarySelectionError({ format: "dos-com", architecture: "x86" }),
     ).toBe("architecture and entry_point apply only with format=raw-binary");
+  });
+});
+
+describe("raw snapshot load and code entry coordinates", () => {
+  it("preserves source spellings while loading a HuC6280 snapshot at its logical base", () => {
+    expect(
+      admitRawBinary({
+        architecture: "huc6280",
+        loadAddress: "0x04000",
+        entryPoint: "0x06286",
+        fileBytes: 0xc000,
+      }),
+    ).toEqual({
+      ok: true,
+      value: {
+        architecture: "huc6280",
+        loadAddress: "0x4000",
+        loadAddressSource: "0x04000",
+        entryPoint: "0x6286",
+        entryPointSource: "0x06286",
+      },
+    });
+  });
+  it.each([
+    { loadAddress: "0x4000", entryPoint: "0x3fff", fileBytes: 0xc000 },
+    { loadAddress: "0x4000", entryPoint: "0xffff", fileBytes: 0xbfff },
+    { loadAddress: "0x4000", entryPoint: "0x6286", fileBytes: 0xc001 },
+    { loadAddress: "0x10000", entryPoint: "0x10000", fileBytes: 1 },
+    { loadAddress: null, entryPoint: "0x6286", fileBytes: 1 },
+    { loadAddress: "4000", entryPoint: "0x6286", fileBytes: 1 },
+  ])("rejects unavailable or overflowing snapshot coordinates %j", (input) => {
+    expect(admitRawBinary({ architecture: "huc6280", ...input }).ok).toBe(
+      false,
+    );
+  });
+  it("restricts load_address to explicit raw targets, including console inputs", () => {
+    for (const format of [undefined, "pce", "dos-com"] as const)
+      expect(
+        rawBinarySelectionError({
+          ...(format === undefined ? {} : { format }),
+          loadAddress: "0x4000",
+        }),
+      ).toContain("load_address applies only with format=raw-binary");
+    expect(
+      rawBinarySelectionError({
+        format: "raw-binary",
+        architecture: "huc6280",
+        loadAddress: "0x4000",
+        entryPoint: "0x6286",
+      }),
+    ).toBeUndefined();
   });
 });

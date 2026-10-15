@@ -576,9 +576,14 @@ export const createGhidraProviderClient = (input: {
       : []),
     ...(target.format === "raw-binary"
       ? [
-          "Headerless raw-binary analysis uses the caller-supplied architecture and entry address; file offset 0 is mapped at that address. Headers are not discovered from file bytes.",
-          "Little-endian generic Ghidra languages are used for x86, x86_64, arm, arm64, and NMOS 6502. Big-endian, Thumb-only, Cortex-M, 65C02, 65816, and other processor variants are unsupported in this increment.",
+          "Headerless raw-binary analysis uses the caller-supplied architecture, load address and entry point. File offset 0 is mapped at the load address; only the declared entry is seeded as an entry function. Headers are not discovered from file bytes.",
+          "Little-endian generic Ghidra languages are used for x86, x86_64, arm, arm64, and NMOS 6502; HuC6280 uses a dedicated experimental language. Big-endian, Thumb-only, Cortex-M, 65C02, 65816, and other processor variants are unsupported in this increment.",
           "Static analysis does not emulate reset vectors, memory-mapped I/O, or firmware boot sequences.",
+          ...(target.architecture === "huc6280"
+            ? [
+                "Raw HuC6280 bytes are a caller-selected logical load, not an identified HuCard or verified runtime capture. For memory dumps, imported bytes describe a frozen logical snapshot; their capture provenance and MPR state must be established independently. TAM/TMA do not remap the imported image. Self-modifying instructions retain captured operands in static decoding; later code writes require another observation. Later mapping changes, device effects, interrupts, timing and game-specific ABI remain unverified.",
+              ]
+            : []),
         ]
       : []),
     ...(consoleRom !== undefined
@@ -649,7 +654,8 @@ export const createGhidraProviderClient = (input: {
             rawBinary: {
               languageId: rawLanguage.languageId,
               compilerSpecId: rawLanguage.compilerSpecId,
-              baseAddr: target.entryPoint,
+              baseAddr: target.loadAddress,
+              entryPoint: target.entryPoint,
             },
           }),
       ...(consoleRom === undefined ? {} : { consoleRom }),

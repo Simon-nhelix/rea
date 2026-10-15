@@ -191,9 +191,22 @@ for (const [index, spec] of cases.entries()) {
     await call("open_binary", {
       path: spec.path,
       format: spec.format,
+      ...(spec.architecture === undefined
+        ? {}
+        : { architecture: spec.architecture }),
+      ...(spec.entry_point === undefined
+        ? {}
+        : { entry_point: spec.entry_point }),
+      ...(spec.load_address === undefined
+        ? {}
+        : { load_address: spec.load_address }),
       provider_id: "ghidra",
     });
     await attempt("binary_session");
+    if (spec.load_image)
+      await attempt("inspect_native_load_image", {}, (v) => {
+        assert.equal(v.status, "verified");
+      });
     for (const procedure of spec.procedures ?? ["entry"]) {
       await attempt("procedure_pseudo_code", { procedure }, (v) =>
         assert.ok(

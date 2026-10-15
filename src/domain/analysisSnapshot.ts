@@ -47,6 +47,7 @@ import { freezeJsonSnapshot } from "./immutableJson.js";
 import {
   binaryArchitectureSchema,
   rawBinaryEntryPointSchema,
+  rawBinaryLoadAddressSchema,
 } from "./rawBinary.js";
 import {
   relationshipCoverageSchema,
@@ -118,26 +119,40 @@ const targetIdentitySchema = z.object({
   kind: kindSchema,
   architecture: architectureSchema.nullable(),
 });
-const targetSchema = z.discriminatedUnion("format", [
-  targetIdentitySchema.extend({
-    format: formatSchema.exclude(["raw-binary", ...CONSOLE_TARGET_FORMATS]),
-    architecture: architectureSchema
-      .exclude(CONSOLE_ONLY_ARCHITECTURES)
-      .nullable(),
-  }),
-  targetIdentitySchema.extend({
-    format: z.literal("raw-binary"),
-    kind: z.literal("executable"),
-    architecture: binaryArchitectureSchema,
-    entry_point: rawBinaryEntryPointSchema,
-  }),
-  targetIdentitySchema.extend({
-    format: z.enum(CONSOLE_TARGET_FORMATS),
-    kind: z.literal("executable"),
-    architecture: architectureSchema,
-    entry_point: rawBinaryEntryPointSchema,
-  }),
-]);
+const targetSchema = z
+  .discriminatedUnion("format", [
+    targetIdentitySchema.extend({
+      format: formatSchema.exclude(["raw-binary", ...CONSOLE_TARGET_FORMATS]),
+      architecture: architectureSchema
+        .exclude(CONSOLE_ONLY_ARCHITECTURES)
+        .nullable(),
+    }),
+    targetIdentitySchema.extend({
+      format: z.literal("raw-binary"),
+      kind: z.literal("executable"),
+      architecture: binaryArchitectureSchema,
+      entry_point: rawBinaryEntryPointSchema,
+      load_address: rawBinaryLoadAddressSchema.optional(),
+    }),
+    targetIdentitySchema.extend({
+      format: z.enum(CONSOLE_TARGET_FORMATS),
+      kind: z.literal("executable"),
+      architecture: architectureSchema,
+      entry_point: rawBinaryEntryPointSchema,
+    }),
+  ])
+  .transform((target) => {
+    if (target.format !== "raw-binary") return target;
+    const { load_address, ...identity } = target;
+    return {
+      ...identity,
+      entry_point: `0x${BigInt(target.entry_point).toString(16)}`,
+      ...(load_address === undefined ||
+      BigInt(load_address) === BigInt(target.entry_point)
+        ? {}
+        : { load_address: `0x${BigInt(load_address).toString(16)}` }),
+    };
+  });
 const bindingSchema = z
   .object({
     provider: committedProviderSchema,
@@ -377,6 +392,9 @@ export const snapshotTarget = (
       architecture: target.architecture,
       format: target.format,
       entry_point: target.entryPoint,
+      ...(target.loadAddress === target.entryPoint
+        ? {}
+        : { load_address: target.loadAddress }),
     };
   if (isConsoleBinaryTarget(target))
     return {
@@ -418,7 +436,13 @@ export const snapshotMatchesTarget = (
   if ("entry_point" in snapshot) {
     return (
       (target.format === "raw-binary" || isConsoleBinaryTarget(target)) &&
-      snapshot.entry_point === target.entryPoint
+      snapshot.entry_point === target.entryPoint &&
+      (target.format !== "raw-binary" ||
+        BigInt(
+          "load_address" in snapshot && snapshot.load_address !== undefined
+            ? snapshot.load_address
+            : snapshot.entry_point,
+        ) === BigInt(target.loadAddress))
     );
   }
   return true;

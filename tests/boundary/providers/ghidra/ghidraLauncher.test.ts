@@ -154,6 +154,33 @@ describe("Ghidra console staging loader", () => {
 });
 
 describe("Ghidra raw-binary loader", () => {
+  it("loads raw HuC6280 at its base and seeds the separate actual entry", () => {
+    const args = ghidraHeadlessArguments({
+      projectRoot: "/tmp/project",
+      targetPath: "/tmp/logical.bin",
+      bridgeScriptPath: "/package/bridge/ReaGhidraBridge.java",
+      descriptorPath: "/tmp/session.json",
+      ghidraLogPath: "/tmp/ghidra.log",
+      scriptLogPath: "/tmp/script.log",
+      rawBinary: {
+        languageId: "HuC6280:LE:16:experimental",
+        compilerSpecId: "default",
+        baseAddr: "0x2000",
+        entryPoint: "0x6286",
+      },
+    });
+    expectOptions(args, [
+      ["-loader-baseAddr", "0x2000"],
+      ["-processor", "HuC6280:LE:16:experimental"],
+    ]);
+    const prepare = args.indexOf("/package/bridge/ReaGhidraPrepareRaw.java");
+    expect(args.slice(prepare + 1, prepare + 4)).toEqual([
+      "HuC6280:LE:16:experimental",
+      "0x2000",
+      "0x6286",
+    ]);
+  });
+
   it("loads caller-supplied architecture and entry before auto-analysis", () => {
     const arguments_ = ghidraHeadlessArguments({
       projectRoot: "/tmp/project",
@@ -166,6 +193,7 @@ describe("Ghidra raw-binary loader", () => {
         languageId: "ARM:LE:32:v7",
         compilerSpecId: "default",
         baseAddr: "0x8000000",
+        entryPoint: "0x8000000",
       },
     });
     expectOptions(arguments_, [
@@ -180,6 +208,7 @@ describe("Ghidra raw-binary loader", () => {
     );
     expect(arguments_[prepare + 2]).toBe("ARM:LE:32:v7");
     expect(arguments_[prepare + 3]).toBe("0x8000000");
+    expect(arguments_[prepare + 4]).toBe("0x8000000");
     expect(prepare).toBeLessThan(arguments_.indexOf("-postScript"));
     expect(arguments_).toContain("-readOnly");
     expect(arguments_).toContain("-deleteProject");
@@ -263,6 +292,7 @@ describe("Ghidra headless launcher", () => {
           languageId: "x86:LE:32:default",
           compilerSpecId: "default",
           baseAddr: "0x1000",
+          entryPoint: "0x1000",
         },
       },
     ])
@@ -329,6 +359,7 @@ describe("Ghidra configured import language and seeds", () => {
           languageId: "ARM:LE:32:v7",
           compilerSpecId: "default",
           baseAddr: "0x8000000",
+          entryPoint: "0x8000000",
         },
       }),
     ).toThrow(/cannot be combined with a raw-binary import/u);

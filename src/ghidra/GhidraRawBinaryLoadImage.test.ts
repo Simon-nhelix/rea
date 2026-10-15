@@ -5,7 +5,12 @@ import { fixtureRawBinaryLoadImage } from "./GhidraRawBinaryLoadImage.fixture.js
 import { ghidraRawBinaryLanguage } from "./GhidraRawBinaryLanguage.js";
 
 describe("raw-binary Ghidra language binding", () => {
-  it("maps the four admitted families to little-endian generic languages", () => {
+  it("binds admitted CPU families to their exact Ghidra languages", () => {
+    expect(ghidraRawBinaryLanguage("huc6280")).toEqual({
+      languageId: "HuC6280:LE:16:experimental",
+      compilerSpecId: "default",
+      defaultAddressSpace: "RAM",
+    });
     expect(ghidraRawBinaryLanguage("x86")).toEqual({
       languageId: "x86:LE:32:default",
       compilerSpecId: "gcc",
@@ -38,6 +43,8 @@ describe("raw-binary mapped-block state", () => {
         ...f.target,
         architecture: "6502" as const,
         availableArchitectures: ["6502" as const],
+        loadAddress: "0x8001",
+        loadAddressSource: "0x8001",
         entryPoint: "0x8001",
         entryPointSource: "0x8001",
       };
@@ -184,6 +191,56 @@ describe("raw-binary independent load-image checks", () => {
       },
     });
   });
+  it("verifies a separate load base and entry offset for raw HuC6280", () => {
+    const f = fixtureRawBinaryLoadImage();
+    const target = {
+      ...f.target,
+      architecture: "huc6280" as const,
+      availableArchitectures: ["huc6280" as const],
+      loadAddress: "0x2000",
+      loadAddressSource: "0x002000",
+      entryPoint: "0x2002",
+      entryPointSource: "0x002002",
+    };
+    f.observation.language_id = "HuC6280:LE:16:experimental";
+    f.observation.default_address_space = "RAM";
+    f.observation.entry_points = ["0x2002"];
+    const mapping = f.observation.mappings[0]!;
+    Object.assign(mapping, {
+      start: "0x2000",
+      end: "0x2003",
+      address_space: "RAM",
+    });
+    expect(
+      attestGhidraRawBinaryLoadImage(f.snapshot, target, f.observation),
+    ).toMatchObject({
+      ok: true,
+      value: {
+        status: "verified",
+        base_address: "0x2000",
+        entry: { address: "0x2002", file_offset: 2 },
+      },
+    });
+    mapping.start = "0x2002";
+    expect(
+      attestGhidraRawBinaryLoadImage(f.snapshot, target, f.observation),
+    ).toMatchObject({
+      ok: true,
+      value: {
+        status: "mismatch",
+        checks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "mapping.start",
+            matched: false,
+            expected: "0x2000",
+          }),
+        ]),
+      },
+    });
+  });
+});
+
+describe("raw-binary load-image identity and entry checks", () => {
   it("retains mismatch evidence for a drifted language", () => {
     const f = fixtureRawBinaryLoadImage();
     f.observation.language_id = "x86:LE:32:default";

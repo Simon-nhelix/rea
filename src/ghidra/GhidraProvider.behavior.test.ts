@@ -200,6 +200,48 @@ describe("Ghidra provider", () => {
 });
 
 describe("Ghidra raw-binary profile", () => {
+  it("binds raw HuC6280 load and entry independently in profile identity", async () => {
+    const ghidra = provider();
+    const target = {
+      path: "/tmp/logical-memory.bin",
+      sha256: "a".repeat(64),
+      kind: "executable" as const,
+      format: "raw-binary" as const,
+      architecture: "huc6280" as const,
+      availableArchitectures: ["huc6280" as const],
+      loadAddress: "0x2000",
+      loadAddressSource: "0x002000",
+      entryPoint: "0x6286",
+      entryPointSource: "0x006286",
+    };
+    expect(ghidra.inspectTargetSupport(target).status).toBe("supported");
+    const first = await ghidra.resolveAnalysisProfile(target);
+    const changedLoad = await ghidra.resolveAnalysisProfile({
+      ...target,
+      loadAddress: "0x1000",
+      loadAddressSource: "0x1000",
+    });
+    const changedSpelling = await ghidra.resolveAnalysisProfile({
+      ...target,
+      loadAddressSource: "0x2000",
+      entryPointSource: "0x6286",
+    });
+    if (!first.ok || !changedLoad.ok || !changedSpelling.ok)
+      throw new Error("expected raw profiles");
+    expect(first.value.profile?.parameters).toMatchObject({
+      load_address: "0x2000",
+      entry_point: "0x6286",
+      language_id: "HuC6280:LE:16:experimental",
+      load_image_evidence: "independent-raw-load-entry-context-v5",
+    });
+    expect(first.value.profile?.digest).not.toBe(
+      changedLoad.value.profile?.digest,
+    );
+    expect(first.value.profile?.digest).toBe(
+      changedSpelling.value.profile?.digest,
+    );
+  });
+
   it("admits raw 6502 on Windows and binds its 16-bit language without mutation authority", async () => {
     const ghidra = provider(installationHost("win32"));
     const target: BinaryTarget = {
@@ -209,6 +251,8 @@ describe("Ghidra raw-binary profile", () => {
       format: "raw-binary",
       architecture: "6502",
       availableArchitectures: ["6502"],
+      loadAddress: "0x8001",
+      loadAddressSource: "0x008001",
       entryPoint: "0x8001",
       entryPointSource: "0x008001",
     };
@@ -222,7 +266,7 @@ describe("Ghidra raw-binary profile", () => {
       compiler_spec_id: "default",
       entry_point: "0x8001",
       language_selection: "caller-supplied-v1",
-      load_image_evidence: "independent-raw-mapping-context-v4",
+      load_image_evidence: "independent-raw-load-entry-context-v5",
     });
     expect(
       ghidra
@@ -239,6 +283,8 @@ describe("Ghidra raw-binary profile", () => {
       format: "raw-binary",
       architecture: "arm",
       availableArchitectures: ["arm"],
+      loadAddress: "0x8000000",
+      loadAddressSource: "0x08000000",
       entryPoint: "0x8000000",
       entryPointSource: "0x08000000",
     };
@@ -259,6 +305,8 @@ describe("Ghidra raw-binary profile", () => {
     });
     const shifted = await ghidra.resolveAnalysisProfile({
       ...target,
+      loadAddress: "0x8001000",
+      loadAddressSource: "0x8001000",
       entryPoint: "0x8001000",
       entryPointSource: "0x8001000",
     });
@@ -2300,6 +2348,8 @@ describe("Ghidra disabled analyzer options", () => {
       format: "raw-binary",
       architecture: "x86",
       availableArchitectures: ["x86"],
+      loadAddress: "0x800",
+      loadAddressSource: "0x0800",
       entryPoint: "0x1000",
       entryPointSource: "0x1000",
     };
@@ -2308,6 +2358,7 @@ describe("Ghidra disabled analyzer options", () => {
       throw new Error("expected a bound raw-binary profile");
     expect(resolved.value.profile.parameters).toMatchObject({
       target_format: "raw-binary",
+      load_address: "0x800",
       entry_point: "0x1000",
       analyzer_preset: "ghidra-default+disabled:Decompiler Switch Analysis",
       analysis_options: { disabled_analyzers: ["Decompiler Switch Analysis"] },
@@ -2319,7 +2370,8 @@ describe("Ghidra disabled analyzer options", () => {
       rawBinary: {
         languageId: "x86:LE:32:default",
         compilerSpecId: "gcc",
-        baseAddr: "0x1000",
+        baseAddr: "0x800",
+        entryPoint: "0x1000",
       },
     });
     await client.close();

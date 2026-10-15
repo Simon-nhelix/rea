@@ -1,4 +1,4 @@
-import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
@@ -402,3 +402,114 @@ it.skipIf(process.platform !== "win32")(
     expect(calls).toEqual(["address_name"]);
   },
 );
+
+it("opens an explicit HuC6280 memory snapshot and retains its independent load identity", async () => {
+  const root = await createTestTempDirectory("rea-huc-mcp-base-");
+  const path = join(root, "memory.bin");
+  await writeFile(path, Buffer.alloc(0xc000));
+  const { client, session } = await connect();
+  const result = await client.callTool({
+    name: "open_binary",
+    arguments: {
+      path,
+      format: "raw-binary",
+      architecture: "huc6280",
+      load_address: "0x04000",
+      entry_point: "0x06286",
+    },
+  });
+  expect(result.isError, JSON.stringify(result)).not.toBe(true);
+  expect(structured(result)).toMatchObject({
+    result: {
+      format: "raw-binary",
+      architecture: "huc6280",
+      load_address: "0x4000",
+      entry_point: "0x6286",
+    },
+  });
+  expect(session.activeTarget()).toMatchObject({
+    loadAddress: "0x4000",
+    loadAddressSource: "0x04000",
+    entryPoint: "0x6286",
+    entryPointSource: "0x06286",
+  });
+  const status = await client.callTool({
+    name: "binary_session",
+    arguments: {},
+  });
+  expect(status.isError, JSON.stringify(status)).not.toBe(true);
+  expect(structured(status)).toMatchObject({
+    result: { load_address: "0x4000", entry_point: "0x6286" },
+  });
+  const reopened = await client.callTool({
+    name: "open_binary",
+    arguments: {
+      path,
+      format: "raw-binary",
+      architecture: "huc6280",
+      load_address: "0x4000",
+      entry_point: "0x6286",
+    },
+  });
+  expect(reopened.isError, JSON.stringify(reopened)).not.toBe(true);
+  expect(session.activeTarget()).toMatchObject({
+    loadAddressSource: "0x4000",
+    entryPointSource: "0x6286",
+  });
+});
+
+it("imports padded raw snapshot coordinates and reuses their existing canonical query binding", async () => {
+  const root = await createTestTempDirectory("rea-huc-mcp-snapshot-alias-");
+  const path = join(root, "memory.bin");
+  const snapshotPath = join(root, "analysis.json");
+  await writeFile(path, Buffer.alloc(0x4000));
+  const calls: string[] = [];
+  const { client } = await connect(createCacheProvider(calls));
+  const selection = {
+    path,
+    format: "raw-binary",
+    architecture: "huc6280",
+    load_address: "0x4000",
+    entry_point: "0x6286",
+  };
+  const opened = await client.callTool({
+    name: "open_binary",
+    arguments: selection,
+  });
+  expect(opened.isError, JSON.stringify(opened)).not.toBe(true);
+  const query = {
+    name: "address_name",
+    arguments: { address: "0x6286", document: "memory.bin" },
+  };
+  const first = await client.callTool(query);
+  expect(first.isError, JSON.stringify(first)).not.toBe(true);
+  const closed = await client.callTool({
+    name: "close_binary",
+    arguments: { snapshot_path: snapshotPath },
+  });
+  expect(closed.isError, JSON.stringify(closed)).not.toBe(true);
+  const snapshot = JSON.parse(await readFile(snapshotPath, "utf8"));
+  expect(snapshot.entries).toHaveLength(1);
+  const originalQuery = snapshot.entries[0].query_id;
+  const originalProfile = snapshot.binding.analysis_profile.digest;
+  snapshot.target.entry_point = "0x06286";
+  snapshot.target.load_address = "0x04000";
+  await writeFile(snapshotPath, JSON.stringify(snapshot));
+  const reopened = await client.callTool({
+    name: "open_binary",
+    arguments: { ...selection, snapshot_path: snapshotPath },
+  });
+  expect(reopened.isError, JSON.stringify(reopened)).not.toBe(true);
+  const replay = await client.callTool(query);
+  expect(replay.isError, JSON.stringify(replay)).not.toBe(true);
+  expect(structured(replay)).toMatchObject({
+    normalized_result: structured(first).normalized_result,
+  });
+  expect(
+    calls.filter((operation) => operation === "address_name"),
+  ).toHaveLength(1);
+  // The importer reuses the canonical binding; it does not rewrite provenance.
+  const retained = JSON.parse(await readFile(snapshotPath, "utf8"));
+  expect(retained.entries[0].query_id).toBe(originalQuery);
+  expect(retained.binding.analysis_profile.digest).toBe(originalProfile);
+});

@@ -1,3 +1,4 @@
+import type { RawBinaryAdmission } from "./rawBinary.js";
 import {
   isConsoleTargetFormat,
   type ConsoleArchitecture,
@@ -14,6 +15,7 @@ export const BINARY_ARCHITECTURES = [
   "arm64",
   "mips",
   "6502",
+  "huc6280",
   "65816",
   "sh2",
   "sh4",
@@ -68,6 +70,7 @@ export const isElfMetadataArchitecture = (
 /** CPU architectures used only by raw-binary or console ROM targets. */
 export const CONSOLE_ONLY_ARCHITECTURES = [
   "6502",
+  "huc6280",
   "65816",
   "sh2",
   "sh4",
@@ -205,16 +208,12 @@ export type BinaryTarget =
   | (BinaryTargetIdentity & {
       readonly kind: "executable";
       readonly format: "raw-binary";
-      readonly architecture: Exclude<
-        BinaryArchitecture,
-        ElfMetadataArchitecture | Exclude<ConsoleOnlyArchitecture, "6502">
-      >;
-      readonly availableArchitectures: readonly Exclude<
-        BinaryArchitecture,
-        ElfMetadataArchitecture | Exclude<ConsoleOnlyArchitecture, "6502">
-      >[];
+      readonly architecture: RawBinaryAdmission["architecture"];
+      readonly availableArchitectures: readonly RawBinaryAdmission["architecture"][];
       readonly entryPoint: string;
       readonly entryPointSource: string;
+      readonly loadAddress: string;
+      readonly loadAddressSource: string;
       readonly executableRole?: never;
       readonly managed?: never;
     })

@@ -19,6 +19,8 @@ describe("Hopper provider capabilities", () => {
         availableArchitectures: ["arm"],
         entryPoint: "0x8000000",
         entryPointSource: "0x8000000",
+        loadAddress: "0x8000000",
+        loadAddressSource: "0x8000000",
       }),
     ).toMatchObject({
       status: "unsupported",

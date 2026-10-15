@@ -238,8 +238,9 @@ context. PSP/stack/device state remains unmodeled. See [DOS guide](https://githu
 
 For other headerless images (embedded firmware without ELF/Mach-O/PE/MZ
 headers), open with `format: "raw-binary"`, `architecture` (`x86`, `x86_64`,
-`arm`, `arm64`, or `6502`), and `entry_point` (`0x` hex). File offset 0 is mapped at
-that address. Hopper and IDA refuse this interpretation; Ghidra uses
+`arm`, `arm64`, `6502`, or `huc6280`), and `entry_point` (`0x` hex). Optional
+`load_address` (CLI `--load-address`) maps file offset 0 independently; omission
+defaults to the entry. The entry must be inside the mapped file. Hopper and IDA refuse this interpretation; Ghidra uses
 `BinaryLoader` with a little-endian generic language. Big-endian, Thumb-only,
 and Cortex-M variants are unsupported. `6502` selects NMOS 6502; the entry and
 complete file mapping must fit within `0x0000..0xffff`. 65C02, 65816, cartridge
@@ -285,7 +286,14 @@ opcode patterns or classify raw-byte matches as confirmed references. See the
 [console localization workflow](https://github.com/morluto/rea/blob/main/docs/console-localization.md)
 for seed syntax, optional processor sources, runtime cross-checks and limits.
 Game Boy needs the dedicated SM83 language; PCE uses an experimental HuC6280
-language whose T-mode/MMR/block-transfer semantics are incomplete.
+language with bounded T-mode arithmetic and logical block-transfer validation.
+PCE ROM analysis establishes only reset bank0 at `$E000..$FFFF`, not runtime MPR
+windows. For CD-loaded code, capture a paused logical-memory range through
+romlab and open that separate file as `raw-binary` / `huc6280` with its known
+load address and entry. Keep capture SHA-256, source disc/BIOS identities,
+PC/frame/cycle, MPR values and debugger source offsets separately. Snapshot-file
+offsets are not disc offsets. The map stays frozen; `TAM` does not remap it.
+REA neither captures emulator memory nor validates the external capture.
 
 Four specialized workflows support console ROM string extraction, pointer table
 analysis, and code cave discovery:

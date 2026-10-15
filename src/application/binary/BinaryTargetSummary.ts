@@ -10,6 +10,9 @@ export const binaryTargetSummary = (target: BinaryTarget) => ({
   kind: target.kind,
   sha256: target.sha256,
   architecture: target.architecture ?? null,
+  ...(target.format === "raw-binary"
+    ? { load_address: target.loadAddress }
+    : {}),
   ...(target.format === "raw-binary" || isConsoleBinaryTarget(target)
     ? { entry_point: target.entryPoint }
     : {}),

@@ -104,6 +104,7 @@ export const runDirectAnalysis = async (
     readonly formatHint?: ExecutableFormatHint;
     readonly architecture?: BinaryArchitecture;
     readonly entryPoint?: string;
+    readonly loadAddress?: string;
   } = {},
 ): Promise<JsonValue> =>
   withProcessCancellation(options.signal, (signal) =>
@@ -120,6 +121,9 @@ export const runDirectAnalysis = async (
       ...(options.entryPoint === undefined
         ? {}
         : { entryPoint: options.entryPoint }),
+      ...(options.loadAddress === undefined
+        ? {}
+        : { loadAddress: options.loadAddress }),
       ...(options.providerId === undefined
         ? {}
         : { providerId: options.providerId }),
@@ -216,6 +220,7 @@ const runAnalysis = async (
     readonly formatHint?: ExecutableFormatHint;
     readonly architecture?: BinaryArchitecture;
     readonly entryPoint?: string;
+    readonly loadAddress?: string;
   },
 ): Promise<JsonValue> => {
   const { logger, signal, snapshotPath } = options;
@@ -239,6 +244,9 @@ const runAnalysis = async (
       ...(options.entryPoint === undefined
         ? {}
         : { entryPoint: options.entryPoint }),
+      ...(options.loadAddress === undefined
+        ? {}
+        : { loadAddress: options.loadAddress }),
     });
     if (
       parsedTarget.ok &&
@@ -296,6 +304,9 @@ const runAnalysis = async (
         ...(options.entryPoint === undefined
           ? {}
           : { entryPoint: options.entryPoint }),
+        ...(options.loadAddress === undefined
+          ? {}
+          : { loadAddress: options.loadAddress }),
       });
       if (!prepared.ok) return cliError(prepared.error);
       const { snapshot } = prepared.value;
@@ -313,6 +324,9 @@ const runAnalysis = async (
           ...(options.entryPoint === undefined
             ? {}
             : { entryPoint: options.entryPoint }),
+          ...(options.loadAddress === undefined
+            ? {}
+            : { loadAddress: options.loadAddress }),
           ...(options.providerId === undefined
             ? {}
             : { providerId: options.providerId }),
@@ -356,6 +370,9 @@ const runAnalysis = async (
         ...(options.entryPoint === undefined
           ? {}
           : { entryPoint: options.entryPoint }),
+        ...(options.loadAddress === undefined
+          ? {}
+          : { loadAddress: options.loadAddress }),
         ...(snapshot === undefined ? {} : { snapshot }),
         ...(options.providerId === undefined
           ? {}
@@ -568,6 +585,7 @@ const prepareSnapshot = async (options: {
   readonly formatHint?: ExecutableFormatHint;
   readonly architecture?: BinaryArchitecture;
   readonly entryPoint?: string;
+  readonly loadAddress?: string;
   readonly snapshotPath: string | undefined;
   readonly signal: AbortSignal;
 }): Promise<
@@ -592,6 +610,9 @@ const prepareSnapshot = async (options: {
     ...(options.entryPoint === undefined
       ? {}
       : { entryPoint: options.entryPoint }),
+    ...(options.loadAddress === undefined
+      ? {}
+      : { loadAddress: options.loadAddress }),
   });
   if (!target.ok) return target;
   if (!snapshotMatchesTarget(loaded.value.target, target.value))

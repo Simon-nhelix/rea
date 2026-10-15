@@ -125,6 +125,9 @@ export class BinarySession
       const imported = this.importAnalysisSnapshot(options.snapshot);
       if (!imported.ok) return imported;
     }
+    // Retain the database identity while preserving this caller's current
+    // address spellings and other admitted source-selection facts.
+    this.#active = { ...retained, target };
     return ok(target);
   }
 

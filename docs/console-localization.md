@@ -89,11 +89,11 @@ installation. REA setup does not install them or modify Ghidra. Back up an
 existing processor module and compile with that installation's Sleigh compiler.
 Generated SLA files and ROMs do not belong in the repository.
 
-| Target    | Selected language            | Scope                                                                                                                                                                                                                                                           |
-| --------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| SNES      | `65816:LE:16:default`        | [Pinned source patch](https://github.com/morluto/rea/tree/main/bridge/ghidra/processors/65816). Restored call/return, stack, status and addressing semantics; dynamic mode boundaries remain limited.                                                           |
-| Game Boy  | `SM83:LE:16:default`         | [Dedicated SM83 source](https://github.com/morluto/rea/tree/main/bridge/ghidra/processors/sm83), rather than a Z80 mode patch. Hardware timing and mapper transitions are not emulated.                                                                         |
-| PC Engine | `HuC6280:LE:16:experimental` | [Experimental HuC6280 source](https://github.com/morluto/rea/tree/main/bridge/ghidra/processors/huc6280). T-mode arithmetic and logical block transfers have bounded validation. MPR remapping and CD-loaded code remain unresolved; pseudocode is provisional. |
+| Target    | Selected language            | Scope                                                                                                                                                                                                                                                                                                          |
+| --------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SNES      | `65816:LE:16:default`        | [Pinned source patch](https://github.com/morluto/rea/tree/main/bridge/ghidra/processors/65816). Restored call/return, stack, status and addressing semantics; dynamic mode boundaries remain limited.                                                                                                          |
+| Game Boy  | `SM83:LE:16:default`         | [Dedicated SM83 source](https://github.com/morluto/rea/tree/main/bridge/ghidra/processors/sm83), rather than a Z80 mode patch. Hardware timing and mapper transitions are not emulated.                                                                                                                        |
+| PC Engine | `HuC6280:LE:16:experimental` | [Experimental HuC6280 source](https://github.com/morluto/rea/tree/main/bridge/ghidra/processors/huc6280). T-mode arithmetic and logical block transfers have bounded validation. Explicit raw memory images can expose CD-loaded code; dynamic MPR remapping remains unresolved and pseudocode is provisional. |
 
 Missing dedicated processor IDs fail instead of falling back to stock Z80 or
 65C02. The source directories preserve upstream revisions, licenses, rebuild
@@ -117,12 +117,27 @@ fixed-window assumption selected file `$AB0F`, which contains unrelated data.
 The revised mapping leaves this destination unresolved. Its mapping scope is
 included in the analysis profile digest.
 
-CD-loaded game code requires a distinct memory snapshot and bank/source model;
-it cannot be analyzed as a cartridge bank inferred from a BIOS image. In the
-tested Ziria Korean build, the font hook at `$6286` calls `$8E88` in CD RAM
+CD-loaded game code requires a separate memory image. Capture a paused logical
+range in romlab, record MPR/source mappings and verify that CPU state did not
+change across the read. Analyze the file with `format=raw-binary`,
+`architecture=huc6280`, and distinct `load_address` and `entry_point` when needed.
+The [raw memory-image workflow](raw-binary.md#frozen-huc6280-memory-images) explains
+the required provenance and limits. REA reads that selected file; it does not
+acquire memory or attach to the emulator.
+
+In the tested Ziria Korean build, the font hook at `$6286` calls `$8E88` in CD RAM
 (RAM offsets `$2286` and `$4E88` with observed MPR3=`$81`, MPR4=`$82`).
-romlab established the call and return stack bytes; the cartridge workflow
-does not establish a disc-file origin or decompile those loaded routines.
+A capture of `$2000..$FFFF` maps those instructions to snapshot-file offsets
+`$4286` and `$6E88`. These offsets have different origins and must remain distinct.
+The snapshot does not establish a disc-file origin or a valid map after `TAM`.
+
+That font routine also rewrites its own bank and `TII` source operands. In one
+observed glyph path, character bytes `95 80` selected MPR6=`$68`, then
+`TII $D280,$33CD,#$0020` copied 32 bytes from Card RAM offset `$1280` to Work RAM
+offset `$13CD`, with identical source and destination bytes after the step.
+The earlier snapshot contained different operands. Its static pseudocode
+therefore explains the patching logic but cannot establish the later copy
+source. Capture after the code write and bank switch when inspecting that copy.
 
 ## Match static analysis to execution
 
@@ -189,3 +204,9 @@ are estimates for serialized tool requests/responses and exclude SDK framing,
 discovery schemas, prompts and billed agent usage; CPU
 and peak process-family memory require a separate measurement. A workflow pass
 does not waive processor limitations or prove gameplay behavior.
+
+For a caller-owned memory image, the manifest also accepts `format: "raw-binary"`,
+`architecture`, `entry_point`, optional `load_address`, and `load_image: true`
+to require independent load-image verification. Retain its external capture
+receipt alongside the report; a raw file's digest alone cannot establish the
+state from which it was acquired.

@@ -8,8 +8,8 @@ export interface GhidraRawBinaryLanguage {
 }
 
 /**
- * Map caller-visible CPU families to little-endian generic Ghidra
- * languages with a supported generic compiler specification. These are
+ * Bind caller-visible CPU families to little-endian Ghidra languages;
+ * HuC6280 uses its dedicated experimental processor. Compiler specifications are
  * analysis conventions, not evidence of the target's original compiler.
  * Big-endian, Thumb-only, and Cortex-M variants are out of scope.
  */
@@ -17,6 +17,12 @@ export const ghidraRawBinaryLanguage = (
   architecture: RawBinaryAdmission["architecture"],
 ): GhidraRawBinaryLanguage => {
   switch (architecture) {
+    case "huc6280":
+      return {
+        languageId: "HuC6280:LE:16:experimental",
+        compilerSpecId: "default",
+        defaultAddressSpace: "RAM",
+      };
     case "6502":
       return {
         languageId: "6502:LE:16:default",

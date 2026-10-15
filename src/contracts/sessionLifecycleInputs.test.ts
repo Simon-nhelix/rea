@@ -48,3 +48,22 @@ describe("open_binary raw-binary input contract", () => {
     ).toBe(false);
   });
 });
+
+it("accepts separate raw HuC6280 load/entry and rejects load addresses on console targets", () => {
+  expect(
+    openBinaryInputSchema.safeParse({
+      path: "/fixture/memory.bin",
+      format: "raw-binary",
+      architecture: "huc6280",
+      load_address: "0x4000",
+      entry_point: "0x6286",
+    }).success,
+  ).toBe(true);
+  expect(
+    openBinaryInputSchema.safeParse({
+      path: "/fixture/game.pce",
+      format: "pce",
+      load_address: "0x4000",
+    }).success,
+  ).toBe(false);
+});

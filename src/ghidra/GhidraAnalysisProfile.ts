@@ -168,13 +168,14 @@ export const resolveGhidraAnalysisProfile = async (
             installation.platform === "win32"
               ? "official-headless-script-v1"
               : "inspected-jvm-launch-support-v1",
-          load_image_evidence: "independent-raw-mapping-context-v4",
+          load_image_evidence: "independent-raw-load-entry-context-v5",
           jump_table_evidence: "typed-case-default-blocks-v1",
           decompiler_jump_loads: true,
           loader: "BinaryLoader",
           language_id: language.languageId,
           compiler_spec_id: language.compilerSpecId,
           language_selection: "caller-supplied-v1",
+          load_address: target.loadAddress,
           entry_point: target.entryPoint,
           entry_seed: "external-entry-and-function-before-analysis-v1",
           ...analyzerParameters,

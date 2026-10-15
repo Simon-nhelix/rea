@@ -321,6 +321,8 @@ const ensureLocalRom = async (): Promise<BinaryTarget> => {
     availableArchitectures: ["arm"],
     entryPoint: "0x0",
     entryPointSource: "0x0",
+    loadAddress: "0x0",
+    loadAddressSource: "0x0",
   };
   return localRomFixture.target;
 };
