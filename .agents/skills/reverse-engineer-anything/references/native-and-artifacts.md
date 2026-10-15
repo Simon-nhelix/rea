@@ -305,6 +305,23 @@ analysis, and code cave discovery:
   bytes without a disassembler session by default (`resolve_xrefs` defaults to
   false; CLI `--resolve-xrefs` opts in). Page large result sets with
   `next_cursor` / `cursor`; raw `bytes_hex` is omitted unless `include_hex` is set.
+  16-bit word text: `sjis-le16` (Shift-JIS code in a little-endian word) and
+  `tile-le16`/`tile-be16` (tilemap words; `.tbl` keys are tile indexes,
+  `tile_mask` default `0x0FFF`, optional `tile_attribute`), with
+  `terminator_word`, `newline_word` and `word_parity` (default both offset
+  parities). Range-scan noise filters: `fullwidth_only`, `min_kana`,
+  `max_level2_kanji_ratio`, `min_text_score` (heuristic `text_score`, shown with
+  `include_score`) and `require_terminator`; `dedupe` returns each distinct byte
+  string once with `occurrences`. The CLI `--output <file>` writes every match
+  as JSON Lines without limits (`--overwrite` replaces an existing file).
+- Unrecognized files and CD images: the CLI ROM commands read a file whose
+  format is not recognized as plain bytes (`source.reason:
+  "format_not_recognized"`), or on request with `--target-format data`;
+  addresses are then file offsets. A `.cue` sheet becomes its first data
+  track's 2048-byte user data, and matches add `sector`, `offset_in_sector`
+  and absolute `lba`. `rea inspect-disc-image <cue|iso>` reports the track
+  layout and the PC Engine CD IPL record. See
+  [console localization](https://github.com/morluto/rea/blob/main/docs/console-localization.md#disc-images-and-unrecognized-files).
 - `discover_pointer_tables` (CLI `rea discover-pointer-tables <path>`): scan ROM
   regions to automatically discover candidate 16/24/32-bit string pointer tables
   with entry counts, unique target counts, string byte-width triage statistics

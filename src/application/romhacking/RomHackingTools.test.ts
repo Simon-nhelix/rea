@@ -9,11 +9,19 @@ import {
   executeSearchRomStrings,
 } from "./RomHackingTools.js";
 import { ok } from "../../domain/result.js";
+import {
+  searchRomStringsInputSchema,
+  type SearchRomStringsInput,
+} from "../../domain/romHacking.js";
 import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
 import {
   createAnalysisExecution,
   type AnalysisOperationPort,
 } from "../AnalysisProvider.js";
+
+const searchInput = (
+  input: Partial<SearchRomStringsInput>,
+): SearchRomStringsInput => searchRomStringsInputSchema.parse(input);
 
 const mockProvider = {
   id: "ghidra",
@@ -68,16 +76,19 @@ describe("RomHackingTools workflows", () => {
       },
     };
 
-    const result = await executeSearchRomStrings(mockAnalysis, {
-      query: "勇者",
-      encoding: "sjis",
-      length: 4096,
-      min_length: 2,
-      terminator_byte: 0x00,
-      max_results: 10,
-      resolve_xrefs: true,
-      include_hex: true,
-    });
+    const result = await executeSearchRomStrings(
+      mockAnalysis,
+      searchInput({
+        query: "勇者",
+        encoding: "sjis",
+        length: 4096,
+        min_length: 2,
+        terminator_byte: 0x00,
+        max_results: 10,
+        resolve_xrefs: true,
+        include_hex: true,
+      }),
+    );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.value).toEqual({
@@ -344,7 +355,7 @@ describe("RomHackingTools Mode A local ROM search", () => {
     localRomFixture.providerCalls = 0;
     const result = await executeSearchRomStrings(
       countingAnalysis,
-      {
+      searchInput({
         query: "魔法",
         encoding: "sjis",
         length: 4096,
@@ -353,7 +364,7 @@ describe("RomHackingTools Mode A local ROM search", () => {
         max_results: 10,
         resolve_xrefs: false,
         include_hex: false,
-      },
+      }),
       undefined,
       target,
     );
@@ -376,8 +387,8 @@ describe("RomHackingTools Mode A local ROM search", () => {
 
   it("pages range_scan with an exact truncated probe and cursor", async () => {
     localRomFixture.providerCalls = 0;
-    const pageInput = {
-      encoding: "sjis" as const,
+    const pageInput = searchInput({
+      encoding: "sjis",
       start_offset: 0x100,
       length: 0x30,
       min_length: 2,
@@ -385,7 +396,7 @@ describe("RomHackingTools Mode A local ROM search", () => {
       max_results: 2,
       resolve_xrefs: false,
       include_hex: false,
-    };
+    });
     const first = await executeSearchRomStrings(
       countingAnalysis,
       pageInput,
@@ -639,16 +650,16 @@ describe("RomHackingTools provider search cursor", () => {
         return ok(createAnalysisExecution({}, mockProvider));
       },
     };
-    const baseInput = {
+    const baseInput = searchInput({
       query: "勇者",
-      encoding: "sjis" as const,
+      encoding: "sjis",
       length: 4096,
       min_length: 2,
       terminator_byte: 0x00,
       max_results: 1,
       resolve_xrefs: false,
       include_hex: false,
-    };
+    });
     const first = await executeSearchRomStrings(mockAnalysis, baseInput);
     expect(first.ok).toBe(true);
     if (!first.ok) return;

@@ -205,7 +205,9 @@ explicit path or endpoint and do not need it.
   `find_code_caves` for string/table/cave workflows (these run directly on local
   ROM bytes by default; pass `resolve_xrefs: true` only when cross-references
   are needed), or `open_binary` for
-  Ghidra decompilation and cross-references. See
+  Ghidra decompilation and cross-references. CD images (`.cue`) and files of
+  unknown format run through the CLI in plain-byte mode
+  (`--target-format data`). See
   [references/native-and-artifacts.md](references/native-and-artifacts.md).
 - Native executable, library, or analysis database: `open_binary`, then
   use focused analysis tools directly; call `binary_overview` when metadata or

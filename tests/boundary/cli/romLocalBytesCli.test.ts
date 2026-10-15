@@ -1,0 +1,115 @@
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+import { expect } from "vitest";
+
+import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { cliTest } from "../../support/cli/cliFixture.js";
+
+/** sjis-le16 「どう」 + FFFF, then 「かな」 FFFE 「よ」 FFFF at an odd offset. */
+const DISC_TEXT = Buffer.from("c782a482ffff00a982c882feffe682ffff", "hex");
+
+cliTest(
+  "reads unrecognized files as plain bytes and streams every match to JSON Lines",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-rom-data-cli-");
+    const environment = {
+      HOME: root,
+      XDG_CONFIG_HOME: root,
+      XDG_CACHE_HOME: root,
+    };
+    const image = Buffer.alloc(4096);
+    DISC_TEXT.copy(image, 0x10);
+    DISC_TEXT.copy(image, 0x810);
+    const path = join(root, "track.iso");
+    await writeFile(path, image);
+
+    const page = await cli.run({
+      arguments: [
+        "search-rom-strings",
+        path,
+        "--encoding",
+        "sjis-le16",
+        "--terminator-word",
+        "0xFFFF",
+        "--newline-word",
+        "0xFFFE",
+        "--min-length",
+        "1",
+        "--start-offset",
+        "0",
+        "--length",
+        "4096",
+        "--dedupe",
+        "--json",
+      ],
+      environment,
+    });
+    expect(page.exitCode).toBe(0);
+    expect(page.json).toMatchObject({
+      subject: { format: "file" },
+      normalized_result: {
+        mode: "range_scan",
+        matches: [
+          {
+            text: "どう",
+            sector: 0,
+            offset_in_sector: 0x10,
+            occurrences: [0x10, 0x810],
+          },
+          { text: "かな\nよ", occurrences: [0x17, 0x817] },
+        ],
+        source: { mode: "data", reason: "format_not_recognized" },
+      },
+    });
+
+    const output = join(root, "strings.jsonl");
+    const exported = await cli.run({
+      arguments: [
+        "search-rom-strings",
+        path,
+        "--target-format",
+        "data",
+        "--encoding",
+        "sjis-le16",
+        "--terminator-word",
+        "0xFFFF",
+        "--newline-word",
+        "0xFFFE",
+        "--min-length",
+        "1",
+        "--output",
+        output,
+        "--json",
+      ],
+      environment,
+    });
+    expect(exported.exitCode).toBe(0);
+    expect(exported.json).toMatchObject({
+      normalized_result: {
+        source: { mode: "data", reason: "requested" },
+        output: { path: output, format: "jsonl", records: 4 },
+      },
+    });
+    const records = (await readFile(output, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { file_offset: number });
+    expect(records.map((record) => record.file_offset)).toEqual([
+      0x10, 0x17, 0x810, 0x817,
+    ]);
+
+    const inspected = await cli.run({
+      arguments: ["inspect-disc-image", path, "--json"],
+      environment,
+    });
+    expect(inspected.exitCode).toBe(0);
+    expect(inspected.json).toMatchObject({
+      operation: "inspect_disc_image",
+      normalized_result: {
+        source: { mode: "data", sector_size: 2048 },
+        pce_cd_ipl: null,
+      },
+    });
+  },
+);

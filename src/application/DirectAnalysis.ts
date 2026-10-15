@@ -1,8 +1,7 @@
 import type { ExecutableFormatHint } from "../domain/dosCom.js";
-import {
-  isConsoleBinaryTarget,
-  type BinaryArchitecture,
-  type BinaryTarget,
+import type {
+  BinaryArchitecture,
+  BinaryTarget,
 } from "../domain/binaryTargetTypes.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type { DirectAnalysisDependencies } from "./DirectAnalysisDependencies.js";
@@ -29,6 +28,8 @@ import { access } from "node:fs/promises";
 import { readAnalysisSnapshot } from "./binary/AnalysisSnapshotFiles.js";
 import { requiresNativeSourceAdmissionBeforeReplay } from "./binary/AnalysisSnapshotCache.js";
 import { parseBinaryTarget } from "./BinaryTargetResolver.js";
+import { isLocalRomToolName } from "./romhacking/LocalRomToolNames.js";
+import type { RomStringExportTarget } from "./romhacking/LocalRomCommands.js";
 import {
   snapshotEvidenceForQuery,
   snapshotMatchesTarget,
@@ -105,6 +106,10 @@ export const runDirectAnalysis = async (
     readonly architecture?: BinaryArchitecture;
     readonly entryPoint?: string;
     readonly loadAddress?: string;
+    /** Read the file as plain bytes (ROM text tools; `--target-format data`). */
+    readonly localBytes?: boolean;
+    /** Write every search_rom_strings match to a JSON Lines file. */
+    readonly stringExport?: RomStringExportTarget;
   } = {},
 ): Promise<JsonValue> =>
   withProcessCancellation(options.signal, (signal) =>
@@ -112,6 +117,12 @@ export const runDirectAnalysis = async (
       logger: options.logger ?? silentLogger,
       snapshotPath: options.snapshotPath,
       signal,
+      ...(options.localBytes === undefined
+        ? {}
+        : { localBytes: options.localBytes }),
+      ...(options.stringExport === undefined
+        ? {}
+        : { stringExport: options.stringExport }),
       ...(options.formatHint === undefined
         ? {}
         : { formatHint: options.formatHint }),
@@ -221,68 +232,54 @@ const runAnalysis = async (
     readonly architecture?: BinaryArchitecture;
     readonly entryPoint?: string;
     readonly loadAddress?: string;
+    readonly localBytes?: boolean;
+    readonly stringExport?: RomStringExportTarget;
   },
 ): Promise<JsonValue> => {
   const { logger, signal, snapshotPath } = options;
-  if (
-    (tool === "search_rom_strings" ||
-      tool === "scan_pointer_table" ||
-      tool === "discover_pointer_tables" ||
-      tool === "find_code_caves") &&
-    arguments_.resolve_xrefs !== true &&
-    snapshotPath === undefined &&
-    options.providerId === undefined
-  ) {
-    const parsedTarget = await parseBinaryTarget(path, {
-      signal,
-      ...(options.formatHint === undefined
-        ? {}
-        : { formatHint: options.formatHint }),
-      ...(options.architecture === undefined
-        ? {}
-        : { architecture: options.architecture }),
-      ...(options.entryPoint === undefined
-        ? {}
-        : { entryPoint: options.entryPoint }),
-      ...(options.loadAddress === undefined
-        ? {}
-        : { loadAddress: options.loadAddress }),
-    });
-    if (
-      parsedTarget.ok &&
-      parsedTarget.value.kind === "executable" &&
-      (isConsoleBinaryTarget(parsedTarget.value) ||
-        parsedTarget.value.format === "raw-binary")
-    ) {
-      const { EnhancedTools } = await import("./EnhancedTools.js");
-      const noopPort = {
-        execute: () =>
-          Promise.resolve(
-            err(
-              new AnalysisInputError(tool, {
-                userMessage:
-                  "Provider operation is unavailable during local ROM fast-path execution.",
-              }),
-            ),
-          ),
-      };
-      const result = await new EnhancedTools(
-        noopPort,
-        parsedTarget.value,
-      ).execute(tool, arguments_, signal);
-      if (result.ok) {
+  if (isLocalRomToolName(tool)) {
+    const localOnly =
+      options.localBytes === true || options.stringExport !== undefined;
+    const usesProvider =
+      arguments_.resolve_xrefs === true ||
+      snapshotPath !== undefined ||
+      options.providerId !== undefined;
+    if (localOnly && usesProvider)
+      return cliError(
+        new AnalysisInputError(tool, {
+          userMessage:
+            "--target-format data and --output read local bytes only; omit --resolve-xrefs, --provider and --snapshot.",
+        }),
+      );
+    if (!usesProvider) {
+      const { runLocalRomTool } =
+        await import("./romhacking/LocalRomCommands.js");
+      const local = await runLocalRomTool({
+        path,
+        tool,
+        arguments: arguments_,
+        signal,
+        localBytes: options.localBytes === true,
+        formatHint: options.formatHint,
+        architecture: options.architecture,
+        entryPoint: options.entryPoint,
+        loadAddress: options.loadAddress,
+        exportTo: options.stringExport,
+      });
+      if (local !== undefined) {
+        if (!local.ok) return cliError(local.error);
         return createWorkflowEvidence({
-          target: parsedTarget.value,
+          target: local.value.subject,
           operation: tool,
-          parameters: arguments_,
-          result: result.value,
+          parameters:
+            options.stringExport === undefined
+              ? arguments_
+              : { ...arguments_, output: options.stringExport.path },
+          result: local.value.result,
           upstreamProfile: undefined,
-          upstreamLimitations: [
-            "Executed directly on local ROM bytes with resolve_xrefs=false (disassembler session skipped).",
-          ],
+          upstreamLimitations: local.value.limitations,
         });
       }
-      return cliError(result.error);
     }
   }
   const config = dependencies.readConfiguration();

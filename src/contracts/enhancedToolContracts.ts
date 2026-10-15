@@ -88,7 +88,7 @@ export const ENHANCED_TOOL_CONTRACTS = [
   ),
   enhanced(
     "search_rom_strings",
-    "Search or scan console ROM memory for localized text in Shift-JIS (sjis/cp932), EUC-JP, UTF-8, UTF-16LE/BE, ASCII, or custom .tbl character tables. Returns virtual addresses, ROM file offsets, raw hex bytes, decoded text, and incoming cross-references for localization and ROM hacking workflows.",
+    "Search or scan console ROM memory for localized text in Shift-JIS (sjis/cp932), EUC-JP, UTF-8, UTF-16LE/BE, ASCII, custom .tbl character tables, or 16-bit words (sjis-le16 byte-swapped Shift-JIS, tile-le16/be16 tilemap words through a tile .tbl). Range scans can filter noise (fullwidth_only, min_kana, max_level2_kanji_ratio, min_text_score, require_terminator) and dedupe identical strings with occurrences. Returns virtual addresses, ROM file offsets, raw hex bytes, decoded text, and incoming cross-references for localization and ROM hacking workflows.",
     enhancedInputSchemas.search_rom_strings,
   ),
   enhanced(

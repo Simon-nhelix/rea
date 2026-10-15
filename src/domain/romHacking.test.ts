@@ -7,12 +7,17 @@ import {
   findCodeCavesInSlice,
   findCodeCavesInSliceTopK,
   formatHexPattern,
+  formatRomScanCursor,
   normalizeRomTextEncoding,
   parseCustomCharTable,
+  parseRomScanCursor,
   readPointerValue,
+  resolveRomWordFormat,
   scanPointerTableInputSchema,
+  scanRomStrings,
   searchRomStringsInputSchema,
 } from "./romHacking.js";
+import { NO_ROM_TEXT_FILTERS } from "./romTextQuality.js";
 
 describe("romHacking input defaults", () => {
   it("defaults to provider-free Mode A with compact output", () => {
@@ -217,5 +222,214 @@ describe("romHacking budgets and code caves", () => {
     });
     expect(top.total).toBe(3);
     expect(top.caves.map((cave) => cave.byte_length)).toEqual([96, 48]);
+  });
+});
+
+describe("16-bit word encodings", () => {
+  /** sjis-le16 words: どう = 82C7 82A4 stored as C7 82 A4 82. */
+  const le16 = (...words: number[]): number[] =>
+    words.flatMap((word) => [word & 0xff, word >>> 8]);
+  const lodossFormat = () => {
+    const format = resolveRomWordFormat({
+      encoding: "sjis-le16",
+      terminatorByte: 0x00,
+      terminatorWord: 0xffff,
+      newlineWord: 0xfffe,
+    });
+    if (!format.ok || format.value === undefined)
+      throw new Error("format did not resolve");
+    return format.value;
+  };
+
+  it("encodes and decodes byte-swapped Shift-JIS words with control words", () => {
+    const words = lodossFormat();
+    const encoded = encodeRomQueryString(
+      "どう\nか",
+      "sjis-le16",
+      undefined,
+      words,
+    );
+    expect(encoded.ok && formatHexPattern(encoded.value)).toBe(
+      "c7 82 a4 82 fe ff a9 82",
+    );
+    const bytes = Uint8Array.from([
+      ...le16(0x82c7, 0x82a4, 0xfffe, 0x82a9, 0xffff),
+      0x41,
+    ]);
+    expect(
+      decodeRomStringFromBytes(bytes, "sjis-le16", 0x00, undefined, words),
+    ).toMatchObject({ decoded: "どう\nか", byteLength: 10 });
+    // Single-byte characters have no word form.
+    expect(encodeRomQueryString("A", "sjis-le16", undefined, words).ok).toBe(
+      false,
+    );
+  });
+
+  it("scans both word parities and resumes pages without changing boundaries", () => {
+    const words = lodossFormat();
+    // Even-aligned 「どう」 at 0, odd-aligned 「かな」 at 7, even 「よ」 at 14.
+    const bytes = Uint8Array.from([
+      ...le16(0x82c7, 0x82a4, 0xffff),
+      0x00,
+      ...le16(0x82a9, 0x82c8, 0xffff),
+      0x00,
+      ...le16(0x82e6, 0xffff),
+    ]);
+    const scan = {
+      bytes,
+      baseAddress: 0n,
+      encoding: "sjis-le16" as const,
+      minLength: 1,
+      terminatorByte: 0x00,
+      words,
+      includeRawHex: false,
+      requireTerminator: true,
+    };
+    const all = [...scanRomStrings(scan)];
+    expect(all.map((item) => [item.offsetInBuffer, item.decoded])).toEqual([
+      [0, "どう"],
+      [7, "かな"],
+      [14, "よ"],
+    ]);
+    expect(all.every((item) => item.terminated)).toBe(true);
+    expect(
+      [...scanRomStrings({ ...scan, wordParity: "even" })].map(
+        (item) => item.decoded,
+      ),
+    ).toEqual(["どう", "よ"]);
+
+    // Page 1 = first item; page 2 resumes from the second item's cursor.
+    const cursor = formatRomScanCursor(all[1]!.resume);
+    expect(cursor).toBe("w14.7");
+    const resume = parseRomScanCursor(cursor, {
+      word: true,
+      bufferLength: bytes.length,
+      parityOrigin: 0,
+    });
+    expect(resume.ok).toBe(true);
+    if (!resume.ok) return;
+    expect(
+      [...scanRomStrings({ ...scan, resume: resume.value })].map(
+        (item) => item.decoded,
+      ),
+    ).toEqual(["かな", "よ"]);
+    // A head whose parity does not match is rejected.
+    expect(
+      parseRomScanCursor("w7.14", {
+        word: true,
+        bufferLength: bytes.length,
+        parityOrigin: 0,
+      }).ok,
+    ).toBe(false);
+  });
+});
+
+describe("tilemap word encodings", () => {
+  it("decodes tilemap words through a tile table with attribute rules", () => {
+    const table = parseCustomCharTable("0110=0\n0111=1\n0170=ア\n0171=イ");
+    expect(table.ok).toBe(true);
+    if (!table.ok) return;
+    const anyAttribute = resolveRomWordFormat({
+      encoding: "tile-le16",
+      terminatorByte: 0x00,
+      customTable: table.value,
+    });
+    expect(anyAttribute.ok).toBe(true);
+    if (!anyAttribute.ok || anyAttribute.value === undefined) return;
+    // F170 F171 0000 | E110 F111 0000: the second string changes palette.
+    const bytes = Uint8Array.from([
+      0x70, 0xf1, 0x71, 0xf1, 0x00, 0x00, 0x10, 0xe1, 0x11, 0xf1, 0x00, 0x00,
+    ]);
+    const found = [
+      ...scanRomStrings({
+        bytes,
+        baseAddress: 0n,
+        encoding: "tile-le16",
+        minLength: 1,
+        terminatorByte: 0x00,
+        words: anyAttribute.value,
+        wordParity: "even",
+      }),
+    ];
+    expect(
+      found.map((item) => [item.offsetInBuffer, item.decoded, item.terminated]),
+    ).toEqual([
+      [0, "アイ", true],
+      [6, "0", false],
+      [8, "1", true],
+    ]);
+    const fixed = resolveRomWordFormat({
+      encoding: "tile-le16",
+      terminatorByte: 0x00,
+      tileAttribute: 0xf000,
+      customTable: table.value,
+    });
+    if (!fixed.ok || fixed.value === undefined) throw new Error("no format");
+    const query = encodeRomQueryString(
+      "アイ",
+      "tile-le16",
+      table.value,
+      fixed.value,
+    );
+    expect(query.ok && formatHexPattern(query.value)).toBe("70 f1 71 f1");
+  });
+
+  it("rejects word options that do not apply to the chosen encoding", () => {
+    expect(
+      resolveRomWordFormat({
+        encoding: "sjis",
+        terminatorByte: 0x00,
+        terminatorWord: 0xffff,
+      }).ok,
+    ).toBe(false);
+    expect(
+      resolveRomWordFormat({
+        encoding: "sjis-le16",
+        terminatorByte: 0x00,
+        terminatorWord: 0xffff,
+        newlineWord: 0xffff,
+      }).ok,
+    ).toBe(false);
+    expect(
+      resolveRomWordFormat({ encoding: "tile-be16", terminatorByte: 0x00 }).ok,
+    ).toBe(false);
+    const table = parseCustomCharTable("1110=x");
+    if (!table.ok) throw new Error("table");
+    // Key 0x1110 has bits outside the default 12-bit tile mask.
+    expect(
+      resolveRomWordFormat({
+        encoding: "tile-be16",
+        terminatorByte: 0x00,
+        customTable: table.value,
+      }).ok,
+    ).toBe(false);
+  });
+});
+
+describe("range-scan noise filters", () => {
+  it("lets fullwidth_only split ASCII noise away from Shift-JIS text", () => {
+    // "mT" + 「勇者」 + NUL: without the filter the noise prefix sticks.
+    const bytes = Uint8Array.from([0x6d, 0x54, 0x97, 0x45, 0x8e, 0xd2, 0x00]);
+    const scan = {
+      bytes,
+      baseAddress: 0n,
+      encoding: "sjis" as const,
+      minLength: 2,
+      terminatorByte: 0x00,
+    };
+    expect([...scanRomStrings(scan)].map((item) => item.decoded)).toEqual([
+      "mT勇者",
+    ]);
+    const filtered = [
+      ...scanRomStrings({
+        ...scan,
+        filters: { ...NO_ROM_TEXT_FILTERS, fullwidthOnly: true },
+        measure: true,
+      }),
+    ];
+    expect(filtered.map((item) => [item.offsetInBuffer, item.decoded])).toEqual(
+      [[2, "勇者"]],
+    );
+    expect(filtered[0]?.score).toBeGreaterThan(0.7);
   });
 });

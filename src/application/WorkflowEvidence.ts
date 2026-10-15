@@ -19,6 +19,7 @@ import {
   createEvidence,
   type Evidence,
   type EvidenceLocation,
+  type EvidenceSubjectTarget,
 } from "../domain/evidence.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type { UnknownRegistryPort } from "./investigation/InvestigationRecordPort.js";
@@ -57,7 +58,7 @@ export const executeComposedWorkflow = async (
 
 /** Build the shared Evidence record for a successful composed binary workflow. */
 export const createWorkflowEvidence = (input: {
-  readonly target: BinaryTarget | undefined;
+  readonly target: BinaryTarget | EvidenceSubjectTarget | undefined;
   readonly operation: AnalysisOperation;
   readonly parameters: Readonly<Record<string, JsonValue>>;
   readonly result: JsonValue;

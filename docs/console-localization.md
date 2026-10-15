@@ -20,6 +20,78 @@ node scripts/rea.mjs search-rom-strings /path/game.sfc \
   --no-resolve-xrefs --format json
 ```
 
+### Disc images and unrecognized files
+
+The four ROM text tools also read files that are not admitted as an executable
+or console ROM. `--target-format data` reads plain bytes: addresses are file
+offsets and no CPU mapping is assumed. When the format is not recognized and no
+`--target-format` is given, the CLI falls back to the same mode and reports
+`source.reason: "format_not_recognized"`. A `.cue` sheet is read as the
+concatenated 2048-byte user data of its first data track (MODE1/2048,
+MODE1/2352, or MODE2/2352 Form 1). Matches then carry `sector`
+(track-relative, the `.iso` sector number), `offset_in_sector`, and `lba`
+(absolute disc LBA); `source.disc` names the image file, its SHA-256, the
+first LBA, other data tracks, and sectors whose sync or mode byte did not
+match. A `.iso` whose size is a multiple of 2048 reports `sector` and
+`offset_in_sector` only. Writing patched sectors back (EDC/ECC) is out of scope.
+
+`inspect-disc-image` reports the cue layout and, when sector 1 carries the
+`PC Engine CD-ROM SYSTEM` ID, the PC Engine CD IPL boot record (IPLBLK,
+IPLBLN, IPLSTA, IPLJMP, MPR2..6, opening graphics/ADPCM fields, program name):
+
+```sh
+node scripts/rea.mjs inspect-disc-image "/path/Game.cue" --format json
+```
+
+Some games store text in 16-bit words. `sjis-le16` reads a two-byte Shift-JIS
+code from a little-endian word (`C7 82` = `82C7` = 「ど」). `tile-le16` and
+`tile-be16` read tilemap words such as PC Engine BAT entries: `word &
+tile_mask` (default `0x0FFF`) is a tile index looked up in a `.tbl` whose keys
+are tile indexes (`0170=ア`), and `tile_attribute` (for example `0xF000`)
+fixes the remaining palette/flip bits; without it each string keeps one
+consistent attribute value. `--terminator-word` and `--newline-word` set
+16-bit control words. Word scans examine both offset parities by default
+(`--word-parity both`) because strings can start at odd offsets; their cursors
+keep one restart point per parity.
+
+Range scans accept caller-selected noise filters: `--fullwidth-only` (single-byte
+characters end a string), `--min-kana N`, `--max-level2-kanji-ratio R` (share of
+JIS level-2 kanji among a string's kanji), `--min-text-score S`, and
+`--require-terminator`. `text_score` (shown with `--include-score`) is a
+heuristic mean of per-character weights; it is not proof that bytes are text or
+data. Placeholder symbols such as `￥` and `§` lower it. `--dedupe` returns each
+distinct byte string once with `occurrences` (every file offset) across the
+whole selected range.
+
+The CLI `--output <file>` writes every match as JSON Lines without page or
+result limits; without a query or range it scans the whole file. The file is
+staged beside the destination and published only when complete; an existing
+file is replaced only with `--overwrite`. The command prints a summary with the
+record count and the output's SHA-256. MCP keeps cursor paging.
+
+For example, on Record of Lodoss War II (PC Engine Super CD-ROM², 46,649,344
+bytes of user data):
+
+```sh
+node scripts/rea.mjs search-rom-strings "/path/Lodoss II.cue" \
+  --encoding sjis-le16 --terminator-word 0xFFFF --newline-word 0xFFFE \
+  --min-length 1 --require-terminator --min-text-score 0.6 \
+  --output lodoss.jsonl --format json
+node scripts/rea.mjs search-rom-strings lodoss2_02.iso \
+  --encoding tile-le16 --table-path ui_tiles.tbl --tile-attribute 0xF000 \
+  --terminator-word 0 --require-terminator --dedupe --output tiles.jsonl
+```
+
+In that game the first command kept 73,520 strings. The project's verified
+manuscript lists 70,636 string locations; 70,364 of them start at a returned
+offset. The misses are 8 distinct strings, mostly short battle messages built
+from placeholders such as `￥の攻撃§`, which fall below the score. With
+`--require-terminator` alone, 82,175 strings contain all 70,636 locations
+(70,528 start exactly; the others follow data bytes that the project's
+extractor trims). The tile scan found the same 37,118 BAT word lists (503
+distinct) as the project's own scanner. These counts describe one game and one
+table; they are not general precision figures.
+
 Use Ghidra when the question needs decoded instructions or analyzed references:
 
 ```sh

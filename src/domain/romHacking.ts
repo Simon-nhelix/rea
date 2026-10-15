@@ -1,5 +1,17 @@
 import { z } from "zod";
 import { err, ok, type Result } from "./result.js";
+import {
+  getSjisDoubleByteDecodeTable,
+  getSjisEncodeMap,
+} from "./shiftJisTables.js";
+import {
+  measureRomText,
+  NO_ROM_TEXT_FILTERS,
+  romTextFiltersActive,
+  romTextPassesFilters,
+  type RomTextFilters,
+} from "./romTextQuality.js";
+import { DATA_TRACK_MODES, type DataTrackMode } from "./discImage.js";
 
 /** Supported ROM text encodings for localization and string extraction. */
 export const ROM_TEXT_ENCODINGS = [
@@ -14,6 +26,9 @@ export const ROM_TEXT_ENCODINGS = [
   "utf16be",
   "ascii",
   "tbl",
+  "sjis-le16",
+  "tile-le16",
+  "tile-be16",
 ] as const;
 
 export type RomTextEncoding = (typeof ROM_TEXT_ENCODINGS)[number];
@@ -26,7 +41,244 @@ export type CanonicalRomTextEncoding =
   | "utf-16le"
   | "utf-16be"
   | "ascii"
-  | "tbl";
+  | "tbl"
+  | "sjis-le16"
+  | "tile-le16"
+  | "tile-be16";
+
+/** Encodings whose text unit is one 16-bit word (scanned per word parity). */
+export const WORD_ROM_TEXT_ENCODINGS = [
+  "sjis-le16",
+  "tile-le16",
+  "tile-be16",
+] as const;
+type WordRomTextEncoding = (typeof WORD_ROM_TEXT_ENCODINGS)[number];
+
+export const isWordRomTextEncoding = (
+  encoding: RomTextEncoding,
+): encoding is WordRomTextEncoding =>
+  (WORD_ROM_TEXT_ENCODINGS as readonly string[]).includes(encoding);
+
+/** Encodings that decode through a caller-supplied character table. */
+export const requiresRomCharTable = (encoding: RomTextEncoding): boolean =>
+  encoding === "tbl" || encoding === "tile-le16" || encoding === "tile-be16";
+
+/**
+ * Resolved interpretation of 16-bit text words. `sjis-le16` stores a two-byte
+ * Shift-JIS code as a little-endian word (bytes C7 82 = code 82C7 = 「ど」).
+ * `tile-le16`/`tile-be16` store tilemap words: `word & mask` is a tile index
+ * looked up in the character table and the remaining bits are attributes
+ * (palette, flips, priority).
+ */
+export interface RomWordFormat {
+  readonly encoding: WordRomTextEncoding;
+  readonly littleEndian: boolean;
+  /** Word value that ends a string, or null for none. */
+  readonly terminatorWord: number | null;
+  /** Word value decoded as "\n" inside a string, or null for none. */
+  readonly newlineWord: number | null;
+  readonly tile?: {
+    readonly mask: number;
+    /** Required attribute bits, or null to require one consistent value per string. */
+    readonly attribute: number | null;
+    readonly characters: ReadonlyMap<number, string>;
+  };
+}
+
+/** Default PC Engine BAT layout: 12-bit tile index, palette in bits 12..15. */
+export const DEFAULT_TILE_MASK = 0x0fff;
+
+/**
+ * Normalize word-format options once at the request boundary. Byte encodings
+ * reject word options instead of silently ignoring them; without
+ * terminator_word, the terminator byte doubled (00 00 by default) ends words.
+ */
+export const resolveRomWordFormat = (input: {
+  readonly encoding: RomTextEncoding;
+  readonly terminatorByte: number | null;
+  readonly terminatorWord?: number | null | undefined;
+  readonly newlineWord?: number | undefined;
+  readonly tileMask?: number | undefined;
+  readonly tileAttribute?: number | null | undefined;
+  readonly customTable?: CustomCharTable | undefined;
+}): Result<RomWordFormat | undefined, string> => {
+  const encoding = normalizeRomTextEncoding(input.encoding);
+  if (!isWordRomTextEncoding(encoding)) {
+    if (
+      input.terminatorWord !== undefined ||
+      input.newlineWord !== undefined ||
+      input.tileMask !== undefined ||
+      input.tileAttribute !== undefined
+    )
+      return err(
+        "terminator_word, newline_word, tile_mask and tile_attribute apply only to the 16-bit word encodings sjis-le16, tile-le16 and tile-be16",
+      );
+    return ok(undefined);
+  }
+  const terminatorWord =
+    input.terminatorWord !== undefined
+      ? input.terminatorWord
+      : input.terminatorByte === null
+        ? null
+        : input.terminatorByte * 0x101;
+  const newlineWord = input.newlineWord ?? null;
+  if (newlineWord !== null && newlineWord === terminatorWord)
+    return err("newline_word must differ from the terminator word");
+  if (encoding === "sjis-le16") {
+    if (input.tileMask !== undefined || input.tileAttribute !== undefined)
+      return err("tile_mask and tile_attribute apply only to tile encodings");
+    return ok({ encoding, littleEndian: true, terminatorWord, newlineWord });
+  }
+  const mask = input.tileMask ?? DEFAULT_TILE_MASK;
+  if (mask === 0 || mask > 0xffff)
+    return err("tile_mask must select 1..16 bits of the 16-bit word");
+  const attribute = input.tileAttribute ?? null;
+  if (attribute !== null && (attribute & mask) !== 0)
+    return err("tile_attribute must not overlap tile_mask bits");
+  const table = input.customTable;
+  if (table === undefined)
+    return err(
+      `Encoding '${encoding}' requires table_path or table_text mapping tile indexes to text`,
+    );
+  if (table.endTokens.size > 0)
+    return err(
+      "Tile tables map tile indexes only; use terminator_word instead of .tbl end markers",
+    );
+  const characters = new Map<number, string>();
+  for (const [length, bucket] of table.decodeByLength) {
+    if (length > 2)
+      return err("Tile table keys must be 1- or 2-byte tile indexes");
+    for (const [key, text] of bucket) {
+      const tile = Number(key);
+      if ((tile & ~mask) !== 0)
+        return err(
+          `Tile table key 0x${tile.toString(16)} has bits outside tile_mask 0x${mask.toString(16)}`,
+        );
+      characters.set(tile, text);
+    }
+  }
+  return ok({
+    encoding,
+    littleEndian: encoding === "tile-le16",
+    terminatorWord,
+    newlineWord,
+    tile: { mask, attribute, characters },
+  });
+};
+
+const readWord = (
+  bytes: Uint8Array,
+  at: number,
+  littleEndian: boolean,
+): number =>
+  littleEndian
+    ? (bytes[at] ?? 0) | ((bytes[at + 1] ?? 0) << 8)
+    : ((bytes[at] ?? 0) << 8) | (bytes[at + 1] ?? 0);
+
+/** Decode one non-control word; group is the attribute value strings keep constant. */
+const decodeTextWord = (
+  word: number,
+  format: RomWordFormat,
+): { readonly text: string; readonly group: number } | undefined => {
+  if (format.tile === undefined) {
+    const text = getSjisDoubleByteDecodeTable()[word];
+    return text === undefined ? undefined : { text, group: 0 };
+  }
+  const { mask, attribute, characters } = format.tile;
+  const group = word & ~mask & 0xffff;
+  if (attribute !== null && group !== attribute) return undefined;
+  const text = characters.get(word & mask);
+  return text === undefined ? undefined : { text, group };
+};
+
+/** Decode one string of words from the start of `bytes`. */
+const decodeWordString = (
+  bytes: Uint8Array,
+  format: RomWordFormat,
+): { readonly text: string; readonly byteLength: number } => {
+  const parts: string[] = [];
+  let group: number | undefined;
+  let pos = 0;
+  while (pos + 1 < bytes.length) {
+    const word = readWord(bytes, pos, format.littleEndian);
+    if (word === format.terminatorWord) {
+      pos += 2;
+      break;
+    }
+    if (word === format.newlineWord) {
+      parts.push("\n");
+      pos += 2;
+      continue;
+    }
+    const decoded = decodeTextWord(word, format);
+    if (decoded === undefined) break;
+    if (group !== undefined && decoded.group !== group) break;
+    group = decoded.group;
+    parts.push(decoded.text);
+    pos += 2;
+  }
+  return { text: parts.join(""), byteLength: pos };
+};
+
+const encodeWordQuery = (
+  query: string,
+  format: RomWordFormat,
+): Result<Uint8Array, string> => {
+  const words: number[] = [];
+  if (format.tile === undefined) {
+    const map = getSjisEncodeMap();
+    for (const char of query) {
+      if (char === "\n" && format.newlineWord !== null) {
+        words.push(format.newlineWord);
+        continue;
+      }
+      const encoded = map.get(char);
+      if (encoded?.length !== 2)
+        return err(
+          `Character '${char}' has no two-byte Shift-JIS code for sjis-le16`,
+        );
+      words.push(((encoded[0] ?? 0) << 8) | (encoded[1] ?? 0));
+    }
+  } else {
+    const { attribute, characters } = format.tile;
+    if (attribute === null)
+      return err("Query search with a tile encoding requires tile_attribute");
+    const tiles = new Map<string, number>();
+    let longest = 1;
+    for (const [tile, text] of characters) {
+      if (text.length === 0 || tiles.has(text)) continue;
+      tiles.set(text, tile);
+      longest = Math.max(longest, text.length);
+    }
+    let pos = 0;
+    while (pos < query.length) {
+      if (query[pos] === "\n" && format.newlineWord !== null) {
+        words.push(format.newlineWord);
+        pos++;
+        continue;
+      }
+      let matched = false;
+      for (let len = Math.min(longest, query.length - pos); len >= 1; len--) {
+        const tile = tiles.get(query.slice(pos, pos + len));
+        if (tile === undefined) continue;
+        words.push(attribute | tile);
+        pos += len;
+        matched = true;
+        break;
+      }
+      if (!matched)
+        return err(
+          `Substring starting at '${query.slice(pos, pos + 4)}' has no tile in the provided table`,
+        );
+    }
+  }
+  const out = new Uint8Array(words.length * 2);
+  words.forEach((word, i) => {
+    out[i * 2] = format.littleEndian ? word & 0xff : word >>> 8;
+    out[i * 2 + 1] = format.littleEndian ? word >>> 8 : word & 0xff;
+  });
+  return ok(out);
+};
 
 export const normalizeRomTextEncoding = (
   encoding: RomTextEncoding,
@@ -146,47 +398,7 @@ export const parseCustomCharTable = (
   });
 };
 
-let cachedSjisEncodeMap: Map<string, Uint8Array> | undefined;
 let cachedEucJpEncodeMap: Map<string, Uint8Array> | undefined;
-
-const getSjisEncodeMap = (): Map<string, Uint8Array> => {
-  if (cachedSjisEncodeMap !== undefined) return cachedSjisEncodeMap;
-  const decoder = new TextDecoder("shift-jis", { fatal: true });
-  const map = new Map<string, Uint8Array>();
-  // Single-byte ASCII & half-width katakana
-  for (let b = 0x20; b <= 0xdf; b++) {
-    if (b > 0x7e && b < 0xa1) continue;
-    try {
-      const char = decoder.decode(Uint8Array.of(b));
-      if (!map.has(char)) map.set(char, Uint8Array.of(b));
-    } catch {
-      // skip unmapped byte
-    }
-  }
-  // Double-byte Shift-JIS / CP932 lead & trail ranges
-  const leadRanges: readonly (readonly [number, number])[] = [
-    [0x81, 0x9f],
-    [0xe0, 0xfc],
-  ];
-  for (const [leadStart, leadEnd] of leadRanges) {
-    for (let lead = leadStart; lead <= leadEnd; lead++) {
-      for (let trail = 0x40; trail <= 0xfc; trail++) {
-        if (trail === 0x7f) continue;
-        try {
-          const bytes = Uint8Array.of(lead, trail);
-          const char = decoder.decode(bytes);
-          if (char.length === 1 && !map.has(char)) {
-            map.set(char, bytes);
-          }
-        } catch {
-          // skip unmapped pair
-        }
-      }
-    }
-  }
-  cachedSjisEncodeMap = map;
-  return map;
-};
 
 const getEucJpEncodeMap = (): Map<string, Uint8Array> => {
   if (cachedEucJpEncodeMap !== undefined) return cachedEucJpEncodeMap;
@@ -226,12 +438,30 @@ export const encodeRomQueryString = (
   query: string,
   encoding: RomTextEncoding,
   customTable?: CustomCharTable,
+  words?: RomWordFormat,
 ): Result<Uint8Array, string> => {
   if (query.length === 0) {
     return err("Query string must not be empty");
   }
   const canonical = normalizeRomTextEncoding(encoding);
   switch (canonical) {
+    case "sjis-le16":
+    case "tile-le16":
+    case "tile-be16": {
+      let format = words;
+      if (format === undefined) {
+        const resolved = resolveRomWordFormat({
+          encoding,
+          terminatorByte: 0x00,
+          customTable,
+        });
+        if (!resolved.ok) return err(resolved.error);
+        format = resolved.value;
+      }
+      return format === undefined
+        ? err(`Encoding '${canonical}' has no word format`)
+        : encodeWordQuery(query, format);
+    }
     case "utf-8":
       return ok(new TextEncoder().encode(query));
     case "ascii": {
@@ -337,12 +567,34 @@ export const decodeRomStringFromBytes = (
   encoding: RomTextEncoding,
   terminatorByte: number | null = 0x00,
   customTable?: CustomCharTable,
+  words?: RomWordFormat,
 ): {
   readonly decoded: string;
   readonly byteLength: number;
   readonly rawHex: string;
 } => {
   const canonical = normalizeRomTextEncoding(encoding);
+  if (isWordRomTextEncoding(canonical)) {
+    let format = words;
+    if (format === undefined) {
+      const resolved = resolveRomWordFormat({
+        encoding: canonical,
+        terminatorByte,
+        customTable,
+      });
+      format = resolved.ok ? resolved.value : undefined;
+    }
+    const decoded =
+      format === undefined
+        ? { text: "", byteLength: 0 }
+        : decodeWordString(bytes, format);
+    const slice = bytes.subarray(0, decoded.byteLength);
+    return {
+      decoded: decoded.text,
+      byteLength: slice.length,
+      rawHex: formatHexPattern(slice),
+    };
+  }
   if (canonical === "tbl" && customTable !== undefined) {
     let pos = 0;
     const parts: string[] = [];
@@ -439,46 +691,299 @@ export const decodeRomStringFromBytes = (
   };
 };
 
-/** Scan a buffer for valid contiguous strings in the requested ROM encoding. */
-export const extractRomStringsFromBuffer = (input: {
+/** Which word alignments a 16-bit word scan examines, by absolute offset. */
+export const ROM_WORD_PARITIES = ["both", "even", "odd"] as const;
+export type RomWordParity = (typeof ROM_WORD_PARITIES)[number];
+
+/**
+ * Where a range scan restarts so it reproduces the same string boundaries.
+ * Byte scans restart at one buffer offset. Word scans keep one pending run
+ * start per absolute parity (index 0 = even, 1 = odd; null = finished or not
+ * scanned), because strings of the two alignments interleave.
+ */
+export type RomScanResume =
+  | { readonly kind: "byte"; readonly offset: number }
+  | {
+      readonly kind: "word";
+      readonly heads: readonly [number | null, number | null];
+    };
+
+/** Opaque cursor text for a resume point. */
+export const formatRomScanCursor = (resume: RomScanResume): string =>
+  resume.kind === "byte"
+    ? String(resume.offset)
+    : `w${resume.heads.map((head) => (head === null ? "-" : String(head))).join(".")}`;
+
+/**
+ * Parse a cursor produced by formatRomScanCursor for the same scan. Word
+ * cursors must name run starts of the right parity inside the buffer.
+ */
+export const parseRomScanCursor = (
+  cursor: string,
+  scan: {
+    readonly word: boolean;
+    readonly bufferLength: number;
+    readonly parityOrigin: number;
+  },
+): Result<RomScanResume, string> => {
+  const invalid = err(
+    "Invalid cursor: pass back the next_cursor value from the previous identical call.",
+  );
+  const text = cursor.trim();
+  if (!scan.word) {
+    if (!/^\d+$/u.test(text)) return invalid;
+    const offset = Number(text);
+    return Number.isSafeInteger(offset)
+      ? ok({ kind: "byte", offset })
+      : invalid;
+  }
+  const match = /^w(\d+|-)\.(\d+|-)$/u.exec(text);
+  if (match === null) return invalid;
+  const heads: (number | null)[] = [];
+  for (const [parity, raw] of [match[1], match[2]].entries()) {
+    if (raw === "-" || raw === undefined) {
+      heads.push(null);
+      continue;
+    }
+    const head = Number(raw);
+    if (
+      !Number.isSafeInteger(head) ||
+      head > scan.bufferLength ||
+      (scan.parityOrigin + head) % 2 !== parity
+    )
+      return invalid;
+    heads.push(head);
+  }
+  return ok({ kind: "word", heads: [heads[0] ?? null, heads[1] ?? null] });
+};
+
+/** One string found by a range scan. */
+export interface ScannedRomString {
+  readonly offsetInBuffer: number;
+  readonly address: string;
+  readonly decoded: string;
+  readonly byteLength: number;
+  readonly rawHex: string;
+  /** Whether the string ended at its terminator (byte, word or .tbl end token). */
+  readonly terminated: boolean;
+  /** text_score, present when requested or when filters need it. */
+  readonly score?: number;
+  /** Restart point that yields this string first. */
+  readonly resume: RomScanResume;
+}
+
+export interface RomStringScanInput {
   readonly bytes: Uint8Array;
   readonly baseAddress: bigint;
   readonly encoding: RomTextEncoding;
   readonly minLength: number;
   readonly terminatorByte: number | null;
   readonly customTable?: CustomCharTable | undefined;
-  readonly limit: number;
+  /** Required for word encodings; resolved by resolveRomWordFormat. */
+  readonly words?: RomWordFormat | undefined;
   /** When false, rawHex is "" and no hex formatting is paid per string. */
   readonly includeRawHex?: boolean | undefined;
-  /** Buffer offset to start scanning from (paging resume point). */
+  /** Buffer offset to start scanning from. */
   readonly startOffset?: number | undefined;
-}): readonly {
+  /** Restart point from a previous page; overrides startOffset. */
+  readonly resume?: RomScanResume | undefined;
+  readonly filters?: RomTextFilters | undefined;
+  /** Report text_score on every string. */
+  readonly measure?: boolean | undefined;
+  /** Keep only strings that ended at their terminator. */
+  readonly requireTerminator?: boolean | undefined;
+  readonly wordParity?: RomWordParity | undefined;
+  /** Absolute offset of bytes[0], which fixes word parity. */
+  readonly parityOrigin?: number | undefined;
+}
+
+interface RawScannedString {
   readonly offsetInBuffer: number;
-  readonly address: string;
   readonly decoded: string;
   readonly byteLength: number;
-  readonly rawHex: string;
-}[] => {
-  const {
-    bytes,
-    baseAddress,
-    encoding,
-    minLength,
-    terminatorByte,
-    customTable,
-    limit,
-  } = input;
-  const canonical = normalizeRomTextEncoding(encoding);
-  const rawHexFor = (slice: Uint8Array): string =>
-    input.includeRawHex === false ? "" : formatHexPattern(slice);
-  const results: {
-    readonly offsetInBuffer: number;
-    readonly address: string;
-    readonly decoded: string;
-    readonly byteLength: number;
-    readonly rawHex: string;
-  }[] = [];
+  readonly terminated: boolean;
+}
 
+/**
+ * Lazily scan a buffer for strings. Boundaries depend only on the bytes and
+ * the format: filters and requireTerminator drop strings after segmentation,
+ * so restarting at any yielded `resume` reproduces the same later strings.
+ */
+export function* scanRomStrings(
+  input: RomStringScanInput,
+): Generator<ScannedRomString, void, undefined> {
+  const filters = input.filters ?? NO_ROM_TEXT_FILTERS;
+  const needsMeasure = input.measure === true || romTextFiltersActive(filters);
+  const accept = (
+    raw: RawScannedString,
+    resume: RomScanResume,
+  ): ScannedRomString | undefined => {
+    if (input.requireTerminator === true && !raw.terminated) return undefined;
+    let score: number | undefined;
+    if (needsMeasure) {
+      const measured = measureRomText(raw.decoded);
+      if (!romTextPassesFilters(measured, filters)) return undefined;
+      score = measured.score;
+    }
+    const slice = input.bytes.subarray(
+      raw.offsetInBuffer,
+      raw.offsetInBuffer + raw.byteLength,
+    );
+    return {
+      offsetInBuffer: raw.offsetInBuffer,
+      address: `0x${(input.baseAddress + BigInt(raw.offsetInBuffer)).toString(16)}`,
+      decoded: raw.decoded,
+      byteLength: raw.byteLength,
+      rawHex: input.includeRawHex === false ? "" : formatHexPattern(slice),
+      terminated: raw.terminated,
+      ...(input.measure === true && score !== undefined ? { score } : {}),
+      resume,
+    };
+  };
+
+  if (isWordRomTextEncoding(normalizeRomTextEncoding(input.encoding))) {
+    const format = input.words;
+    if (format === undefined) return;
+    yield* scanWordStrings(input, format, accept);
+    return;
+  }
+  const start =
+    input.resume?.kind === "byte" ? input.resume.offset : input.startOffset;
+  for (const raw of scanByteStrings(input, start, filters.fullwidthOnly)) {
+    const accepted = accept(raw, {
+      kind: "byte",
+      offset: raw.offsetInBuffer,
+    });
+    if (accepted !== undefined) yield accepted;
+  }
+}
+
+function* scanWordStrings(
+  input: RomStringScanInput,
+  format: RomWordFormat,
+  accept: (
+    raw: RawScannedString,
+    resume: RomScanResume,
+  ) => ScannedRomString | undefined,
+): Generator<ScannedRomString, void, undefined> {
+  const { bytes } = input;
+  const origin = input.parityOrigin ?? 0;
+  const parity = input.wordParity ?? "both";
+  const begin = Math.min(
+    Math.max(0, Math.floor(input.startOffset ?? 0)),
+    bytes.length,
+  );
+  const startFor = (absoluteParity: 0 | 1): number | null => {
+    if (
+      (parity === "even" && absoluteParity === 1) ||
+      (parity === "odd" && absoluteParity === 0)
+    )
+      return null;
+    if (input.resume?.kind === "word")
+      return input.resume.heads[absoluteParity];
+    return (origin + begin) % 2 === absoluteParity ? begin : begin + 1;
+  };
+  const streams = ([0, 1] as const).map((absoluteParity) => {
+    const at = startFor(absoluteParity);
+    if (at === null) return undefined;
+    const runs = scanWordRuns(bytes, at, format, input.minLength);
+    return (function* () {
+      for (const raw of runs) {
+        // The resume head is filled in by the merge below.
+        const accepted = accept(raw, { kind: "word", heads: [null, null] });
+        if (accepted !== undefined) yield accepted;
+      }
+    })();
+  });
+  const heads = streams.map((stream) => stream?.next());
+  for (;;) {
+    let pick: 0 | 1 | undefined;
+    for (const k of [0, 1] as const) {
+      const head = heads[k];
+      if (head === undefined || head.done === true) continue;
+      const other = pick === undefined ? undefined : heads[pick];
+      if (
+        other === undefined ||
+        other.done === true ||
+        head.value.offsetInBuffer < other.value.offsetInBuffer
+      )
+        pick = k;
+    }
+    if (pick === undefined) return;
+    const headOffset = (k: 0 | 1): number | null => {
+      const head = heads[k];
+      return head === undefined || head.done === true
+        ? null
+        : head.value.offsetInBuffer;
+    };
+    const current = heads[pick] as IteratorYieldResult<ScannedRomString>;
+    yield {
+      ...current.value,
+      resume: { kind: "word", heads: [headOffset(0), headOffset(1)] },
+    };
+    heads[pick] = streams[pick]?.next();
+  }
+}
+
+/** Runs of text words of one alignment, starting at a run start `at`. */
+function* scanWordRuns(
+  bytes: Uint8Array,
+  at: number,
+  format: RomWordFormat,
+  minLength: number,
+): Generator<RawScannedString, void, undefined> {
+  let pos = at;
+  while (pos + 1 < bytes.length) {
+    const runStart = pos;
+    const parts: string[] = [];
+    let characters = 0;
+    let group: number | undefined;
+    let terminated = false;
+    let groupChanged = false;
+    while (pos + 1 < bytes.length) {
+      const word = readWord(bytes, pos, format.littleEndian);
+      if (word === format.terminatorWord) {
+        pos += 2;
+        terminated = true;
+        break;
+      }
+      if (word === format.newlineWord) {
+        parts.push("\n");
+        pos += 2;
+        continue;
+      }
+      const decoded = decodeTextWord(word, format);
+      if (decoded === undefined) break;
+      if (group !== undefined && decoded.group !== group) {
+        groupChanged = true;
+        break;
+      }
+      group = decoded.group;
+      parts.push(decoded.text);
+      characters++;
+      pos += 2;
+    }
+    if (characters >= minLength)
+      yield {
+        offsetInBuffer: runStart,
+        decoded: parts.join(""),
+        byteLength: pos - runStart,
+        terminated,
+      };
+    // A word with another attribute starts the next run; any other stop word
+    // (not text, not a control word) cannot start one.
+    if (!terminated && !groupChanged && pos + 1 < bytes.length) pos += 2;
+  }
+}
+
+/** Byte-encoding segmentation (Shift-JIS, EUC-JP, .tbl, ASCII/UTF-8). */
+function* scanByteStrings(
+  input: RomStringScanInput,
+  startOffset: number | undefined,
+  fullwidthOnly: boolean,
+): Generator<RawScannedString, void, undefined> {
+  const { bytes, minLength, terminatorByte, customTable } = input;
+  const canonical = normalizeRomTextEncoding(input.encoding);
   const sjisDecoder =
     canonical === "sjis" || canonical === "cp932"
       ? new TextDecoder("shift-jis", { fatal: true })
@@ -502,6 +1007,7 @@ export const extractRomStringsFromBuffer = (input: {
         const b1 = bytes[at + 1] ?? 0;
         return b1 >= 0x40 && b1 <= 0xfc && b1 !== 0x7f ? 2 : 0;
       }
+      if (fullwidthOnly) return 0;
       return (b0 >= 0x20 && b0 <= 0x7e) || (b0 >= 0xa1 && b0 <= 0xdf) ? 1 : 0;
     }
     if (b0 >= 0xa1 && b0 <= 0xfe) {
@@ -509,16 +1015,17 @@ export const extractRomStringsFromBuffer = (input: {
       const b1 = bytes[at + 1] ?? 0;
       return b1 >= 0xa1 && b1 <= 0xfe ? 2 : 0;
     }
+    if (fullwidthOnly) return 0;
     return b0 >= 0x20 && b0 <= 0x7e ? 1 : 0;
   };
   const isMultibyteUnit = (at: number, unitLength: number): boolean =>
     unitLength === 2 || (isSjisFamily && (bytes[at] ?? 0) >= 0xa1);
 
   let cursor = Math.min(
-    Math.max(0, Math.floor(input.startOffset ?? 0)),
+    Math.max(0, Math.floor(startOffset ?? 0)),
     bytes.length,
   );
-  while (cursor < bytes.length && results.length < limit) {
+  while (cursor < bytes.length) {
     if (
       terminatorByte !== null &&
       bytes[cursor] === terminatorByte &&
@@ -531,6 +1038,7 @@ export const extractRomStringsFromBuffer = (input: {
     if (canonical === "tbl" && customTable !== undefined) {
       let pos = cursor;
       const chars: string[] = [];
+      let terminated = false;
       while (pos < bytes.length) {
         let matchedText: string | undefined;
         let matchedLen = 0;
@@ -554,22 +1062,24 @@ export const extractRomStringsFromBuffer = (input: {
           (matchedText === undefined || (terminatorByte !== 0x00 && !hitEnd))
         ) {
           pos++;
+          terminated = true;
           break;
         }
         if (matchedText === undefined) break;
         chars.push(matchedText);
         pos += matchedLen;
-        if (hitEnd) break;
+        if (hitEnd) {
+          terminated = true;
+          break;
+        }
       }
       if (chars.length >= minLength) {
-        const slice = bytes.subarray(cursor, pos);
-        results.push({
+        yield {
           offsetInBuffer: cursor,
-          address: `0x${(baseAddress + BigInt(cursor)).toString(16)}`,
           decoded: chars.join(""),
-          byteLength: slice.length,
-          rawHex: rawHexFor(slice),
-        });
+          byteLength: pos - cursor,
+          terminated,
+        };
         cursor = pos;
         continue;
       }
@@ -603,6 +1113,7 @@ export const extractRomStringsFromBuffer = (input: {
         const contentEnd = terminated ? pos - 1 : pos;
         let decoded: string | undefined;
         let acceptedEnd = pos;
+        let acceptedTerminated = terminated;
         try {
           decoded = sjisDecoder.decode(bytes.subarray(cursor, contentEnd));
         } catch {
@@ -630,17 +1141,16 @@ export const extractRomStringsFromBuffer = (input: {
           if (prefixChars >= minLength && prefixMultibyte > 0) {
             decoded = parts.join("");
             acceptedEnd = scan;
+            acceptedTerminated = false;
           }
         }
         if (decoded !== undefined) {
-          const slice = bytes.subarray(cursor, acceptedEnd);
-          results.push({
+          yield {
             offsetInBuffer: cursor,
-            address: `0x${(baseAddress + BigInt(cursor)).toString(16)}`,
             decoded,
-            byteLength: slice.length,
-            rawHex: rawHexFor(slice),
-          });
+            byteLength: acceptedEnd - cursor,
+            terminated: acceptedTerminated,
+          };
           cursor = Math.max(acceptedEnd, cursor + 1);
           continue;
         }
@@ -651,10 +1161,12 @@ export const extractRomStringsFromBuffer = (input: {
 
     // ASCII / UTF-8 printable run
     let pos = cursor;
+    let terminated = false;
     while (pos < bytes.length) {
       const b = bytes[pos] ?? 0;
       if (terminatorByte !== null && b === terminatorByte) {
         pos++;
+        terminated = true;
         break;
       }
       if (b >= 0x20 && b <= 0x7e) {
@@ -663,33 +1175,34 @@ export const extractRomStringsFromBuffer = (input: {
       }
       break;
     }
-    const charLen =
-      terminatorByte !== null &&
-      pos > cursor &&
-      bytes[pos - 1] === terminatorByte
-        ? pos - 1 - cursor
-        : pos - cursor;
+    const charLen = terminated ? pos - 1 - cursor : pos - cursor;
     if (charLen >= minLength) {
       const slice = bytes.subarray(cursor, pos);
-      const decoded = decodeRomStringFromBytes(
-        slice,
-        canonical,
-        terminatorByte,
-      ).decoded;
-      results.push({
+      yield {
         offsetInBuffer: cursor,
-        address: `0x${(baseAddress + BigInt(cursor)).toString(16)}`,
-        decoded,
+        decoded: decodeRomStringFromBytes(slice, canonical, terminatorByte)
+          .decoded,
         byteLength: slice.length,
-        rawHex: rawHexFor(slice),
-      });
+        terminated,
+      };
       cursor = pos;
       continue;
     }
     // A rejected printable run's suffixes are shorter, so jump past it.
     cursor = Math.max(pos, cursor + 1);
   }
+}
 
+/** Scan a buffer for valid contiguous strings in the requested ROM encoding. */
+export const extractRomStringsFromBuffer = (
+  input: RomStringScanInput & { readonly limit: number },
+): readonly ScannedRomString[] => {
+  const results: ScannedRomString[] = [];
+  if (input.limit <= 0) return results;
+  for (const found of scanRomStrings(input)) {
+    results.push(found);
+    if (results.length >= input.limit) break;
+  }
   return results;
 };
 
@@ -712,6 +1225,48 @@ export const readPointerValue = (
     }
   }
   return BigInt(val);
+};
+
+/** Word-encoding options shared by every ROM text tool. */
+const romWordFormatFields = {
+  terminator_word: z
+    .number()
+    .int()
+    .min(0)
+    .max(0xffff)
+    .nullable()
+    .optional()
+    .describe(
+      "16-bit word ending a string in sjis-le16/tile-le16/tile-be16 (e.g. 0xFFFF); default terminator_byte doubled; null for none.",
+    ),
+  newline_word: z
+    .number()
+    .int()
+    .min(0)
+    .max(0xffff)
+    .optional()
+    .describe(
+      "16-bit word decoded as a line break inside word-encoded strings (e.g. 0xFFFE).",
+    ),
+  tile_mask: z
+    .number()
+    .int()
+    .min(1)
+    .max(0xffff)
+    .optional()
+    .describe(
+      "Tile-index bits of tile-le16/tile-be16 words (default 0x0FFF, PC Engine BAT); table keys are tile indexes.",
+    ),
+  tile_attribute: z
+    .number()
+    .int()
+    .min(0)
+    .max(0xffff)
+    .nullable()
+    .optional()
+    .describe(
+      "Required non-tile bits of tilemap words (e.g. 0xF000 = palette 15); omit to accept one consistent value per string.",
+    ),
 };
 
 export const searchRomStringsInputSchema = z.strictObject({
@@ -812,6 +1367,58 @@ export const searchRomStringsInputSchema = z.strictObject({
     .describe(
       "Include each match's raw bytes as hex (bytes_hex). Default false omits it to keep results compact; byte_length is always reported.",
     ),
+  ...romWordFormatFields,
+  word_parity: z
+    .enum(ROM_WORD_PARITIES)
+    .default("both")
+    .describe(
+      "File-offset alignments a word-encoding range scan examines; strings may start at odd offsets.",
+    ),
+  fullwidth_only: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Range scan: treat single-byte characters (ASCII, half-width kana) as non-text.",
+    ),
+  min_kana: z
+    .number()
+    .int()
+    .min(0)
+    .max(256)
+    .default(0)
+    .describe("Range scan: minimum full-width hiragana/katakana per string."),
+  max_level2_kanji_ratio: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .describe(
+      "Range scan: maximum share of JIS level-2 kanji among a string's kanji (data noise is often level 2).",
+    ),
+  min_text_score: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .describe(
+      "Range scan: minimum heuristic text_score (0..1; kana and punctuation high, rare symbols low).",
+    ),
+  include_score: z
+    .boolean()
+    .default(false)
+    .describe("Range scan: report text_score on each match."),
+  require_terminator: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Range scan: keep only strings that end at their terminator byte/word.",
+    ),
+  dedupe: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Range scan: return each distinct byte string once with occurrences (every file offset) over the whole range.",
+    ),
   cursor: z
     .string()
     .min(1)
@@ -825,15 +1432,76 @@ export type SearchRomStringsInput = z.output<
   typeof searchRomStringsInputSchema
 >;
 
+/** Disc layout behind a `disc-image` byte source (JSON-shaped). */
+export type RomDiscSourceDescription = {
+  readonly track: number;
+  readonly track_mode: DataTrackMode;
+  readonly image_path: string;
+  readonly image_sha256: string;
+  readonly first_lba: number;
+  readonly sectors: number;
+  readonly raw_sector_bytes: number;
+  readonly user_data_offset: number;
+  readonly first_sector_in_image: number;
+  readonly header_mismatched_sectors: number;
+  readonly first_mismatched_sector: number | null;
+  readonly other_data_tracks: number[];
+};
+
+/** Result `source` block; validated by romByteSourceSchema. */
+export type RomByteSourceDescription = {
+  readonly mode: "data" | "disc-image";
+  readonly reason: "requested" | "format_not_recognized";
+  readonly byte_length: number;
+  readonly sector_size?: number;
+  readonly disc?: RomDiscSourceDescription;
+};
+
+/**
+ * How a local file was read when it was not admitted as an executable or ROM:
+ * plain file bytes, or the user data of a cue sheet's first data track.
+ */
+export const romByteSourceSchema = z.strictObject({
+  mode: z.enum(["data", "disc-image"]),
+  reason: z.enum(["requested", "format_not_recognized"]),
+  byte_length: z.number().int().min(0),
+  /** User-data sector size; file offsets divide into sectors of this size. */
+  sector_size: z.number().int().min(1).optional(),
+  disc: z
+    .strictObject({
+      track: z.number().int().min(1),
+      track_mode: z.enum(DATA_TRACK_MODES),
+      image_path: z.string(),
+      image_sha256: z.string(),
+      first_lba: z.number().int().min(0),
+      sectors: z.number().int().min(0),
+      raw_sector_bytes: z.number().int().min(1),
+      user_data_offset: z.number().int().min(0),
+      first_sector_in_image: z.number().int().min(0),
+      header_mismatched_sectors: z.number().int().min(0),
+      first_mismatched_sector: z.number().int().min(0).nullable(),
+      other_data_tracks: z.array(z.number().int().min(1)),
+    })
+    .optional(),
+});
+
 export const romStringMatchSchema = z.strictObject({
   address: z.string(),
   file_offset: z.number().int().min(0).nullable(),
+  /** Track-relative user-data sector (the .iso sector number). */
+  sector: z.number().int().min(0).optional(),
+  offset_in_sector: z.number().int().min(0).optional(),
+  /** Absolute disc LBA of `sector`, when the cue sheet establishes it. */
+  lba: z.number().int().min(0).optional(),
   encoding: z.enum(ROM_TEXT_ENCODINGS),
   text: z.string(),
   text_truncated: z.boolean().optional(),
+  text_score: z.number().min(0).max(1).optional(),
   bytes_hex: z.string().optional(),
   byte_length: z.number().int().min(0),
   terminated: z.boolean(),
+  /** With dedupe: file offsets of every copy, in order, including this one. */
+  occurrences: z.array(z.number().int().min(0)).optional(),
   xrefs: z.array(z.string()),
 });
 
@@ -845,6 +1513,7 @@ export const searchRomStringsResultSchema = z.strictObject({
   total_matches: z.number().int().min(0),
   truncated: z.boolean(),
   next_cursor: z.string().nullable().optional(),
+  source: romByteSourceSchema.optional(),
 });
 
 export const scanPointerTableInputSchema = z.strictObject({
@@ -938,6 +1607,7 @@ export const scanPointerTableInputSchema = z.strictObject({
     .describe(
       "Number of bytes to read at each pointer target to decode a text preview (0 disables preview).",
     ),
+  ...romWordFormatFields,
   resolve_xrefs: z
     .boolean()
     .default(false)
@@ -1012,6 +1682,7 @@ export const scanPointerTableResultSchema = z.strictObject({
   start_index: z.number().int().min(0).optional(),
   next_start_index: z.number().int().min(0).optional(),
   manuscript_records: z.array(manuscriptRecordSchema).optional(),
+  source: romByteSourceSchema.optional(),
 });
 
 /**
@@ -1170,6 +1841,7 @@ export const discoverPointerTablesInputSchema = z.strictObject({
     .max(16)
     .default(3)
     .describe("Number of sample entries to include per discovered table."),
+  ...romWordFormatFields,
   resolve_xrefs: z
     .boolean()
     .default(false)
@@ -1215,6 +1887,7 @@ export const discoverPointerTablesResultSchema = z.strictObject({
   bytes_scanned: z.number().int().min(0),
   tables: z.array(discoveredPointerTableSchema),
   total_tables: z.number().int().min(0),
+  source: romByteSourceSchema.optional(),
 });
 
 export const findCodeCavesInputSchema = z.strictObject({
@@ -1317,6 +1990,7 @@ export const findCodeCavesResultSchema = z.strictObject({
   alignment: z.number().int().min(1),
   caves: z.array(codeCaveEntrySchema),
   total_caves: z.number().int().min(0),
+  source: romByteSourceSchema.optional(),
 });
 
 /** Scan a byte slice for contiguous runs of 0x00 or 0xFF (or explicit fillByte) aligned to `alignment`. */

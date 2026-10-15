@@ -24,16 +24,33 @@ import {
   extractRomStringsFromBuffer,
   findCodeCavesInSliceTopK,
   formatHexPattern,
+  formatRomScanCursor,
+  isWordRomTextEncoding,
   normalizeRomTextEncoding,
   parseCustomCharTable,
+  parseRomScanCursor,
   readPointerValue,
+  requiresRomCharTable,
+  resolveRomWordFormat,
+  scanRomStrings,
   type CustomCharTable,
   type DiscoverPointerTablesInput,
   type FindCodeCavesInput,
+  type RomScanResume,
+  type RomStringScanInput,
   type RomTextEncoding,
+  type RomWordFormat,
+  type ScannedRomString,
   type ScanPointerTableInput,
   type SearchRomStringsInput,
 } from "../../domain/romHacking.js";
+import type { RomTextFilters } from "../../domain/romTextQuality.js";
+import {
+  isLocalByteSource,
+  locateLocalByteOffset,
+  type LocalByteSource,
+  type RomByteSourceDescription,
+} from "./LocalByteSource.js";
 import type { JsonValue } from "../../domain/jsonValue.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
@@ -66,7 +83,16 @@ interface LocalRomContext {
     tableFileOffset?: number,
   ) => number | null;
   readonly toVirtualAddress: (fileOffset: number) => string | null;
+  /** How a plain local byte source was read; absent for admitted targets. */
+  readonly source?: RomByteSourceDescription;
+  /** Sector coordinates for byte sources that have sectors. */
+  readonly locate?: (
+    fileOffset: number,
+  ) => ReturnType<typeof locateLocalByteOffset>;
 }
+
+/** A parsed target, or a local file read as plain bytes. */
+export type RomToolTarget = BinaryTarget | LocalByteSource;
 
 const ROM_BYTES_CACHE_LIMIT = 4;
 const romBytesCache = new Map<string, Buffer>();
@@ -98,11 +124,39 @@ const readRomBytesCached = async (
   return romBytes;
 };
 
+const identityMapping = (
+  length: number,
+): Pick<LocalRomContext, "toFileOffset" | "toVirtualAddress"> => ({
+  toFileOffset: (virtualAddress) => {
+    const offset = Number(virtualAddress);
+    return Number.isSafeInteger(offset) && offset >= 0 && offset < length
+      ? offset
+      : null;
+  },
+  toVirtualAddress: (fileOffset) =>
+    fileOffset >= 0 && fileOffset < length
+      ? `0x${fileOffset.toString(16)}`
+      : null,
+});
+
 const loadLocalRomContext = async (
-  target: BinaryTarget | undefined,
+  target: RomToolTarget | undefined,
 ): Promise<LocalRomContext | undefined> => {
+  if (target === undefined) return undefined;
+  if (isLocalByteSource(target)) {
+    return {
+      romBytes: target.bytes,
+      ...identityMapping(target.bytes.length),
+      source: target.description,
+      ...(target.description.sector_size === undefined
+        ? {}
+        : {
+            locate: (fileOffset: number) =>
+              locateLocalByteOffset(target, fileOffset),
+          }),
+    };
+  }
   if (
-    target === undefined ||
     target.kind !== "executable" ||
     (!isConsoleBinaryTarget(target) && target.format !== "raw-binary")
   ) {
@@ -123,22 +177,14 @@ const loadLocalRomContext = async (
         resolveConsoleVirtualAddress(admission, fileOffset),
     };
   }
-  return {
-    romBytes,
-    toFileOffset: (virtualAddress) => {
-      const offset = Number(virtualAddress);
-      return Number.isSafeInteger(offset) &&
-        offset >= 0 &&
-        offset < romBytes.length
-        ? offset
-        : null;
-    },
-    toVirtualAddress: (fileOffset) =>
-      fileOffset >= 0 && fileOffset < romBytes.length
-        ? `0x${fileOffset.toString(16)}`
-        : null,
-  };
+  return { romBytes, ...identityMapping(romBytes.length) };
 };
+
+/** `source` result field for plain byte sources. */
+const sourceField = (
+  localRom: LocalRomContext | undefined,
+): { readonly source?: RomByteSourceDescription } =>
+  localRom?.source === undefined ? {} : { source: localRom.source };
 
 const callOperation = async (
   analysis: AnalysisOperationPort,
@@ -201,14 +247,41 @@ const loadCustomTable = async (
       ? ok(parsed.value)
       : err(new AnalysisInputError(operation, { userMessage: parsed.error }));
   }
-  if (encoding === "tbl") {
+  if (requiresRomCharTable(encoding)) {
     return err(
       new AnalysisInputError(operation, {
-        userMessage: "encoding 'tbl' requires either table_path or table_text.",
+        userMessage: `encoding '${encoding}' requires either table_path or table_text.`,
       }),
     );
   }
   return ok(undefined);
+};
+
+/** Resolve word options once per request; byte encodings reject them. */
+const loadWordFormat = (
+  operation: string,
+  input: {
+    readonly encoding: RomTextEncoding;
+    readonly terminator_word?: number | null | undefined;
+    readonly newline_word?: number | undefined;
+    readonly tile_mask?: number | undefined;
+    readonly tile_attribute?: number | null | undefined;
+  },
+  terminatorByte: number | null,
+  customTable: CustomCharTable | undefined,
+): Result<RomWordFormat | undefined, AnalysisError> => {
+  const resolved = resolveRomWordFormat({
+    encoding: input.encoding,
+    terminatorByte,
+    terminatorWord: input.terminator_word,
+    newlineWord: input.newline_word,
+    tileMask: input.tile_mask,
+    tileAttribute: input.tile_attribute,
+    customTable,
+  });
+  return resolved.ok
+    ? resolved
+    : err(new AnalysisInputError(operation, { userMessage: resolved.error }));
 };
 
 const resolveOptionalFileOffset = async (
@@ -283,20 +356,6 @@ const resolveXrefsBatched = async (
   return new Map(unique.map((address, index) => [address, values[index]!]));
 };
 
-/** Whether an extracted string ran to the scan-window edge without its terminator. */
-const extractedTextTruncated = (
-  bytes: Uint8Array,
-  offsetInBuffer: number,
-  byteLength: number,
-  terminatorByte: number | null,
-  windowMayContinue: boolean,
-): boolean => {
-  if (!windowMayContinue || byteLength <= 0) return false;
-  const end = offsetInBuffer + byteLength;
-  if (end < bytes.length) return false;
-  return !(terminatorByte !== null && bytes[end - 1] === terminatorByte);
-};
-
 /** Parse an opaque search cursor (a non-negative decimal resume position). */
 const parseRomCursor = (
   operation: string,
@@ -367,39 +426,382 @@ const dedupManuscriptRecords = <
   return unique;
 };
 
-export const executeSearchRomStrings = async (
-  analysis: AnalysisOperationPort,
+/** Request facts resolved once before any search_rom_strings mode runs. */
+interface PreparedRomSearch {
+  readonly terminatorByte: number | null;
+  readonly customTable: CustomCharTable | undefined;
+  readonly words: RomWordFormat | undefined;
+  readonly filters: RomTextFilters;
+  readonly localRom: LocalRomContext | undefined;
+}
+
+const rangeOnlyOptionsUsed = (input: SearchRomStringsInput): boolean =>
+  input.dedupe ||
+  input.include_score ||
+  input.require_terminator ||
+  input.fullwidth_only ||
+  input.min_kana > 0 ||
+  input.max_level2_kanji_ratio !== undefined ||
+  input.min_text_score !== undefined;
+
+const prepareRomSearch = async (
   input: SearchRomStringsInput,
-  signal?: AbortSignal,
-  target?: BinaryTarget,
-): EnhancedResult => {
+  target: RomToolTarget | undefined,
+): Promise<Result<PreparedRomSearch, AnalysisError>> => {
+  const operation = "search_rom_strings";
   const terminatorByte =
     input.terminator_byte === undefined ? 0x00 : input.terminator_byte;
+  if (input.query !== undefined && rangeOnlyOptionsUsed(input))
+    return err(
+      new AnalysisInputError(operation, {
+        userMessage:
+          "dedupe, include_score, require_terminator and the text filters apply to range scans; omit query to scan a range.",
+      }),
+    );
   const tableResult = await loadCustomTable(
-    "search_rom_strings",
+    operation,
     input.encoding,
     input.table_path,
     input.table_text,
   );
   if (!tableResult.ok) return tableResult;
   const customTable = tableResult.value;
-  const localRom = await loadLocalRomContext(target);
-  // Provider query search uses the provider's own opaque cursor verbatim;
-  // local and range scans use a numeric resume offset.
-  const usesProviderCursor =
-    input.query !== undefined && localRom === undefined;
-  let pageCursor = 0;
-  if (!usesProviderCursor) {
-    const cursorResult = parseRomCursor("search_rom_strings", input.cursor);
-    if (!cursorResult.ok) return cursorResult;
-    pageCursor = cursorResult.value;
+  const words = loadWordFormat(operation, input, terminatorByte, customTable);
+  if (!words.ok) return words;
+  return ok({
+    terminatorByte,
+    customTable,
+    words: words.value,
+    filters: {
+      fullwidthOnly: input.fullwidth_only,
+      minKana: input.min_kana,
+      maxLevel2KanjiRatio: input.max_level2_kanji_ratio,
+      minTextScore: input.min_text_score,
+    },
+    localRom: await loadLocalRomContext(target),
+  });
+};
+
+/** Every occurrence of the encoded query inside [start, end), in file order. */
+function* localQueryOffsets(
+  romBytes: Buffer,
+  needle: Buffer,
+  start: number,
+  end: number,
+): Generator<number, void, undefined> {
+  let scanAt = start;
+  while (scanAt + needle.length <= end) {
+    const idx = romBytes.indexOf(needle, scanAt);
+    if (idx === -1 || idx + needle.length > end) return;
+    yield idx;
+    scanAt = idx + 1;
   }
+}
+
+const localQueryRange = (
+  localRom: LocalRomContext,
+  input: SearchRomStringsInput,
+): Result<{ readonly start: number; readonly end: number }, AnalysisError> => {
+  let start = 0;
+  if (input.start_offset !== undefined) {
+    start = Math.min(input.start_offset, localRom.romBytes.length);
+  } else if (input.start_address !== undefined) {
+    const parsedStart = parseHexAddressBigInt(
+      "search_rom_strings",
+      "start_address",
+      input.start_address,
+    );
+    if (!parsedStart.ok) return parsedStart;
+    const resolved = localRom.toFileOffset(parsedStart.value);
+    if (resolved !== null) start = Math.min(resolved, localRom.romBytes.length);
+  }
+  const end =
+    input.end_offset !== undefined
+      ? Math.min(input.end_offset, localRom.romBytes.length)
+      : localRom.romBytes.length;
+  return ok({ start, end });
+};
+
+/** One query hit decoded from its file offset to the terminator. */
+const projectLocalQueryMatch = (
+  localRom: LocalRomContext,
+  prepared: PreparedRomSearch,
+  input: SearchRomStringsInput,
+  needle: Buffer,
+  fileOffset: number,
+) => {
+  const query = input.query ?? "";
+  const address =
+    localRom.toVirtualAddress(fileOffset) ?? `0x${fileOffset.toString(16)}`;
+  const buf = localRom.romBytes.subarray(
+    fileOffset,
+    Math.min(localRom.romBytes.length, fileOffset + 128),
+  );
+  const decoded = decodeRomStringFromBytes(
+    buf,
+    input.encoding,
+    prepared.terminatorByte,
+    prepared.customTable,
+    prepared.words,
+  );
+  const text = decoded.decoded.length > 0 ? decoded.decoded : query;
+  const bytesHex =
+    decoded.decoded.length > 0
+      ? decoded.rawHex.replace(/\s+/gu, "").toLowerCase()
+      : needle.toString("hex");
+  const byteLength =
+    decoded.decoded.length > 0 ? decoded.byteLength : needle.length;
+  const terminated = queryDecodeTerminated(prepared, buf, decoded.byteLength);
+  const textTruncated =
+    !terminated && fileOffset + buf.length < localRom.romBytes.length;
+  return {
+    address,
+    file_offset: fileOffset,
+    ...localRom.locate?.(fileOffset),
+    encoding: input.encoding,
+    text,
+    ...(textTruncated ? { text_truncated: true } : {}),
+    ...(input.include_hex ? { bytes_hex: bytesHex } : {}),
+    byte_length: byteLength,
+    terminated,
+  };
+};
+
+/** Whether a decode from a query hit stopped at its terminator. */
+const queryDecodeTerminated = (
+  prepared: PreparedRomSearch,
+  buf: Uint8Array,
+  byteLength: number,
+): boolean => {
+  if (prepared.words !== undefined) {
+    const terminator = prepared.words.terminatorWord;
+    if (terminator === null || byteLength < 2) return false;
+    const at = byteLength - 2;
+    const word = prepared.words.littleEndian
+      ? (buf[at] ?? 0) | ((buf[at + 1] ?? 0) << 8)
+      : ((buf[at] ?? 0) << 8) | (buf[at + 1] ?? 0);
+    return word === terminator;
+  }
+  return prepared.terminatorByte !== null
+    ? byteLength < buf.length || buf.includes(prepared.terminatorByte)
+    : byteLength < buf.length;
+};
+
+/** A local range scan resolved to one byte window. */
+interface LocalRangePlan {
+  readonly slice: Buffer;
+  readonly startOffset: number;
+  readonly sliceMayContinue: boolean;
+  readonly scan: Omit<RomStringScanInput, "resume" | "startOffset">;
+}
+
+const planLocalRange = (
+  localRom: LocalRomContext,
+  prepared: PreparedRomSearch,
+  input: SearchRomStringsInput,
+  wholeFileByDefault: boolean,
+): Result<LocalRangePlan, AnalysisError> => {
+  let startOffset = input.start_offset ?? 0;
+  let baseAddress = BigInt(startOffset);
+  if (input.start_offset === undefined && input.start_address !== undefined) {
+    const parsedAddr = parseHexAddressBigInt(
+      "search_rom_strings",
+      "start_address",
+      input.start_address,
+    );
+    if (!parsedAddr.ok) return parsedAddr;
+    baseAddress = parsedAddr.value;
+    const resolved = localRom.toFileOffset(parsedAddr.value);
+    if (resolved === null) {
+      return err(
+        new AnalysisInputError("search_rom_strings", {
+          userMessage: `start_address ${input.start_address} does not map to a file offset in this ROM.`,
+        }),
+      );
+    }
+    startOffset = resolved;
+  } else {
+    const resolvedVaddr = localRom.toVirtualAddress(startOffset);
+    if (resolvedVaddr !== null) baseAddress = BigInt(resolvedVaddr);
+  }
+  const fileLength = localRom.romBytes.length;
+  const sliceStart = Math.min(startOffset, fileLength);
+  const end =
+    input.end_offset !== undefined
+      ? Math.min(fileLength, Math.max(sliceStart, input.end_offset))
+      : wholeFileByDefault &&
+          input.start_offset === undefined &&
+          input.start_address === undefined
+        ? fileLength
+        : Math.min(fileLength, sliceStart + input.length);
+  const slice = localRom.romBytes.subarray(sliceStart, end);
+  return ok({
+    slice,
+    startOffset: sliceStart,
+    sliceMayContinue: end < fileLength,
+    scan: rangeScanInput(prepared, input, slice, baseAddress, sliceStart),
+  });
+};
+
+const rangeScanInput = (
+  prepared: PreparedRomSearch,
+  input: SearchRomStringsInput,
+  bytes: Uint8Array,
+  baseAddress: bigint,
+  parityOrigin: number,
+): Omit<RomStringScanInput, "resume" | "startOffset"> => ({
+  bytes,
+  baseAddress,
+  encoding: input.encoding,
+  minLength: input.min_length,
+  terminatorByte: prepared.terminatorByte,
+  customTable: prepared.customTable,
+  words: prepared.words,
+  includeRawHex: input.include_hex,
+  filters: prepared.filters,
+  measure: input.include_score,
+  requireTerminator: input.require_terminator,
+  wordParity: input.word_parity,
+  parityOrigin,
+});
+
+/** One scanned string as a match, before xrefs are attached. */
+const projectRangeMatch = (
+  input: SearchRomStringsInput,
+  item: ScannedRomString,
+  location: {
+    readonly address: string;
+    readonly fileOffset: number | null;
+    readonly sector?: ReturnType<typeof locateLocalByteOffset>;
+    readonly truncated: boolean;
+    readonly occurrences?: readonly number[];
+  },
+) => ({
+  address: location.address,
+  file_offset: location.fileOffset,
+  ...location.sector,
+  encoding: input.encoding,
+  text: item.decoded,
+  ...(location.truncated ? { text_truncated: true } : {}),
+  ...(item.score === undefined ? {} : { text_score: item.score }),
+  ...(input.include_hex
+    ? { bytes_hex: item.rawHex.replace(/\s+/gu, "").toLowerCase() }
+    : {}),
+  byte_length: item.byteLength,
+  terminated: item.terminated,
+  ...(location.occurrences === undefined
+    ? {}
+    : { occurrences: [...location.occurrences] }),
+});
+
+/** Distinct byte strings in first-appearance order with every buffer offset. */
+const groupScannedStrings = (
+  scan: Iterable<ScannedRomString>,
+  bytes: Uint8Array,
+): { readonly first: ScannedRomString; readonly offsets: number[] }[] => {
+  const groups = new Map<
+    string,
+    { readonly first: ScannedRomString; readonly offsets: number[] }
+  >();
+  const view = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (const item of scan) {
+    const key = view.toString(
+      "latin1",
+      item.offsetInBuffer,
+      item.offsetInBuffer + item.byteLength,
+    );
+    const group = groups.get(key);
+    if (group === undefined)
+      groups.set(key, { first: item, offsets: [item.offsetInBuffer] });
+    else group.offsets.push(item.offsetInBuffer);
+  }
+  return [...groups.values()];
+};
+
+const DEDUPE_CURSOR = /^d(\d+)$/u;
+
+/**
+ * Select one page of range-scan strings. Plain scans resume from the scanner's
+ * own restart point; dedupe scans group the whole window and page by group.
+ */
+const selectRangePage = (
+  scan: Omit<RomStringScanInput, "resume" | "startOffset">,
+  input: SearchRomStringsInput,
+): Result<
+  {
+    readonly items: readonly {
+      readonly item: ScannedRomString;
+      readonly offsets?: readonly number[];
+    }[];
+    readonly nextCursor: string | null;
+  },
+  AnalysisError
+> => {
+  const invalidCursor = err(
+    new AnalysisInputError("search_rom_strings", {
+      userMessage:
+        "Invalid cursor: pass back the next_cursor value from the previous identical call.",
+    }),
+  );
+  if (input.dedupe) {
+    let first = 0;
+    if (input.cursor !== undefined) {
+      const match = DEDUPE_CURSOR.exec(input.cursor.trim());
+      if (match === null) return invalidCursor;
+      first = Number(match[1]);
+    }
+    const groups = groupScannedStrings(scanRomStrings(scan), scan.bytes);
+    const page = groups.slice(first, first + input.max_results);
+    return ok({
+      items: page.map((group) => ({
+        item: group.first,
+        offsets: group.offsets,
+      })),
+      nextCursor:
+        first + input.max_results < groups.length
+          ? `d${first + input.max_results}`
+          : null,
+    });
+  }
+  let resume: RomScanResume | undefined;
+  if (input.cursor !== undefined) {
+    const parsed = parseRomScanCursor(input.cursor, {
+      word: isWordRomTextEncoding(normalizeRomTextEncoding(input.encoding)),
+      bufferLength: scan.bytes.length,
+      parityOrigin: scan.parityOrigin ?? 0,
+    });
+    if (!parsed.ok) return invalidCursor;
+    resume = parsed.value;
+  }
+  const items: { readonly item: ScannedRomString }[] = [];
+  let nextCursor: string | null = null;
+  for (const item of scanRomStrings({ ...scan, resume })) {
+    if (items.length === input.max_results) {
+      nextCursor = formatRomScanCursor(item.resume);
+      break;
+    }
+    items.push({ item });
+  }
+  return ok({ items, nextCursor });
+};
+
+export const executeSearchRomStrings = async (
+  analysis: AnalysisOperationPort,
+  input: SearchRomStringsInput,
+  signal?: AbortSignal,
+  target?: RomToolTarget,
+): EnhancedResult => {
+  const preparedResult = await prepareRomSearch(input, target);
+  if (!preparedResult.ok) return preparedResult;
+  const prepared = preparedResult.value;
+  const { localRom, customTable, terminatorByte, words } = prepared;
 
   if (input.query !== undefined) {
     const encodedResult = encodeRomQueryString(
       input.query,
       input.encoding,
       customTable,
+      words,
     );
     if (!encodedResult.ok) {
       return err(
@@ -411,88 +813,35 @@ export const executeSearchRomStrings = async (
     const pattern = formatHexPattern(encodedResult.value).toUpperCase();
 
     if (localRom !== undefined) {
+      // Provider query search uses the provider's own opaque cursor verbatim;
+      // local scans use a numeric resume offset.
+      const cursorResult = parseRomCursor("search_rom_strings", input.cursor);
+      if (!cursorResult.ok) return cursorResult;
+      const range = localQueryRange(localRom, input);
+      if (!range.ok) return range;
       const needle = Buffer.from(encodedResult.value);
-      let searchStart = 0;
-      if (input.start_offset !== undefined) {
-        searchStart = Math.min(input.start_offset, localRom.romBytes.length);
-      } else if (input.start_address !== undefined) {
-        const parsedStart = parseHexAddressBigInt(
-          "search_rom_strings",
-          "start_address",
-          input.start_address,
-        );
-        if (!parsedStart.ok) return parsedStart;
-        const resolved = localRom.toFileOffset(parsedStart.value);
-        if (resolved !== null) {
-          searchStart = Math.min(resolved, localRom.romBytes.length);
-        }
-      }
-      const searchEnd =
-        input.end_offset !== undefined
-          ? Math.min(input.end_offset, localRom.romBytes.length)
-          : localRom.romBytes.length;
 
       // Count every match in the range (native indexOf) while collecting
       // only this page, starting at the cursor's file offset.
-      const pageStart = Math.max(searchStart, pageCursor);
+      const pageStart = Math.max(range.value.start, cursorResult.value);
       const foundOffsets: number[] = [];
       let totalMatches = 0;
       let nextCursor: string | null = null;
-      let scanAt = searchStart;
-      while (scanAt + needle.length <= searchEnd) {
-        const idx = localRom.romBytes.indexOf(needle, scanAt);
-        if (idx === -1 || idx + needle.length > searchEnd) break;
+      for (const idx of localQueryOffsets(
+        localRom.romBytes,
+        needle,
+        range.value.start,
+        range.value.end,
+      )) {
         totalMatches++;
-        if (idx >= pageStart) {
-          if (foundOffsets.length < input.max_results) {
-            foundOffsets.push(idx);
-          } else if (nextCursor === null) {
-            nextCursor = String(idx);
-          }
-        }
-        scanAt = idx + 1;
+        if (idx < pageStart) continue;
+        if (foundOffsets.length < input.max_results) foundOffsets.push(idx);
+        else nextCursor ??= String(idx);
       }
-      const truncated = nextCursor !== null;
 
-      const pendingMatches = [];
-      for (const fileOffset of foundOffsets) {
-        const address =
-          localRom.toVirtualAddress(fileOffset) ??
-          `0x${fileOffset.toString(16)}`;
-        const buf = localRom.romBytes.subarray(
-          fileOffset,
-          Math.min(localRom.romBytes.length, fileOffset + 128),
-        );
-        const decoded = decodeRomStringFromBytes(
-          buf,
-          input.encoding,
-          terminatorByte,
-          customTable,
-        );
-        const text = decoded.decoded.length > 0 ? decoded.decoded : input.query;
-        const bytesHex =
-          decoded.decoded.length > 0
-            ? decoded.rawHex.replace(/\s+/gu, "").toLowerCase()
-            : needle.toString("hex");
-        const byteLength =
-          decoded.decoded.length > 0 ? decoded.byteLength : needle.length;
-        const terminated =
-          terminatorByte !== null
-            ? decoded.byteLength < buf.length || buf.includes(terminatorByte)
-            : decoded.byteLength < buf.length;
-        const textTruncated =
-          !terminated && fileOffset + buf.length < localRom.romBytes.length;
-        pendingMatches.push({
-          address,
-          file_offset: fileOffset,
-          encoding: input.encoding,
-          text,
-          ...(textTruncated ? { text_truncated: true } : {}),
-          ...(input.include_hex ? { bytes_hex: bytesHex } : {}),
-          byte_length: byteLength,
-          terminated,
-        });
-      }
+      const pendingMatches = foundOffsets.map((fileOffset) =>
+        projectLocalQueryMatch(localRom, prepared, input, needle, fileOffset),
+      );
       const xrefsByAddress = await resolveXrefsBatched(
         analysis,
         pendingMatches.map((match) => match.address),
@@ -510,8 +859,9 @@ export const executeSearchRomStrings = async (
         encoded_query_pattern: pattern,
         matches,
         total_matches: totalMatches,
-        truncated,
+        truncated: nextCursor !== null,
         next_cursor: nextCursor,
+        ...sourceField(localRom),
       });
     }
 
@@ -571,16 +921,17 @@ export const executeSearchRomStrings = async (
             input.encoding,
             terminatorByte,
             customTable,
+            words,
           );
           if (decoded.decoded.length > 0) {
             text = decoded.decoded;
             bytesHex = decoded.rawHex.replace(/\s+/gu, "").toLowerCase();
             byteLength = decoded.byteLength;
-            terminated =
-              terminatorByte !== null
-                ? decoded.byteLength < buf.length ||
-                  buf.includes(terminatorByte)
-                : decoded.byteLength < buf.length;
+            terminated = queryDecodeTerminated(
+              prepared,
+              buf,
+              decoded.byteLength,
+            );
           }
         }
       }
@@ -638,83 +989,25 @@ export const executeSearchRomStrings = async (
   }
 
   if (localRom !== undefined) {
-    let startOffset = input.start_offset ?? 0;
-    let baseAddrBigInt = BigInt(startOffset);
-    if (input.start_offset === undefined && input.start_address !== undefined) {
-      const parsedAddr = parseHexAddressBigInt(
-        "search_rom_strings",
-        "start_address",
-        input.start_address,
-      );
-      if (!parsedAddr.ok) return parsedAddr;
-      baseAddrBigInt = parsedAddr.value;
-      const resolved = localRom.toFileOffset(parsedAddr.value);
-      if (resolved === null) {
-        return err(
-          new AnalysisInputError("search_rom_strings", {
-            userMessage: `start_address ${input.start_address} does not map to a file offset in this ROM.`,
-          }),
-        );
-      }
-      startOffset = resolved;
-    } else if (input.start_offset !== undefined) {
-      const resolvedVaddr = localRom.toVirtualAddress(input.start_offset);
-      if (resolvedVaddr !== null) {
-        baseAddrBigInt = BigInt(resolvedVaddr);
-      }
-    }
-
-    const scanLength =
-      input.end_offset !== undefined
-        ? Math.max(0, input.end_offset - startOffset)
-        : input.length;
-    const slice = localRom.romBytes.subarray(
-      Math.min(startOffset, localRom.romBytes.length),
-      Math.min(localRom.romBytes.length, startOffset + scanLength),
-    );
-    const probed = extractRomStringsFromBuffer({
-      bytes: slice,
-      baseAddress: baseAddrBigInt,
-      encoding: input.encoding,
-      minLength: input.min_length,
-      terminatorByte,
-      customTable,
-      limit: input.max_results + 1,
-      includeRawHex: input.include_hex,
-      startOffset: pageCursor,
-    });
-    const rangeTruncated = probed.length > input.max_results;
-    const extracted = rangeTruncated
-      ? probed.slice(0, input.max_results)
-      : probed;
-    const rangeNextCursor = rangeTruncated
-      ? String(probed[input.max_results]!.offsetInBuffer)
-      : null;
-
-    const sliceMayContinue =
-      startOffset + slice.length < localRom.romBytes.length;
-    const pendingMatches = extracted.map((item) => {
+    const plan = planLocalRange(localRom, prepared, input, false);
+    if (!plan.ok) return plan;
+    const { slice, startOffset, sliceMayContinue } = plan.value;
+    const page = selectRangePage(plan.value.scan, input);
+    if (!page.ok) return page;
+    const pendingMatches = page.value.items.map(({ item, offsets }) => {
       const fileOffset = startOffset + item.offsetInBuffer;
-      return {
+      return projectRangeMatch(input, item, {
         address: localRom.toVirtualAddress(fileOffset) ?? item.address,
-        file_offset: fileOffset,
-        encoding: input.encoding,
-        text: item.decoded,
-        ...(extractedTextTruncated(
-          slice,
-          item.offsetInBuffer,
-          item.byteLength,
-          terminatorByte,
-          sliceMayContinue,
-        )
-          ? { text_truncated: true }
-          : {}),
-        ...(input.include_hex
-          ? { bytes_hex: item.rawHex.replace(/\s+/gu, "").toLowerCase() }
-          : {}),
-        byte_length: item.byteLength,
-        terminated: true,
-      };
+        fileOffset,
+        sector: localRom.locate?.(fileOffset),
+        truncated:
+          sliceMayContinue &&
+          !item.terminated &&
+          item.offsetInBuffer + item.byteLength >= slice.length,
+        ...(offsets === undefined
+          ? {}
+          : { occurrences: offsets.map((offset) => startOffset + offset) }),
+      });
     });
     const xrefsByAddress = await resolveXrefsBatched(
       analysis,
@@ -733,10 +1026,19 @@ export const executeSearchRomStrings = async (
       encoded_query_pattern: null,
       matches,
       total_matches: matches.length,
-      truncated: rangeTruncated,
-      next_cursor: rangeNextCursor,
+      truncated: page.value.nextCursor !== null,
+      next_cursor: page.value.nextCursor,
+      ...sourceField(localRom),
     });
   }
+
+  if (input.dedupe)
+    return err(
+      new AnalysisInputError("search_rom_strings", {
+        userMessage:
+          "dedupe needs local file bytes (a console ROM, raw binary, or data file).",
+      }),
+    );
 
   const startAddressStr =
     input.start_address ?? `0x${(input.start_offset ?? 0).toString(16)}`;
@@ -772,24 +1074,18 @@ export const executeSearchRomStrings = async (
   }
 
   const buffer = Buffer.from(parsedRead.data.bytes_hex, "hex");
-  const probed = extractRomStringsFromBuffer({
-    bytes: buffer,
-    baseAddress: baseAddrResult.value,
-    encoding: input.encoding,
-    minLength: input.min_length,
-    terminatorByte,
-    customTable,
-    limit: input.max_results + 1,
-    includeRawHex: input.include_hex,
-    startOffset: pageCursor,
-  });
-  const rangeTruncated = probed.length > input.max_results;
-  const extracted = rangeTruncated
-    ? probed.slice(0, input.max_results)
-    : probed;
-  const rangeNextCursor = rangeTruncated
-    ? String(probed[input.max_results]!.offsetInBuffer)
-    : null;
+  const page = selectRangePage(
+    rangeScanInput(
+      prepared,
+      input,
+      buffer,
+      baseAddrResult.value,
+      input.start_offset ?? 0,
+    ),
+    input,
+  );
+  if (!page.ok) return page;
+  const extracted = page.value.items.map(({ item }) => item);
 
   const pendingAddresses = extracted.map((item) => item.address);
   const [providerOffsets, providerXrefs] = await Promise.all([
@@ -802,24 +1098,13 @@ export const executeSearchRomStrings = async (
     ),
   ]);
   const matches = extracted.map((item) => ({
-    address: item.address,
-    file_offset: providerOffsets.get(item.address) ?? null,
-    encoding: input.encoding,
-    text: item.decoded,
-    ...(extractedTextTruncated(
-      buffer,
-      item.offsetInBuffer,
-      item.byteLength,
-      terminatorByte,
-      true,
-    )
-      ? { text_truncated: true }
-      : {}),
-    ...(input.include_hex
-      ? { bytes_hex: item.rawHex.replace(/\s+/gu, "").toLowerCase() }
-      : {}),
-    byte_length: item.byteLength,
-    terminated: true,
+    ...projectRangeMatch(input, item, {
+      address: item.address,
+      fileOffset: providerOffsets.get(item.address) ?? null,
+      truncated:
+        !item.terminated &&
+        item.offsetInBuffer + item.byteLength >= buffer.length,
+    }),
     xrefs: [...(providerXrefs.get(item.address) ?? [])],
   }));
 
@@ -829,8 +1114,144 @@ export const executeSearchRomStrings = async (
     encoded_query_pattern: null,
     matches,
     total_matches: matches.length,
-    truncated: rangeTruncated,
-    next_cursor: rangeNextCursor,
+    truncated: page.value.nextCursor !== null,
+    next_cursor: page.value.nextCursor,
+  });
+};
+
+/** Summary of a search_rom_strings run written to a JSON Lines file. */
+export type RomStringExportSummary = {
+  readonly mode: "query_search" | "range_scan";
+  readonly encoding: RomTextEncoding;
+  readonly encoded_query_pattern: string | null;
+  readonly deduplicated: boolean;
+  readonly range: {
+    readonly start_offset: number;
+    readonly end_offset: number;
+  };
+  readonly source?: RomByteSourceDescription;
+};
+
+/**
+ * Run search_rom_strings over local bytes without page or result limits and
+ * hand each match to `write` as one record. With dedupe, records are written
+ * after the whole range is grouped. Without a query or range, the whole file
+ * is scanned.
+ */
+export const exportSearchRomStrings = async (
+  input: SearchRomStringsInput,
+  target: RomToolTarget,
+  write: (record: Readonly<Record<string, JsonValue>>) => Promise<void>,
+  signal?: AbortSignal,
+): Promise<Result<RomStringExportSummary, AnalysisError>> => {
+  const operation = "search_rom_strings";
+  if (input.cursor !== undefined || input.resolve_xrefs)
+    return err(
+      new AnalysisInputError(operation, {
+        userMessage:
+          "File export writes every match from local bytes; cursor and resolve_xrefs do not apply.",
+      }),
+    );
+  const preparedResult = await prepareRomSearch(input, target);
+  if (!preparedResult.ok) return preparedResult;
+  const prepared = preparedResult.value;
+  const { localRom } = prepared;
+  if (localRom === undefined)
+    return err(
+      new AnalysisInputError(operation, {
+        userMessage:
+          "File export needs local file bytes (a console ROM, raw binary, or data file).",
+      }),
+    );
+  const cancelled = (): Result<never, AnalysisError> | undefined =>
+    signal?.aborted === true
+      ? err(
+          new AnalysisInputError(operation, {
+            userMessage: "Export was cancelled.",
+          }),
+        )
+      : undefined;
+
+  if (input.query !== undefined) {
+    const encoded = encodeRomQueryString(
+      input.query,
+      input.encoding,
+      prepared.customTable,
+      prepared.words,
+    );
+    if (!encoded.ok)
+      return err(
+        new AnalysisInputError(operation, { userMessage: encoded.error }),
+      );
+    const range = localQueryRange(localRom, input);
+    if (!range.ok) return range;
+    const needle = Buffer.from(encoded.value);
+    for (const fileOffset of localQueryOffsets(
+      localRom.romBytes,
+      needle,
+      range.value.start,
+      range.value.end,
+    )) {
+      const stop = cancelled();
+      if (stop !== undefined) return stop;
+      await write(
+        projectLocalQueryMatch(localRom, prepared, input, needle, fileOffset),
+      );
+    }
+    return ok({
+      mode: "query_search",
+      encoding: input.encoding,
+      encoded_query_pattern: formatHexPattern(encoded.value).toUpperCase(),
+      deduplicated: false,
+      range: {
+        start_offset: range.value.start,
+        end_offset: range.value.end,
+      },
+      ...sourceField(localRom),
+    });
+  }
+
+  const plan = planLocalRange(localRom, prepared, input, true);
+  if (!plan.ok) return plan;
+  const { slice, startOffset, sliceMayContinue, scan } = plan.value;
+  const project = (item: ScannedRomString, offsets?: readonly number[]) => {
+    const fileOffset = startOffset + item.offsetInBuffer;
+    return projectRangeMatch(input, item, {
+      address: localRom.toVirtualAddress(fileOffset) ?? item.address,
+      fileOffset,
+      sector: localRom.locate?.(fileOffset),
+      truncated:
+        sliceMayContinue &&
+        !item.terminated &&
+        item.offsetInBuffer + item.byteLength >= slice.length,
+      ...(offsets === undefined
+        ? {}
+        : { occurrences: offsets.map((offset) => startOffset + offset) }),
+    });
+  };
+  if (input.dedupe) {
+    for (const group of groupScannedStrings(scanRomStrings(scan), slice)) {
+      const stop = cancelled();
+      if (stop !== undefined) return stop;
+      await write(project(group.first, group.offsets));
+    }
+  } else {
+    for (const item of scanRomStrings(scan)) {
+      const stop = cancelled();
+      if (stop !== undefined) return stop;
+      await write(project(item));
+    }
+  }
+  return ok({
+    mode: "range_scan",
+    encoding: input.encoding,
+    encoded_query_pattern: null,
+    deduplicated: input.dedupe,
+    range: {
+      start_offset: startOffset,
+      end_offset: startOffset + slice.length,
+    },
+    ...sourceField(localRom),
   });
 };
 
@@ -838,7 +1259,7 @@ export const executeScanPointerTable = async (
   analysis: AnalysisOperationPort,
   input: ScanPointerTableInput,
   signal?: AbortSignal,
-  target?: BinaryTarget,
+  target?: RomToolTarget,
 ): EnhancedResult => {
   if (input.address === undefined && input.table_offset === undefined) {
     return err(
@@ -876,6 +1297,14 @@ export const executeScanPointerTable = async (
   );
   if (!tableResult.ok) return tableResult;
   const customTable = tableResult.value;
+  const wordsResult = loadWordFormat(
+    "scan_pointer_table",
+    input,
+    terminatorByte,
+    customTable,
+  );
+  if (!wordsResult.ok) return wordsResult;
+  const words = wordsResult.value;
   const localRom = await loadLocalRomContext(target);
 
   const totalBytesToRead = input.count * stride;
@@ -977,6 +1406,7 @@ export const executeScanPointerTable = async (
               input.encoding,
               terminatorByte,
               customTable,
+              words,
             );
             previewText = decoded.decoded;
             previewTruncated = decodeWindowTruncated(
@@ -1050,6 +1480,7 @@ export const executeScanPointerTable = async (
             input.encoding,
             terminatorByte,
             customTable,
+            words,
           );
           fullByTarget.set(key, {
             text: decoded.decoded,
@@ -1103,6 +1534,7 @@ export const executeScanPointerTable = async (
         ...(manuscriptRecords === undefined
           ? {}
           : { manuscript_records: manuscriptRecords }),
+        ...sourceField(localRom),
       });
     }
   }
@@ -1200,6 +1632,7 @@ export const executeScanPointerTable = async (
       input.encoding,
       terminatorByte,
       customTable,
+      words,
     );
     return {
       text: decoded.decoded,
@@ -1283,6 +1716,7 @@ export const executeScanPointerTable = async (
         input.encoding,
         terminatorByte,
         customTable,
+        words,
       );
       return {
         text: decoded.decoded,
@@ -1346,7 +1780,8 @@ const isLikelyValidDecodedTarget = (
   encoding: RomTextEncoding,
   terminatorByte: number | null,
   minStringLength: number,
-  customTable?: CustomCharTable,
+  customTable: CustomCharTable | undefined,
+  words: RomWordFormat | undefined,
 ): {
   readonly valid: boolean;
   readonly text: string;
@@ -1376,6 +1811,10 @@ const isLikelyValidDecodedTarget = (
     minLength: minStringLength,
     terminatorByte,
     customTable,
+    words,
+    // A pointer target is a string start, so only the even word parity
+    // relative to the target is meaningful.
+    wordParity: "even",
     limit: 1,
     includeRawHex: false,
   });
@@ -1394,7 +1833,7 @@ export const executeDiscoverPointerTables = async (
   analysis: AnalysisOperationPort,
   input: DiscoverPointerTablesInput,
   signal?: AbortSignal,
-  target?: BinaryTarget,
+  target?: RomToolTarget,
 ): EnhancedResult => {
   const terminatorByte =
     input.terminator_byte === undefined ? 0x00 : input.terminator_byte;
@@ -1422,6 +1861,14 @@ export const executeDiscoverPointerTables = async (
   );
   if (!tableResult.ok) return tableResult;
   const customTable = tableResult.value;
+  const wordsResult = loadWordFormat(
+    "discover_pointer_tables",
+    input,
+    terminatorByte,
+    customTable,
+  );
+  if (!wordsResult.ok) return wordsResult;
+  const words = wordsResult.value;
   const localRom = await loadLocalRomContext(target);
 
   let romBuffer: Uint8Array;
@@ -1533,6 +1980,7 @@ export const executeDiscoverPointerTables = async (
       terminatorByte,
       input.min_string_length,
       customTable,
+      words,
     );
     targetCache.set(targetFileOffset, res);
     return res;
@@ -1659,6 +2107,7 @@ export const executeDiscoverPointerTables = async (
     bytes_scanned: Math.max(0, scanEndOffset - scanStartOffset),
     tables: discoveredTables,
     total_tables: discoveredTables.length,
+    ...sourceField(localRom),
   });
 };
 
@@ -1666,7 +2115,7 @@ export const executeFindCodeCaves = async (
   analysis: AnalysisOperationPort,
   input: FindCodeCavesInput,
   signal?: AbortSignal,
-  target?: BinaryTarget,
+  target?: RomToolTarget,
 ): EnhancedResult => {
   const localRom = await loadLocalRomContext(target);
   const rawCaves: {
@@ -1701,6 +2150,7 @@ export const executeFindCodeCaves = async (
     const romBytes = localRom.romBytes;
     if (
       target !== undefined &&
+      !isLocalByteSource(target) &&
       isConsoleBinaryTarget(target) &&
       input.start_offset === undefined &&
       input.end_offset === undefined &&
@@ -1763,9 +2213,13 @@ export const executeFindCodeCaves = async (
         ),
         sliceFileOffset: startOffset,
         regionName:
-          target !== undefined && isConsoleBinaryTarget(target)
-            ? (target.consoleRom.fileMappings[0]?.name ?? "ROM")
-            : "RAW_BINARY",
+          localRom.source !== undefined
+            ? "DATA"
+            : target !== undefined &&
+                !isLocalByteSource(target) &&
+                isConsoleBinaryTarget(target)
+              ? (target.consoleRom.fileMappings[0]?.name ?? "ROM")
+              : "RAW_BINARY",
         executable: true,
         minSize: input.min_size,
         alignment: input.alignment,
@@ -1854,5 +2308,6 @@ export const executeFindCodeCaves = async (
     alignment: input.alignment,
     caves,
     total_caves: totalCavesFound,
+    ...sourceField(localRom),
   });
 };
