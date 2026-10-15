@@ -120,6 +120,39 @@ describe("Ghidra COM loader", () => {
   });
 });
 
+describe("Ghidra console staging loader", () => {
+  it.each([
+    ["6502:LE:16:default", "0x8000", "0x0"],
+    ["65816:LE:16:default", "0x8000", "0x0"],
+    ["x86:LE:16:Real Mode", "0x20000", "0000:0000"],
+    ["ARM:LE:32:v4t", "0x8000000", "0x8000000"],
+  ])(
+    "stages %s without consuming space below the mapping base",
+    (languageId, baseAddr, stagingBase) => {
+      const arguments_ = ghidraHeadlessArguments({
+        projectRoot: "/tmp/project",
+        targetPath: "/tmp/rom.bin",
+        bridgeScriptPath: "/package/bridge/ReaGhidraBridge.java",
+        descriptorPath: "/tmp/session.json",
+        ghidraLogPath: "/tmp/ghidra.log",
+        scriptLogPath: "/tmp/script.log",
+        consoleRom: {
+          loader: "BinaryLoader",
+          languageId,
+          compilerSpecId: "default",
+          baseAddr,
+          specPath: "/tmp/console.tsv",
+        },
+      });
+      expectOptions(arguments_, [
+        ["-loader-baseAddr", stagingBase],
+        ["-processor", languageId],
+      ]);
+      expect(arguments_).toContain("/tmp/console.tsv");
+    },
+  );
+});
+
 describe("Ghidra raw-binary loader", () => {
   it("loads caller-supplied architecture and entry before auto-analysis", () => {
     const arguments_ = ghidraHeadlessArguments({

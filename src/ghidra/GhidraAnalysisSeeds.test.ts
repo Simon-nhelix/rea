@@ -61,9 +61,35 @@ describe("Ghidra seed parsing", () => {
     ]);
   });
 
+  it("keeps distinct context registers and rejects repeated assertions", () => {
+    const parsed = parseGhidraSeeds(
+      "0x9A86A3\tcontext\tctx_MF=0x00\n0x9a86a3\tcontext\tctx_XF=0x1\n0x9a86a3\tfunction",
+    );
+    if (!parsed.ok) throw parsed.error;
+    expect(parsed.value.map((entry) => entry.name)).toEqual([
+      "ctx_MF=0x0",
+      "ctx_XF=0x1",
+      undefined,
+    ]);
+    expect(
+      parseGhidraSeeds("0x1\tcontext\tctx_MF=0x0\n0x01\tcontext\tctx_MF=0x1")
+        .ok,
+    ).toBe(false);
+  });
+
+  it.each([
+    "ctx_MF",
+    "ctx_MF=1",
+    "ctx_MF=-0x1",
+    "ctx_MF=0x",
+    `ctx_MF=0x${"f".repeat(65)}`,
+  ])("rejects malformed context %s", (assignment) => {
+    expect(parseGhidraSeeds(`0x1\tcontext\t${assignment}`).ok).toBe(false);
+  });
+
   it.each([
     ["401000\tfunction", "line 1: address must be 0x-prefixed hex"],
-    ["0x401000\tdata", "line 1: kind must be function, code or label"],
+    ["0x401000\tdata", "line 1: kind must be function, code, label or context"],
     ["0x401000", "line 1: expected address<TAB>kind[<TAB>name]"],
     ["0x401000\tlabel", "line 1: a label seed requires a name"],
     [
@@ -105,6 +131,33 @@ describe("Ghidra seed commitment", () => {
     const runtime = await workspace();
     const snapshot = await snapshotGhidraAnalysisSeeds(commitment, runtime);
     expect(await readFile(snapshot, "utf8")).toBe(CANONICAL);
+  });
+
+  it("commits exact-address context and preserves context-before-function input order", async () => {
+    const path = join(await workspace(), "context.tsv");
+    await writeFile(
+      path,
+      "0x9A86A3\tcontext\tctx_MF=0x00\n0x9a86a3\tfunction\n",
+    );
+    const resolved = await resolveGhidraAnalysisSeeds(path);
+    if (!resolved.ok || resolved.value === undefined)
+      throw new Error("Expected commitment");
+    const canonical = "0x9a86a3\tcontext\tctx_MF=0x0\n0x9a86a3\tfunction\n";
+    expect(resolved.value.entries).toEqual({
+      function: 1,
+      code: 0,
+      label: 0,
+      context: 1,
+    });
+    expect(resolved.value.sha256).toBe(
+      createHash("sha256").update(canonical).digest("hex"),
+    );
+    expect(
+      await readFile(
+        await snapshotGhidraAnalysisSeeds(resolved.value, await workspace()),
+        "utf8",
+      ),
+    ).toBe(canonical);
   });
 
   it("is absent when no seed file is configured", async () => {
@@ -180,6 +233,23 @@ describe("Ghidra seed session verification", () => {
       ),
     ]);
     expect(ghidraSeedLimitations(undefined)).toEqual([]);
+  });
+
+  it("requires all declared processor contexts to be applied", () => {
+    const contextual = {
+      ...commitment,
+      entries: { ...commitment.entries, context: 1 },
+    };
+    expect(
+      ghidraSeedFailure(contextual, { ...report, entries: 5 }, "xrefs"),
+    ).toBeDefined();
+    expect(
+      ghidraSeedFailure(
+        contextual,
+        { ...report, entries: 5, context_applied: 1 },
+        "xrefs",
+      ),
+    ).toBeUndefined();
   });
 
   it.each([

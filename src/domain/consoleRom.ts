@@ -289,6 +289,18 @@ export const detectConsoleFormatFromHeader = (
     return "wsc";
   }
 
+  // Raw SH-4 has no identifying magic. Only the conventional boot filename
+  // supplies a format hint; opcode/pointer coincidences in arbitrary .bin data
+  // do not establish a Dreamcast target.
+  if (
+    /(?:^|[\\/])1st_read\.bin$/iu.test(lowerPath) &&
+    bytes.length >= 0x40 &&
+    fileSize >= 0x40 &&
+    fileSize <= 0x01000000
+  ) {
+    return "dc-bin";
+  }
+
   return undefined;
 };
 
@@ -1364,7 +1376,9 @@ const admitSaturn = (
     firstReadAddr >= 0x06002000 &&
     firstReadAddr < 0x06002000 + fileBytes
       ? hex32(firstReadAddr)
-      : loadBase);
+      : hasIpHeader && fileBytes > 0x100
+        ? "0x6002100"
+        : loadBase);
 
   return ok({
     format: "saturn",
@@ -1747,7 +1761,7 @@ const admitPce = (
   return ok({
     format: "pce",
     architecture: "6502",
-    ghidraLanguageId: "6502:LE:16:default",
+    ghidraLanguageId: "HuC6280:LE:16:experimental",
     compilerSpecId: "default",
     loader: "BinaryLoader",
     loadBase: "0xe000",
@@ -1916,7 +1930,10 @@ const admitSnes = (
       name: "BANK00_ROM",
       virtualAddress: "0x8000",
       fileOffset: smcOffset + (romBytes >= 0x10000 ? 0x8000 : 0),
-      byteLength: firstBankSize,
+      byteLength: Math.min(
+        firstBankSize,
+        romBytes - (romBytes >= 0x10000 ? 0x8000 : 0),
+      ),
       executable: true,
       writable: false,
     });
@@ -1935,18 +1952,55 @@ const admitSnes = (
       });
     }
   } else {
-    const bankCount = Math.min(125, Math.ceil(romBytes / 0x8000));
+    const bankCount = Math.min(128, Math.ceil(romBytes / 0x8000));
     for (let i = 0; i < bankCount; i++) {
       const bankOffset = i * 0x8000;
       const bankSize = Math.min(romBytes - bankOffset, 0x8000);
       if (bankSize <= 0) break;
       mappings.push({
         name: `BANK${i.toString(16).toUpperCase().padStart(2, "0")}_ROM`,
-        virtualAddress: hex32(i * 0x10000 + 0x8000),
+        // CPU banks $7E/$7F are WRAM; use their ROM mirrors $FE/$FF.
+        virtualAddress: hex32((i >= 0x7e ? i + 0x80 : i) * 0x10000 + 0x8000),
         fileOffset: smcOffset + bankOffset,
         byteLength: bankSize,
         executable: true,
         writable: false,
+      });
+    }
+  }
+  // Represent aliases once at admission so address lookup and provider imports
+  // consume identical mappings, including a final partial bank.
+  const canonicalMappings = [...mappings];
+  for (const map of canonicalMappings) {
+    if (isHiRom) {
+      if (!map.name.startsWith("HIROM_BANK")) continue;
+      const bank = (Number(BigInt(map.virtualAddress)) - 0xc00000) / 0x10000;
+      if (bank < 0x3e) {
+        mappings.push({
+          ...map,
+          name: `MIRROR_HIROM_BANK${bank.toString(16).toUpperCase()}`,
+          virtualAddress: hex32((0x40 + bank) * 0x10000),
+        });
+      }
+      const upperLength = map.byteLength - 0x8000;
+      if (upperLength <= 0) continue;
+      for (const mirrorBank of [bank, bank + 0x80]) {
+        if (mirrorBank === 0) continue; // BANK00_ROM already owns this alias.
+        mappings.push({
+          ...map,
+          name: `MIRROR_BANK${mirrorBank.toString(16).toUpperCase()}_ROM`,
+          virtualAddress: hex32(mirrorBank * 0x10000 + 0x8000),
+          fileOffset: map.fileOffset + 0x8000,
+          byteLength: upperLength,
+        });
+      }
+    } else {
+      const address = Number(BigInt(map.virtualAddress));
+      if (address >= 0x800000) continue; // $FE/$FF are already canonical.
+      mappings.push({
+        ...map,
+        name: `FAST_${map.name}`,
+        virtualAddress: hex32(address + 0x800000),
       });
     }
   }
@@ -1992,7 +2046,7 @@ const admitSnes = (
       reset_vector: hex32(resetVector),
       bank_count: isHiRom
         ? Math.min(64, Math.ceil(romBytes / 0x10000))
-        : Math.min(125, Math.ceil(romBytes / 0x8000)),
+        : Math.min(128, Math.ceil(romBytes / 0x8000)),
     },
   });
 };
@@ -2152,7 +2206,7 @@ const admitGb = (
   return ok({
     format: "gb",
     architecture: "sm83",
-    ghidraLanguageId: "z80:LE:16:default",
+    ghidraLanguageId: "SM83:LE:16:default",
     compilerSpecId: "default",
     loader: "BinaryLoader",
     loadBase: "0x0",
@@ -2428,18 +2482,6 @@ export const resolveConsoleFileOffset = (
   const direct = findInMappings(vaddr);
   if (direct !== null) return direct;
 
-  // 3. SNES FastROM ($80..$FF) mirror resolution
-  if (admission.format === "snes" && vaddr >= 0x800000n && vaddr <= 0xffffffn) {
-    const isHiRom = admission.romMetadata.mapping_mode === "HiROM";
-    if (!isHiRom && (vaddr & 0xffffn) >= 0x8000n) {
-      const mirrored = findInMappings(vaddr & 0x7fffffn);
-      if (mirrored !== null) return mirrored;
-    } else if (isHiRom && vaddr < 0xc00000n && (vaddr & 0xffffn) >= 0x8000n) {
-      const mirrored = findInMappings(vaddr - 0x800000n + 0xc00000n);
-      if (mirrored !== null) return mirrored;
-    }
-  }
-
   return null;
 };
 
@@ -2458,7 +2500,7 @@ export const resolveConsoleVirtualAddress = (
     admission.romMetadata.mapping_mode === "HiROM"
   ) {
     for (const map of admission.fileMappings) {
-      if (map.name === "BANK00_ROM") continue;
+      if (!map.name.startsWith("HIROM_BANK")) continue;
       if (
         fileOffset >= map.fileOffset &&
         fileOffset < map.fileOffset + map.byteLength

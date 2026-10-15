@@ -6,6 +6,11 @@ import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.SourceType;
 import java.nio.charset.StandardCharsets;
+import java.math.BigInteger;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.lang.RegisterValue;
+import java.util.HashMap;
+import java.util.Map;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -18,8 +23,8 @@ import java.util.List;
  * Apply caller-declared analysis seeds before default auto-analysis.
  *
  * The single argument is REA's canonical seed snapshot: one
- * {@code 0x<hex>\t(function|code|label)[\tname]} line per seed. Code seeds are
- * applied after functions (highest address first), then labels. The outcome is stored as a
+ * {@code 0x<hex>\t(function|code|label|context)[\tname-or-assignment]} line per seed. Context seeds declare processor context at one exact address before any
+ * disassembly. Code seeds are applied after functions (highest address first), then labels. The outcome is stored as a
  * program property that the bridge reports during its handshake.
  */
 public final class ReaGhidraApplySeeds extends GhidraScript {
@@ -70,7 +75,9 @@ public final class ReaGhidraApplySeeds extends GhidraScript {
         int codeDecoded = 0, codeFailed = 0;
         int functionCreated = 0, functionExisting = 0, functionFailed = 0;
         int labelApplied = 0, labelFailed = 0;
-        for (String pass : new String[] { "function", "code", "label" }) {
+        int contextApplied = 0;
+        Map<Address, RegisterValue> assertedContext = new HashMap<>();
+        for (String pass : new String[] { "context", "function", "code", "label" }) {
             for (Seed seed : seeds) {
                 if (!seed.kind().equals(pass)) continue;
                 monitor.checkCancelled();
@@ -78,10 +85,32 @@ public final class ReaGhidraApplySeeds extends GhidraScript {
                     ? null
                     : currentProgram.getMemory().getBlock(seed.address());
                 if (block == null || (!pass.equals("label") && !block.isInitialized())) {
+                    if (pass.equals("context"))
+                        throw new IllegalArgumentException("REA context seed requires initialized mapped memory");
                     unmapped++;
                     continue;
                 }
                 switch (pass) {
+                    case "context" -> {
+                        String[] assignment = seed.name() == null ? new String[0] : seed.name().split("=", -1);
+                        if (assignment.length != 2 || !assignment[1].matches("0x[0-9a-f]{1,64}"))
+                            throw new IllegalArgumentException("REA context seed is malformed");
+                        Register register = currentProgram.getRegister(assignment[0]);
+                        BigInteger value = new BigInteger(assignment[1].substring(2), 16);
+                        if (register == null || !register.isProcessorContext() || value.bitLength() > register.getBitLength())
+                            throw new IllegalArgumentException("REA context seed requires a known processor context register and an in-width value: " + seed.name());
+                        RegisterValue asserted = new RegisterValue(register, value).getBaseRegisterValue();
+                        RegisterValue prior = assertedContext.get(seed.address());
+                        if (prior != null) {
+                            BigInteger overlap = prior.getValueMask().and(asserted.getValueMask());
+                            if (prior.getUnsignedValueIgnoreMask().xor(asserted.getUnsignedValueIgnoreMask()).and(overlap).signum() != 0)
+                                throw new IllegalArgumentException("REA context seeds assert conflicting register bits at " + seed.address());
+                            asserted = prior.combineValues(asserted);
+                        }
+                        assertedContext.put(seed.address(), asserted);
+                        currentProgram.getProgramContext().setValue(register, seed.address(), seed.address(), value);
+                        contextApplied++;
+                    }
                     case "code" -> {
                         if (decoded(seed.address())) codeDecoded++;
                         else {
@@ -124,7 +153,8 @@ public final class ReaGhidraApplySeeds extends GhidraScript {
             ",\"code_failed\":" + codeFailed +
             ",\"label_applied\":" + labelApplied +
             ",\"label_failed\":" + labelFailed +
-            ",\"unmapped\":" + unmapped + "}";
+            ",\"unmapped\":" + unmapped +
+            ",\"context_applied\":" + contextApplied + "}";
         currentProgram.getOptions(Program.PROGRAM_INFO).setString(REPORT_OPTION, report);
         println("REA seeds applied: " + report);
     }

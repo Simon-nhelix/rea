@@ -270,10 +270,22 @@ Evidence in `rea compare-wasm-interfaces input.json --json`.
 
 ## Console ROMs and game localization
 
-REA auto-detects 15 console ROM and executable formats (`psx-exe`, `ps2-elf`,
+REA admits 16 console ROM and executable formats (`psx-exe`, `ps2-elf`,
 `psp`, `ps3`, `xbox`, `gc-dol`, `gba`, `nds`, `saturn`, `md`, `snes`, `pce`,
-`nes`, `gb`, `wsc`) and configures architecture/bank memory maps (plus GBA
+`nes`, `gb`, `wsc`, `dc-bin`) and configures architecture/bank memory maps (plus GBA
 hardware IO register symbols `REG_*`) when opening in headless Ghidra.
+Raw Dreamcast binaries other than `1ST_READ.BIN` need explicit `dc-bin` selection.
+
+For SNES, preserve CPU addresses and source file offsets separately. Ordinary
+LoROM/HiROM mirrors are mapped; extended or cartridge-specific layouts remain
+unverified. At an unreachable 65816 entry, obtain E/M/X from a known flow or
+romlab observation and supply exact-address context seeds through
+`REA_GHIDRA_SEED_FILE` before decoding. Do not guess instruction widths from
+opcode patterns or classify raw-byte matches as confirmed references. See the
+[console localization workflow](https://github.com/morluto/rea/blob/main/docs/console-localization.md)
+for seed syntax, optional processor sources, runtime cross-checks and limits.
+Game Boy needs the dedicated SM83 language; PCE uses an experimental HuC6280
+language whose T-mode/MMR/block-transfer semantics are incomplete.
 
 Four specialized workflows support console ROM string extraction, pointer table
 analysis, and code cave discovery:

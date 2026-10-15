@@ -25,7 +25,12 @@ export const ghidraSeedCommitmentSchema = z.strictObject({
   path: z.string().refine(isAbsolute, "Seed path must be absolute"),
   configured_path: z.string().refine(isAbsolute, "Seed path must be absolute"),
   sha256: digest,
-  entries: z.strictObject({ function: count, code: count, label: count }),
+  entries: z.strictObject({
+    function: count,
+    code: count,
+    label: count,
+    context: count.optional(),
+  }),
 });
 export type GhidraSeedCommitment = z.infer<typeof ghidraSeedCommitmentSchema>;
 
@@ -42,10 +47,11 @@ export const ghidraSeedReportSchema = z.strictObject({
   label_applied: count,
   label_failed: count,
   unmapped: count,
+  context_applied: count.optional(),
 });
 export type GhidraSeedReport = z.infer<typeof ghidraSeedReportSchema>;
 
-type SeedKind = "function" | "code" | "label";
+type SeedKind = "function" | "code" | "label" | "context";
 interface SeedEntry {
   readonly address: bigint;
   readonly kind: SeedKind;
@@ -82,8 +88,15 @@ export const parseGhidraSeeds = (
     const [address, kind, name] = fields;
     if (address === undefined || !/^0x[0-9a-fA-F]{1,16}$/u.test(address))
       return err(seedLineError(number, "address must be 0x-prefixed hex"));
-    if (kind !== "function" && kind !== "code" && kind !== "label")
-      return err(seedLineError(number, "kind must be function, code or label"));
+    if (
+      kind !== "function" &&
+      kind !== "code" &&
+      kind !== "label" &&
+      kind !== "context"
+    )
+      return err(
+        seedLineError(number, "kind must be function, code, label or context"),
+      );
     if (
       name !== undefined &&
       (name.length === 0 ||
@@ -102,15 +115,29 @@ export const parseGhidraSeeds = (
       return err(
         seedLineError(number, "a code seed takes no name; add a label seed"),
       );
+    let canonicalName = name;
+    if (kind === "context") {
+      const context = name?.match(
+        /^([A-Za-z_][A-Za-z0-9_]{0,127})=0x([0-9a-fA-F]{1,64})$/u,
+      );
+      if (context === undefined || context === null)
+        return err(
+          seedLineError(
+            number,
+            "a context seed requires register=0xvalue (at most 256 bits)",
+          ),
+        );
+      canonicalName = `${context[1]}=0x${BigInt(`0x${context[2]}`).toString(16)}`;
+    }
     const value = BigInt(address);
-    const key = `${value.toString(16)}:${kind}`;
+    const key = `${value.toString(16)}:${kind}${kind === "context" ? `:${canonicalName?.split("=")[0]}` : ""}`;
     if (seen.has(key))
       return err(seedLineError(number, `duplicate ${kind} seed at ${address}`));
     seen.add(key);
     entries.push({
       address: value,
       kind,
-      ...(name === undefined ? {} : { name }),
+      ...(canonicalName === undefined ? {} : { name: canonicalName }),
     });
     if (entries.length > MAX_GHIDRA_SEED_ENTRIES)
       return err(
@@ -206,8 +233,14 @@ export const resolveGhidraAnalysisSeeds = async (
   }
   if (!parsed.ok) return parsed;
   const normalized = normalizedSeeds(parsed.value);
-  const tally = { function: 0, code: 0, label: 0 };
-  for (const entry of parsed.value) tally[entry.kind] += 1;
+  const tally: {
+    function: number;
+    code: number;
+    label: number;
+    context?: number;
+  } = { function: 0, code: 0, label: 0 };
+  for (const entry of parsed.value)
+    tally[entry.kind] = (tally[entry.kind] ?? 0) + 1;
   return ok({
     format: GHIDRA_SEED_FORMAT,
     path,
@@ -244,7 +277,8 @@ export const snapshotGhidraAnalysisSeeds = async (
 const totalEntries = (commitment: GhidraSeedCommitment): number =>
   commitment.entries.function +
   commitment.entries.code +
-  commitment.entries.label;
+  commitment.entries.label +
+  (commitment.entries.context ?? 0);
 
 /** Fail closed when the session did not apply exactly the committed seeds. */
 export const ghidraSeedFailure = (
@@ -259,7 +293,8 @@ export const ghidraSeedFailure = (
       : report === undefined
         ? "The Ghidra session did not report the committed analysis seeds."
         : report.sha256 !== commitment.sha256 ||
-            report.entries !== totalEntries(commitment)
+            report.entries !== totalEntries(commitment) ||
+            (report.context_applied ?? 0) !== (commitment.entries.context ?? 0)
           ? "The Ghidra session applied analysis seeds that differ from the committed profile."
           : undefined;
   return reason === undefined
@@ -277,10 +312,10 @@ export const ghidraSeedLimitations = (
   commitment === undefined
     ? []
     : [
-        `Ghidra analysis was seeded before auto-analysis from ${commitment.path} (sha256 ${commitment.sha256}: ${commitment.entries.function} function, ${commitment.entries.code} code, ${commitment.entries.label} label entries). Seeded functions, code and names are caller assertions, not Ghidra discoveries.`,
+        `Ghidra analysis was seeded before auto-analysis from ${commitment.path} (sha256 ${commitment.sha256}: ${commitment.entries.function} function, ${commitment.entries.code} code, ${commitment.entries.label} label entries${commitment.entries.context === undefined ? "" : `, ${commitment.entries.context} processor context entries`}). Seeded functions, code and names are caller assertions, not Ghidra discoveries. Processor context is a caller assertion at the exact seed address, not an observed CPU state.`,
         ...(report === undefined
           ? []
           : [
-              `Seed outcome: ${report.function_created} functions created, ${report.function_existing} already present, ${report.function_failed} failed; ${report.code_decoded} code seeds decoded, ${report.code_failed} failed; ${report.label_applied} labels applied, ${report.label_failed} failed; ${report.unmapped} seeds outside initialized memory.`,
+              `Seed outcome: ${report.function_created} functions created, ${report.function_existing} already present, ${report.function_failed} failed; ${report.code_decoded} code seeds decoded, ${report.code_failed} failed; ${report.label_applied} labels applied, ${report.label_failed} failed; ${report.unmapped} seeds outside initialized memory; ${report.context_applied ?? 0} processor context seeds applied.`,
             ]),
       ];

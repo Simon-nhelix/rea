@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<language_definitions>
+  <language processor="HuC6280" endian="little" size="16" variant="experimental" version="1.0"
+    slafile="huc6280.sla" processorspec="6502.pspec" id="HuC6280:LE:16:experimental">
+    <description>HuC6280 experimental static decode; incomplete semantics</description>
+    <compiler name="default" spec="6502.cspec" id="default"/>
+  </language>
+</language_definitions>

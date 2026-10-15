@@ -1,5 +1,8 @@
 import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { describe, expect, it } from "vitest";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/ajv";
+import { CONSOLE_TARGET_FORMATS } from "../../../src/domain/consoleRom.js";
+import { toolOutputSchemaWithMetadata } from "../../../src/contracts/toolSchemaMetadata.js";
 import { connectGhidraMcp } from "./ghidraMcpHarness.js";
 import { toolContract } from "../../../src/contracts/toolContracts.js";
 import { expandToolAvailability } from "../../../src/contracts/toolOutputSchemaPrimitives.js";
@@ -52,6 +55,55 @@ describe("Ghidra MCP capability routing", () => {
           provider: { id: "ghidra", version: "12.1.4" },
         },
       });
+      // Reuse a production-shaped session observation to verify that every
+      // admitted console format has the same lifecycle contract as open_binary.
+      for (const dialect of ["draft-2020-12", "draft-07"] as const) {
+        const advertised = toolOutputSchemaWithMetadata(
+          toolContract("binary_session"),
+        )["~standard"].jsonSchema.output({ target: dialect });
+        const validate = new AjvJsonSchemaValidator().getValidator(advertised);
+        for (const format of CONSOLE_TARGET_FORMATS) {
+          const observation = {
+            result: {
+              ...sessionStatus.result,
+              format,
+              kind: "executable",
+              architecture: (
+                {
+                  gba: "arm",
+                  "psx-exe": "r3000",
+                  "ps2-elf": "r5900",
+                  psp: "allegrex",
+                  ps3: "cell-ppu",
+                  xbox: "x86",
+                  "dc-bin": "sh4",
+                  saturn: "sh2",
+                  nds: "arm",
+                  md: "68000",
+                  pce: "6502",
+                  "gc-dol": "gekko",
+                  snes: "65816",
+                  nes: "6502",
+                  gb: "sm83",
+                  wsc: "x86",
+                } as const
+              )[format],
+              entry_point: "0x8000",
+            },
+          };
+          expect(
+            toolContract("open_binary").outputSchema.safeParse(observation)
+              .success,
+          ).toBe(true);
+          expect(
+            toolContract("binary_session").outputSchema.safeParse(observation)
+              .success,
+          ).toBe(true);
+          expect(validate(observation).valid).toBe(true);
+          const { entry_point: _entry, ...missingEntry } = observation.result;
+          expect(validate({ result: missingEntry }).valid).toBe(false);
+        }
+      }
       const availability = expandToolAvailability(
         sessionStatus.result.tool_availability,
       );

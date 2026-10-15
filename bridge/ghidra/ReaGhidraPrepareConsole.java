@@ -14,6 +14,7 @@ import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.mem.MemoryBlockSourceInfo;
 import ghidra.program.model.symbol.SourceType;
+import java.io.InputStream;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -193,6 +194,24 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
                 throw new IllegalStateException("BinaryLoader import did not record FileBytes");
             }
             FileBytes fileBytes = allFileBytes.get(0);
+            String execPathRaw = currentProgram.getExecutablePath();
+            if (execPathRaw != null && !execPathRaw.isBlank()) {
+                Path execPath = Path.of(execPathRaw);
+                if (Files.isRegularFile(execPath, LinkOption.NOFOLLOW_LINKS)) {
+                    long actualSize = Files.size(execPath);
+                    if (fileBytes.getSize() < actualSize) {
+                        try (InputStream in = Files.newInputStream(execPath)) {
+                            fileBytes = memory.createFileBytes(
+                                execPath.getFileName().toString(),
+                                0L,
+                                actualSize,
+                                in,
+                                monitor
+                            );
+                        }
+                    }
+                }
+            }
 
             // Remove the default flat block created by BinaryLoader so we can map
             // exact console segments backed by the same FileBytes.
@@ -232,6 +251,7 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
                 created.setWrite(map.writable);
                 created.setExecute(map.executable);
             }
+
         }
 
         for (MemoryRegionSpec region : memRegions) {
@@ -287,19 +307,112 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
             rawEntryOffset = alignedOffset;
         }
 
-        if (Long.compareUnsigned(rawEntryOffset, maxOffset) <= 0) {
-            Address entry = space.getAddress(rawEntryOffset);
-            MemoryBlock entryBlock = memory.getBlock(entry);
-            if (entryBlock != null && entryBlock.isInitialized()) {
-                addEntryPoint(entry);
-                disassemble(entry);
-                if (getFunctionAt(entry) == null) {
-                    createFunction(entry, "entry");
+        seedEntryAddress(space, memory, maxOffset, rawEntryOffset, "entry");
+        seedConsoleVectors(format, space, memory, maxOffset, rawEntryOffset);
+
+        currentProgram.getOptions(Program.PROGRAM_INFO).setString(
+            "REA console entry",
+            String.format("0x%x", rawEntryOffset)
+        );
+        currentProgram.getOptions(Program.PROGRAM_INFO).setBoolean("REA console prepared", true);
+    }
+
+    private void seedEntryAddress(
+        AddressSpace space,
+        Memory memory,
+        long maxOffset,
+        long rawOffset,
+        String name
+    ) throws Exception {
+        if (Long.compareUnsigned(rawOffset, maxOffset) > 0) return;
+        Address address = space.getAddress(rawOffset);
+        MemoryBlock block = memory.getBlock(address);
+        if (block == null || !block.isInitialized()) return;
+        if (name != null) {
+            createLabel(address, name, true, SourceType.IMPORTED);
+        }
+        if (currentProgram.getLanguageID().getIdAsString().equals("65816:LE:16:default")) {
+            // Interrupt vectors may alias code entered under a different status.
+            // Labels preserve the observation without imposing conflicting modes.
+            if (!"entry".equals(name)) return;
+            Address resetVector = space.getAddress(0xfffcL);
+            if (!memory.contains(resetVector) ||
+                (memory.getShort(resetVector) & 0xffff) != rawOffset) return;
+            if ("entry".equals(name)) {
+                Register efReg = currentProgram.getRegister("ctx_EF");
+                if (efReg != null) {
+                    currentProgram.getProgramContext().setValue(efReg, address, address, BigInteger.ONE);
+                }
+                Register mfReg = currentProgram.getRegister("ctx_MF");
+                Register xfReg = currentProgram.getRegister("ctx_XF");
+                if (mfReg != null) {
+                    currentProgram.getProgramContext().setValue(mfReg, address, address, BigInteger.ONE);
+                }
+                if (xfReg != null) {
+                    currentProgram.getProgramContext().setValue(xfReg, address, address, BigInteger.ONE);
                 }
             }
         }
+        if ("entry".equals(name)) addEntryPoint(address);
+        disassemble(address);
+        if (name != null && getFunctionAt(address) == null) {
+            createFunction(address, name);
+        }
+    }
 
-        currentProgram.getOptions(Program.PROGRAM_INFO).setBoolean("REA console prepared", true);
+    private void seedConsoleVectors(
+        String format,
+        AddressSpace space,
+        Memory memory,
+        long maxOffset,
+        long primaryEntry
+    ) throws Exception {
+        switch (format) {
+            case "snes" -> {
+                long[] vecAddrs = { 0x00ffeaL, 0x00ffeeL, 0x00fffaL, 0x00fffeL };
+                String[] vecNames = { "vec_nmi_native", "vec_irq_native", "vec_nmi_emu", "vec_irq_emu" };
+                for (int i = 0; i < vecAddrs.length; i++) {
+                    Address vecPtr = space.getAddress(vecAddrs[i]);
+                    if (!memory.contains(vecPtr) || !memory.contains(vecPtr.add(1))) continue;
+                    int target = memory.getShort(vecPtr) & 0xffff;
+                    if (target >= 0x8000 && target < 0xffe0 && target != primaryEntry) {
+                        seedEntryAddress(space, memory, maxOffset, target, vecNames[i]);
+                    }
+                }
+            }
+            case "nes" -> {
+                long[] vecAddrs = { 0xfffaL, 0xfffeL };
+                String[] vecNames = { "vec_nmi", "vec_irq" };
+                for (int i = 0; i < vecAddrs.length; i++) {
+                    Address vecPtr = space.getAddress(vecAddrs[i]);
+                    if (!memory.contains(vecPtr) || !memory.contains(vecPtr.add(1))) continue;
+                    int target = memory.getShort(vecPtr) & 0xffff;
+                    if (target >= 0x8000 && target < 0xfffa && target != primaryEntry) {
+                        seedEntryAddress(space, memory, maxOffset, target, vecNames[i]);
+                    }
+                }
+            }
+            case "gb" -> {
+                long[] vecAddrs = { 0x0040L, 0x0048L, 0x0050L, 0x0058L, 0x0060L };
+                String[] vecNames = { "int_vblank", "int_stat", "int_timer", "int_serial", "int_joypad" };
+                for (int i = 0; i < vecAddrs.length; i++) {
+                    seedEntryAddress(space, memory, maxOffset, vecAddrs[i], vecNames[i]);
+                }
+            }
+            case "md" -> {
+                long[] vecAddrs = { 0x000070L, 0x000078L };
+                String[] vecNames = { "vec_hblank", "vec_vblank" };
+                for (int i = 0; i < vecAddrs.length; i++) {
+                    Address vecPtr = space.getAddress(vecAddrs[i]);
+                    if (!memory.contains(vecPtr) || !memory.contains(vecPtr.add(3))) continue;
+                    long target = Integer.toUnsignedLong(memory.getInt(vecPtr));
+                    if (target >= 0x200L && target != primaryEntry) {
+                        seedEntryAddress(space, memory, maxOffset, target, vecNames[i]);
+                    }
+                }
+            }
+            default -> {}
+        }
     }
 
     private void applyGbaFields(

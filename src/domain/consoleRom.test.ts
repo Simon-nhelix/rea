@@ -93,6 +93,7 @@ describe("consoleRom", () => {
     });
     expect(admitted.ok).toBe(true);
     if (!admitted.ok) return;
+    expect(admitted.value.ghidraLanguageId).toBe("SM83:LE:16:default");
     expect(admitted.value.format).toBe("gb");
     expect(admitted.value.architecture).toBe("sm83");
     expect(admitted.value.entryPoint).toBe("0x100");
@@ -376,8 +377,99 @@ describe("consoleRom Saturn, NDS, Mega Drive, PCE, and multi-bank coordinates", 
     expect(pceAdmitted.ok).toBe(true);
     if (pceAdmitted.ok) {
       expect(pceAdmitted.value.architecture).toBe("6502");
+      expect(pceAdmitted.value.ghidraLanguageId).toBe(
+        "HuC6280:LE:16:experimental",
+      );
       expect(pceAdmitted.value.entryPoint).toBe("0xe120");
     }
+
+    // Standalone 16 KiB Saturn IP.BIN whose firstReadAddress is in 1ST_READ.BIN
+    const satIpOnly = Buffer.alloc(0x4000, 0);
+    satIpOnly.write("SEGA SEGASATURN ", 0x00, "ascii");
+    satIpOnly.writeUInt32BE(0x06010000, 0xf0);
+    const satIpAdmitted = admitConsoleTarget({
+      format: "saturn",
+      headerBytes: satIpOnly,
+      fileBytes: 0x4000,
+    });
+    expect(satIpAdmitted.ok).toBe(true);
+    if (satIpAdmitted.ok) {
+      expect(satIpAdmitted.value.entryPoint).toBe("0x6002100");
+    }
+
+    // Dreamcast SH-4 raw boot binary (.bin with SH-4 NOPs + 0x8Cxxxxxx literal pool pointer)
+    const dcBin = Buffer.alloc(0x80, 0);
+    dcBin.writeUInt16LE(0x0009, 0x00); // nop
+    dcBin.writeUInt32LE(0x8c184c40, 0x28); // literal pool pointer in Dreamcast RAM
+    expect(
+      detectConsoleFormatFromHeader(dcBin, 0x10000, "/roms/1ST_READ.BIN"),
+    ).toBe("dc-bin");
+  });
+});
+
+describe("consoleRom multi-bank and overlay coordinate resolution", () => {
+  it("maps the last LoROM banks through ROM mirrors and round-trips their offsets", () => {
+    const admitted = admitConsoleTarget({
+      format: "snes",
+      headerBytes: Buffer.alloc(0x8000),
+      fileBytes: 0x400000,
+    });
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    expect(admitted.value.romMetadata.bank_count).toBe(128);
+    expect(admitted.value.fileMappings).toHaveLength(254);
+    for (const [bank, address] of [
+      [125, 0x7d8100],
+      [126, 0xfe8100],
+      [127, 0xff8100],
+    ]) {
+      const offset = bank! * 0x8000 + 0x100;
+      expect(resolveConsoleVirtualAddress(admitted.value, offset)).toBe(
+        `0x${address!.toString(16)}`,
+      );
+      expect(resolveConsoleFileOffset(admitted.value, address!)).toBe(offset);
+    }
+    expect(resolveConsoleFileOffset(admitted.value, 0x7e8100)).toBeNull();
+    expect(resolveConsoleVirtualAddress(admitted.value, 0x400000)).toBeNull();
+  });
+
+  it("uses the same bounded HiROM aliases for imports and offset lookup", () => {
+    const header = Buffer.alloc(0x10000);
+    header.writeUInt16LE(0xffff, 0xffdc);
+    header.writeUInt16LE(0x8000, 0xfffc);
+    const admitted = admitConsoleTarget({
+      format: "snes",
+      headerBytes: header,
+      fileBytes: 0x1c000,
+    });
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    expect(admitted.value.romMetadata.mapping_mode).toBe("HiROM");
+    for (const address of [0xc18100, 0x418100, 0x018100, 0x818100]) {
+      expect(resolveConsoleFileOffset(admitted.value, address)).toBe(0x18100);
+    }
+    expect(resolveConsoleVirtualAddress(admitted.value, 0x18100)).toBe(
+      "0xc18100",
+    );
+    for (const address of [0xc1c000, 0x41c000, 0x01c000, 0x81c000]) {
+      expect(resolveConsoleFileOffset(admitted.value, address)).toBeNull();
+    }
+    expect(resolveConsoleVirtualAddress(admitted.value, 0x1c000)).toBeNull();
+    for (const map of admitted.value.fileMappings) {
+      expect(map.fileOffset + map.byteLength).toBeLessThanOrEqual(0x1c000);
+    }
+  });
+
+  it("does not infer a Dreamcast from opcode and pointer coincidences", () => {
+    const bytes = Buffer.alloc(0x80);
+    bytes.writeUInt16LE(0x0009, 0);
+    bytes.writeUInt32LE(0x8c184c40, 0x28);
+    expect(
+      detectConsoleFormatFromHeader(bytes, 0x10000, "/roms/unrelated.bin"),
+    ).toBeUndefined();
+    expect(
+      detectConsoleFormatFromHeader(bytes, 0x10000, "/roms/not1st_read.bin"),
+    ).toBeUndefined();
   });
 
   it("resolves multi-bank SNES, GB, and PS1 headerless overlay coordinates", () => {
@@ -407,7 +499,7 @@ describe("consoleRom Saturn, NDS, Mega Drive, PCE, and multi-bank coordinates", 
     });
     expect(snes.ok).toBe(true);
     if (snes.ok) {
-      expect(snes.value.fileMappings).toHaveLength(4);
+      expect(snes.value.fileMappings).toHaveLength(8);
       // Bank 2 ($02:8100) -> 512 + 2 * 0x8000 + 0x100
       expect(resolveConsoleFileOffset(snes.value, 0x028100)).toBe(
         512 + 0x10100,
@@ -425,6 +517,10 @@ describe("consoleRom Saturn, NDS, Mega Drive, PCE, and multi-bank coordinates", 
       expect(resolveConsoleVirtualAddress(snes.value, 512 + 0x10100)).toBe(
         "0x28100",
       );
+      expect(
+        resolveConsoleVirtualAddress(snes.value, 512 + 4 * 0x8000),
+      ).toBeNull();
+      expect(resolveConsoleVirtualAddress(snes.value, 511)).toBeNull();
 
       // Overlapping mappings keep declaration-order (first match) semantics.
       const overlapping = {

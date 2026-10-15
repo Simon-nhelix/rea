@@ -8,6 +8,8 @@ const packedCutterBridge = "package/bridge/cutter/rea_bridge.py";
 const packedGhidraBridge = "package/bridge/ghidra/ReaGhidraBridge.java";
 const packedGhidraActivator =
   "package/bridge/ghidra/ReaGhidraBundleActivator.java";
+const packedGhidraConsole =
+  "package/bridge/ghidra/ReaGhidraPrepareConsole.java";
 
 /** Check shipped bridge files; real-provider lanes verify runtime behavior. */
 export async function verifyPackedBridge({ workspace, tarball, packedFiles }) {
@@ -16,6 +18,7 @@ export async function verifyPackedBridge({ workspace, tarball, packedFiles }) {
     packedCutterBridge,
     packedGhidraBridge,
     packedGhidraActivator,
+    packedGhidraConsole,
   ]) {
     if (!packedFiles.includes(path)) throw new Error(`package omitted ${path}`);
   }

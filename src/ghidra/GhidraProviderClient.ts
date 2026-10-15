@@ -584,6 +584,20 @@ export const createGhidraProviderClient = (input: {
     ...(consoleRom !== undefined
       ? [
           `Console ROM/executable profile (${consoleRom.format}) maps file-backed segments and hardware RAM/MMIO regions statically using Ghidra language ${consoleRom.ghidraLanguageId}. Dynamic bank switching, DMA transfers, and hardware interrupts are not emulated.`,
+          ...(consoleRom.format === "snes"
+            ? [
+                "SNES reset E/M/X context is established only at the actual reset-vector entry. Explicit processor-context seeds are caller assertions at their selected addresses, not runtime observations by Ghidra. Instruction widths downstream of unknown PLP, RTI or XCE status changes are not proven; validate them against instruction bytes and observed CPU status before relying on pseudocode. Cross-references contain analyzed Ghidra references only; no hits do not prove that code or data is unused.",
+              ]
+            : []),
+          ...(consoleRom.format === "gb"
+            ? [
+                "Game Boy uses a dedicated SM83 language, not stock Z80. HALT/STOP and interrupt controls are abstract userops; hardware timing, STOP glitches and mapper bank transitions are not modeled. Complete CPU semantic and game-specific ABI validation has not been performed.",
+              ]
+            : consoleRom.format === "pce"
+              ? [
+                  "PC Engine uses an experimental dedicated HuC6280 language. SET/T-mode redirected ALU behavior is not modeled; pseudocode after SET can be incorrect. TAM/TMA and block transfers expose opaque userops without MMR remapping or defined copy effects. Instruction flags and calling convention have not been comprehensively validated. Use instruction bytes and disassembly as primary evidence; decompiler output is provisional.",
+                ]
+              : []),
         ]
       : []),
     ...(target.kind === "executable" &&

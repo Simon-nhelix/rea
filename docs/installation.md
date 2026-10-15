@@ -878,6 +878,9 @@ rejects the inherited `-mmacosx-version-min=10.6` flag, retry the make with
 
 ### Ghidra import language and analysis seeds
 
+For ROM mappings, console processor prerequisites and observed CPU-state seeds,
+see [console localization with romlab](console-localization.md).
+
 Ghidra detects the language from the executable header. To set it (for example, Borland C++ PE images):
 
 ```bash
@@ -893,7 +896,30 @@ To seed code that auto-analysis cannot reach (computed jumps, pointers in data):
 export REA_GHIDRA_SEED_FILE=/absolute/path/to/seeds.tsv
 ```
 
-Each line is `address<TAB>kind[<TAB>name]`, where kind is `function`, `code` or `label` (a label needs a name). Addresses are `0x` hex in the default space; `#` lines are comments. A pre-script applies seeds before auto-analysis: functions from the highest address down, then code, then labels. The seed digest is part of the analysis profile, and the session fails if the applied seeds differ. Result limitations report the outcome counts; a seed fails when it overlaps an instruction Ghidra already decoded.
+Each line is `address<TAB>kind[<TAB>name]`, where kind is `function`, `code`, `label` or `context` (a label needs a name; context takes a `register=0xvalue` assignment). Addresses are `0x` hex in the default space; `#` lines are comments. A pre-script applies seeds before auto-analysis: processor context first, functions from the highest address down, then code, then labels. The seed digest is part of the analysis profile, and the session fails if the applied seeds differ. Result limitations report the outcome counts; a seed fails when it overlaps an instruction Ghidra already decoded.
+
+For processors whose instruction widths depend on status flags, context seeds
+supply explicit caller assertions before function/code seeds are decoded. For
+example, a SNES entry observed in native mode with 16-bit accumulator and index
+registers can use these literal tab-separated lines:
+
+```text
+0x9a86a3	context	ctx_EF=0x0
+0x9a86a3	context	ctx_MF=0x0
+0x9a86a3	context	ctx_XF=0x0
+0x9a86a3	function
+```
+
+Use the actual E/M/X values observed at the selected entry (for example from
+an emulator CPU-status snapshot), and retain that observation separately. These
+values are caller assertions for static decoding, not runtime observations made
+by Ghidra. Each context seed sets one processor context register at that exact
+analysis address; it does not assert a range or set running CPU registers.
+The decoder may propagate context along its instruction flow. Context entries
+are applied first regardless of file order, are included in the seed digest and
+reported applied count, and reject duplicate register/address assignments,
+unknown/non-context registers, values wider than the register, and unmapped
+addresses. Register values use unsigned `0x` hexadecimal (at most 256 bits).
 
 Label seeds can name mapped uninitialized storage such as `.bss`; function and code seeds require initialized bytes.
 

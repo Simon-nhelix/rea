@@ -51,6 +51,8 @@ import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.cmd.function.CreateFunctionCmd;
 import ghidra.app.util.headless.HeadlessScript;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileOptions;
@@ -812,8 +814,10 @@ public final class ReaGhidraBridge extends HeadlessScript {
             Address bound = start == null ? end : start;
             if (bound != null && !bound.getAddressSpace().equals(low.getAddressSpace())) continue;
             // Without bounds, search loaded memory only. Non-loaded file parts
-            // (such as .symtab) and overlays stay reachable through explicit bounds.
-            if (bound == null && (!block.isLoaded() || block.isOverlay())) {
+            // (such as .symtab), overlays, and console mirror blocks stay
+            // reachable through explicit bounds.
+            if (bound == null && (!block.isLoaded() || block.isOverlay() ||
+                (isConsoleProgram() && isConsoleMirrorBlock(block)))) {
                 notLoaded.add(byteSearchCoverage(block, low, high));
                 continue;
             }
@@ -968,6 +972,10 @@ public final class ReaGhidraBridge extends HeadlessScript {
                 // can fall back to source coordinates; ambiguity never falls back.
                 if (!failure.code.equals("not_found") || !selector.matches("0x[0-9a-fA-F]+"))
                     throw failure;
+                Address parsedAddr = tryParseAddress(selector);
+                if (parsedAddr != null && currentProgram.getMemory().contains(parsedAddr)) {
+                    throw failure;
+                }
             }
         }
         String coordinate = explicitOffset ? selector.substring(prefix.length()) : selector;
@@ -992,6 +1000,12 @@ public final class ReaGhidraBridge extends HeadlessScript {
             }
         }
         List<Address> candidates = new ArrayList<>(mappedAddresses);
+        if (candidates.size() > 1 && isConsoleProgram()) {
+            Address preferred = selectPreferredConsoleCandidate(candidates);
+            if (preferred != null) {
+                candidates = List.of(preferred);
+            }
+        }
         if (candidates.size() > 1)
             throw new RequestFailure("ambiguous", "File offset " + coordinate +
                 " has multiple loaded mappings: " + candidates.stream().map(ReaGhidraBridge::canonicalAddress).toList() +
@@ -1398,16 +1412,23 @@ public final class ReaGhidraBridge extends HeadlessScript {
         requireKeys(params, Set.of("document", "address"));
         requireDocument(params);
         Address address = requireAddress(params, "address");
-        ReferenceIterator references = currentProgram.getReferenceManager().getReferencesTo(address);
+        Set<Address> targets = new java.util.LinkedHashSet<>();
+        targets.add(address);
+        if (isConsoleProgram()) {
+            targets.addAll(consoleEquivalentAddresses(address));
+        }
         Set<Address> sources = new HashSet<>();
-        while (references.hasNext()) {
-            monitor.checkCancelled();
-            Reference reference = references.next();
-            if (reference.isEntryPointReference()) {
-                continue;
+        for (Address target : targets) {
+            ReferenceIterator references = currentProgram.getReferenceManager().getReferencesTo(target);
+            while (references.hasNext()) {
+                monitor.checkCancelled();
+                Reference reference = references.next();
+                if (reference.isEntryPointReference()) {
+                    continue;
+                }
+                sources.add(reference.getFromAddress());
             }
-            sources.add(reference.getFromAddress());
-            }
+        }
         List<Address> ordered = new ArrayList<>(sources);
         ordered.sort(Address::compareTo);
         JsonArray result = new JsonArray();
@@ -2218,6 +2239,30 @@ public final class ReaGhidraBridge extends HeadlessScript {
                 }
                 if (matchesName) matches.add(function);
             }
+            if (matches.isEmpty() && isConsoleProgram()) {
+                for (Symbol sym : currentProgram.getSymbolTable().getGlobalSymbols(value)) {
+                    monitor.checkCancelled();
+                    Address symAddr = sym.getAddress();
+                    if (symAddr != null && symAddr.isMemoryAddress()) {
+                        Function fn = functionAtOrContaining(symAddr);
+                        if (fn != null && !matches.contains(fn)) {
+                            matches.add(fn);
+                        }
+                    }
+                }
+            }
+            if (matches.size() != 1 && isConsoleProgram() && value.equals("entry")) {
+                String configuredEntry = currentProgram
+                    .getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO)
+                    .getString("REA console entry", null);
+                if (configuredEntry != null) {
+                    Address entryAddr = tryParseAddress(configuredEntry);
+                    if (entryAddr != null) {
+                        Function fn = functionAtOrContaining(entryAddr);
+                        if (fn != null) return fn;
+                    }
+                }
+            }
             if (matches.size() > 1)
                 throw new RequestFailure("ambiguous", "Ghidra procedure name is ambiguous: " + value +
                     "; select an exact entry address from " + matches.stream()
@@ -2240,11 +2285,162 @@ public final class ReaGhidraBridge extends HeadlessScript {
         return function;
     }
 
-    private Function functionAtOrContaining(Address address) {
+    private Function functionAtOrContaining(Address address) throws Exception {
         Function function = currentProgram.getFunctionManager().getFunctionAt(address);
-        return function == null && address.isMemoryAddress()
-            ? currentProgram.getFunctionManager().getFunctionContaining(address)
-            : function;
+        if (function == null && address.isMemoryAddress()) {
+            function = currentProgram.getFunctionManager().getFunctionContaining(address);
+        }
+        if (function == null && isConsoleProgram()) {
+            function = ensureConsoleProcedureAt(address);
+        }
+        return function;
+    }
+
+    private boolean isConsoleProgram() {
+        return currentProgram
+            .getOptions(ghidra.program.model.listing.Program.PROGRAM_INFO)
+            .getBoolean("REA console prepared", false);
+    }
+
+    private static boolean isConsoleMirrorBlock(MemoryBlock block) {
+        String name = block.getName();
+        return name.startsWith("FAST_BANK") || name.startsWith("MIRROR_BANK");
+    }
+
+    private Address selectPreferredConsoleCandidate(List<Address> candidates) {
+        for (Address candidate : candidates) {
+            if (currentProgram.getFunctionManager().getFunctionAt(candidate) != null) {
+                return candidate;
+            }
+        }
+        for (Address candidate : candidates) {
+            if (currentProgram.getFunctionManager().getFunctionContaining(candidate) != null) {
+                return candidate;
+            }
+        }
+        for (Address candidate : candidates) {
+            MemoryBlock block = currentProgram.getMemory().getBlock(candidate);
+            if (block != null && !isConsoleMirrorBlock(block)) {
+                return candidate;
+            }
+        }
+        return candidates.isEmpty() ? null : candidates.get(0);
+    }
+
+    private List<Address> consoleEquivalentAddresses(Address address) throws Exception {
+        if (!address.isMemoryAddress()) return List.of();
+        Set<Address> equivalents = new java.util.LinkedHashSet<>();
+        MemoryBlock block = currentProgram.getMemory().getBlock(address);
+        if (block != null && block.isInitialized()) {
+            TargetFileOffset mapping = targetFileOffset(block, address);
+            Long fileOffset = mapping.offset();
+            if (fileOffset != null) {
+                for (MemoryBlock other : currentProgram.getMemory().getBlocks()) {
+                    for (MemoryBlockSourceInfo source : other.getSourceInfos()) {
+                        FileBytes backing = source.getFileBytes().orElse(null);
+                        if (backing == null || !isTargetSource(backing)) continue;
+                        Address mapped = source.locateAddressForFileOffset(fileOffset);
+                        if (mapped != null) equivalents.add(mapped);
+                    }
+                }
+            }
+        }
+        // ROM equivalence comes from admitted FileBytes mappings, not a bank-bit
+        // guess: e.g. HiROM $40:8000 and $C0:8000 are not universal aliases.
+        return new ArrayList<>(equivalents);
+    }
+
+    private Function ensureConsoleProcedureAt(Address requested) throws Exception {
+        if (requested == null || !requested.isMemoryAddress()) return null;
+        Address target = requested;
+        boolean setThumb = false;
+        String langId = currentProgram.getLanguageID().getIdAsString();
+        if (langId.startsWith("ARM:") && (target.getOffset() & 1L) == 1L) {
+            target = target.subtract(1L);
+            setThumb = true;
+            Function alignedFn = currentProgram.getFunctionManager().getFunctionAt(target);
+            if (alignedFn == null) {
+                alignedFn = currentProgram.getFunctionManager().getFunctionContaining(target);
+            }
+            if (alignedFn != null) return alignedFn;
+        }
+        MemoryBlock block = currentProgram.getMemory().getBlock(target);
+        if (block == null || !block.isInitialized()) {
+            for (Address eq : consoleEquivalentAddresses(target)) {
+                MemoryBlock eqBlock = currentProgram.getMemory().getBlock(eq);
+                if (eqBlock != null && eqBlock.isInitialized()) {
+                    target = eq;
+                    block = eqBlock;
+                    break;
+                }
+            }
+        }
+        if (block == null || !block.isInitialized()) return null;
+        Listing listing = currentProgram.getListing();
+        // A caller-selected address permits attempting a decode, not replacing
+        // data or moving the requested entry into a containing instruction.
+        if (listing.getDefinedDataContaining(target) != null ||
+            (listing.getInstructionAt(target) == null &&
+             listing.getInstructionContaining(target) != null)) return null;
+
+        if (langId.equals("65816:LE:16:default") &&
+            currentProgram.getListing().getInstructionAt(target) == null) {
+            // M/X are execution state. Byte-pattern scoring cannot establish
+            // instruction widths, nor may it replace existing data definitions.
+            for (String name : List.of("ctx_EF", "ctx_MF", "ctx_XF")) {
+                Register flag = currentProgram.getRegister(name);
+                var known = flag == null ? null :
+                    currentProgram.getProgramContext().getNonDefaultValue(flag, target);
+                if (known == null || !known.hasValue()) {
+                    throw new RequestFailure("not_found",
+                        "SNES instruction context is unknown at " + canonicalAddress(target) +
+                        ". Establish E/M/X from a known control-flow entry or an observed CPU status register before decoding. Supply context seeds for ctx_EF, ctx_MF and ctx_XF plus a function/code seed through REA_GHIDRA_SEED_FILE, then reopen analysis; raw byte patterns do not establish a procedure.");
+                }
+            }
+        }
+
+        int tx = currentProgram.startTransaction("REA console on-demand procedure");
+        boolean commit = false;
+        try {
+            if (!block.isExecute()) {
+                block.setExecute(true);
+            }
+            if (setThumb) {
+                Register tmode = currentProgram.getRegister("TMode");
+                if (tmode != null) {
+                    currentProgram.getProgramContext().setValue(
+                        tmode, target, target, BigInteger.ONE
+                    );
+                }
+            }
+            if (listing.getInstructionAt(target) == null) {
+                DisassembleCommand disCmd = new DisassembleCommand(target, null, true);
+                disCmd.applyTo(currentProgram, monitor);
+            }
+            Instruction startInst = listing.getInstructionAt(target);
+            if (startInst != null) {
+                Address entryAddr = startInst.getAddress();
+                if (currentProgram.getFunctionManager().getFunctionAt(entryAddr) == null &&
+                    currentProgram.getFunctionManager().getFunctionContaining(entryAddr) == null) {
+                    CreateFunctionCmd fnCmd = new CreateFunctionCmd(entryAddr);
+                    fnCmd.applyTo(currentProgram, monitor);
+                }
+                Function created = currentProgram.getFunctionManager().getFunctionAt(entryAddr);
+                if (created == null) {
+                    created = currentProgram.getFunctionManager().getFunctionContaining(entryAddr);
+                }
+                if (created != null) {
+                    // Do not recursively create functions from guessed widths or
+                    // raw-byte caller candidates. Provider analysis owns callees.
+                    invalidateAnalysisCaches();
+                    commit = true;
+                    return created;
+                }
+            }
+            return null;
+        } finally {
+            currentProgram.endTransaction(tx, commit);
+        }
     }
 
     private JsonObject nativeApiBoundary(
@@ -3671,6 +3867,11 @@ public final class ReaGhidraBridge extends HeadlessScript {
         // data. Use actual body ownership, including an external's exact entry.
         AddressSet scope = functionObservationScope(function);
         boolean outgoing = direction.equals("outgoing");
+        if (!outgoing && isConsoleProgram()) {
+            for (Address eq : consoleEquivalentAddresses(function.getEntryPoint())) {
+                scope.add(eq);
+            }
+        }
         AddressIterator addresses = outgoing
             ? currentProgram.getReferenceManager().getReferenceSourceIterator(scope, true)
             : currentProgram.getReferenceManager().getReferenceDestinationIterator(scope, true);

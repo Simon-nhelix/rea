@@ -684,7 +684,9 @@ export const ghidraHeadlessArguments = (
                 "-loader-baseAddr",
                 consoleRom.languageId === "x86:LE:16:Real Mode"
                   ? "0000:0000"
-                  : consoleRom.baseAddr,
+                  : consoleRom.languageId.includes(":16:")
+                    ? "0x0"
+                    : consoleRom.baseAddr,
                 "-processor",
                 consoleRom.languageId,
                 "-cspec",

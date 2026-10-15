@@ -497,15 +497,22 @@ const consoleLifecycleTargetSchema = z.object({
   ),
 });
 
+// Open and session observations share the same target alternatives. Keep the
+// format union in one place so a new admitted target cannot be omitted from
+// session status after a successful open.
+const lifecycleTargetSchemas = [
+  detectedLifecycleTargetSchema,
+  rawLifecycleTargetSchema,
+  consoleLifecycleTargetSchema,
+] as const;
+const lifecycleTargetSchema = z.discriminatedUnion(
+  "format",
+  lifecycleTargetSchemas,
+);
+
 /** Exact structured-content schemas for target lifecycle operations. */
 export const sessionOutputSchemas = {
-  open_binary: lifecycleResultOf(
-    z.discriminatedUnion("format", [
-      detectedLifecycleTargetSchema,
-      rawLifecycleTargetSchema,
-      consoleLifecycleTargetSchema,
-    ]),
-  ),
+  open_binary: lifecycleResultOf(lifecycleTargetSchema),
   close_binary: lifecycleResultOf(
     z.union([
       z.null(),
@@ -535,14 +542,9 @@ export const sessionOutputSchemas = {
   binary_session: lifecycleResultOf(
     z.union([
       sessionProvider.extend({ open: z.literal(false) }),
-      sessionProvider.extend({
-        open: z.literal(true),
-        ...detectedLifecycleTargetSchema.shape,
-      }),
-      sessionProvider.extend({
-        open: z.literal(true),
-        ...rawLifecycleTargetSchema.shape,
-      }),
+      ...lifecycleTargetSchemas.map((target) =>
+        sessionProvider.extend({ open: z.literal(true), ...target.shape }),
+      ),
     ]),
   ),
   export_evidence_bundle: lifecycleResultOf(
