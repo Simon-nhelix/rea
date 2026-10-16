@@ -11,14 +11,17 @@ import {
   type ManagedMetadataLayout,
 } from "./ManagedMetadataLayout.js";
 import { readManagedPeLayout } from "./ManagedPeReader.js";
+import { memberListIndexSize } from "./ManagedMemberPointers.js";
 import { edges } from "./ManagedMemberRows.js";
 import { parseUserStrings } from "./ManagedUserStrings.js";
 import { signature, type ManagedMethod } from "./ManagedMemberInspectorCore.js";
 import { ManagedReaderFailure } from "./ManagedReaderFailure.js";
 import { managedMemberInspectionSchema } from "../domain/managed/managedArtifact.js";
 import { comparisonLimitations } from "../domain/managed/managedMemberComparisonCoverage.js";
+import { buildManagedPeFixture as buildMultiMethodManagedPeFixture } from "../../scripts/fixtures/managed/pe.mjs";
 
 import {
+  buildManagedNestedTypeFixture,
   buildManagedPeFixture,
   buildNativePeFixture,
   fixtureUserStringHeap,
@@ -519,6 +522,111 @@ describe("managed MethodSpec call targets", () => {
       ["invalid-blob", "metadata.MethodSpec:0x2b000001"],
       ["invalid-row", "metadata.MethodSpec:0x2b000002"],
       ["invalid-blob", "metadata.MethodSpec:0x2b000002"],
+    ]);
+  });
+});
+
+describe("managed nested types", () => {
+  const inspectNested = (
+    options: Parameters<typeof buildManagedNestedTypeFixture>[0] = {},
+  ) => {
+    const bytes = buildManagedNestedTypeFixture(options);
+    return inspectManagedMembersBytes(
+      bytes,
+      managedPeFixtureTarget(bytes, "/fixture/nested.dll"),
+    );
+  };
+
+  it("reports the enclosing type of each nested type", () => {
+    const result = inspectNested();
+
+    expect(
+      result.types.map(({ full_name, enclosing_type_token }) => [
+        full_name,
+        enclosing_type_token,
+      ]),
+    ).toEqual([
+      ["<Module>", null],
+      ["Fixture.A", null],
+      ["Fixture.B", null],
+      ["Inner", "0x02000002"],
+      ["Inner", "0x02000003"],
+      ["Leaf", "0x02000004"],
+    ]);
+    expect(result.nesting_read).toBe(true);
+    expect(result.coverage.issues).toEqual([]);
+  });
+
+  it.each([2, 3, 4, 5, 6, 7])(
+    "keeps nested visibility %i unresolved when its parent entry is missing",
+    (visibility) => {
+      const bytes = buildManagedNestedTypeFixture({ nestedClassRows: [] });
+      const target = () => managedPeFixtureTarget(bytes, "/fixture/nested.dll");
+      const row = inspectManagedMembersBytes(bytes, target()).types.find(
+        (type) => type.token === "0x02000004",
+      )!.row_offset;
+      bytes.writeUInt32LE((bytes.readUInt32LE(row) & ~7) | visibility, row);
+      const result = inspectManagedMembersBytes(bytes, target());
+      expect(result.nesting_read).toBe(true);
+      expect(
+        result.types.find((type) => type.token === "0x02000004"),
+      ).toMatchObject({ enclosing_type_token: null, name_sha256: null });
+      expect(result.coverage.issues).toContainEqual(
+        expect.objectContaining({
+          code: "invalid-row",
+          scope: "metadata.TypeDef:0x02000004",
+          offset: row,
+        }),
+      );
+    },
+  );
+
+  it("retains a selected child's contradictory parent issue exactly once", () => {
+    const bytes = buildManagedNestedTypeFixture();
+    const target = () => managedPeFixtureTarget(bytes, "/fixture/nested.dll");
+    const row = inspectManagedMembersBytes(bytes, target()).types.find(
+      (type) => type.token === "0x02000004",
+    )!.row_offset;
+    bytes.writeUInt32LE((bytes.readUInt32LE(row) & ~7) | 1, row);
+    const result = inspectManagedMembersBytes(bytes, target(), {
+      typeNames: ["Leaf"],
+    });
+    expect(result.types).toHaveLength(1);
+    expect(result.types[0]?.name_sha256).toBeNull();
+    expect(result.coverage.state).toBe("partial");
+    expect(
+      result.coverage.issues.filter(
+        (issue) => issue.scope === "metadata.TypeDef:0x02000004",
+      ),
+    ).toEqual([expect.objectContaining({ code: "invalid-row", offset: row })]);
+  });
+
+  it("reports NestedClass rows that do not pair distinct existing types once", () => {
+    const result = inspectNested({
+      nestedClassRows: [
+        [4, 4],
+        [5, 3],
+        [5, 2],
+        [6, 9],
+        [0, 2],
+        [4, 0],
+        [9, 2],
+      ],
+    });
+
+    expect(
+      result.types.map(({ enclosing_type_token }) => enclosing_type_token),
+    ).toEqual([null, null, null, null, "0x02000003", null]);
+    expect(result.nesting_read).toBe(false);
+    expect(
+      result.coverage.issues.map(({ code, scope }) => [code, scope]),
+    ).toEqual([
+      ["invalid-row", "metadata.NestedClass:0x29000001"],
+      ["invalid-row", "metadata.NestedClass:0x29000003"],
+      ["invalid-row", "metadata.NestedClass:0x29000004"],
+      ["invalid-row", "metadata.NestedClass:0x29000005"],
+      ["invalid-row", "metadata.NestedClass:0x29000006"],
+      ["invalid-row", "metadata.NestedClass:0x29000007"],
     ]);
   });
 });
@@ -1223,7 +1331,173 @@ describe("managed derived caller names", () => {
   });
 });
 
-describe("managed member reference bounds", () => {
+describe("managed TypeDef list ownership bounds", () => {
+  it("retains rows but leaves ownership unknown for zero TypeDef list starts", () => {
+    const bytes = buildManagedPeFixture();
+    const pe = readManagedPeLayout(bytes);
+    if (pe.cli === null) throw new Error("fixture has no CLI header");
+    const { rva, size } = pe.cli.metadata;
+    const layout = readManagedMetadataLayout(
+      bytes,
+      pe.rvaToOffset(rva, size, "cli.metadata"),
+      size,
+    );
+    const listOffset =
+      metadataRowOffset(layout, 2, 1) +
+      4 +
+      2 * layout.stringIndexSize +
+      layout.codedIndexSize("TypeDefOrRef");
+    const listIndexWidth = Math.max(
+      layout.tableIndexSize(3),
+      layout.tableIndexSize(4),
+      layout.tableIndexSize(5),
+      layout.tableIndexSize(6),
+    );
+    const writeIndex = (offset: number) =>
+      listIndexWidth === 2
+        ? bytes.writeUInt16LE(0, offset)
+        : bytes.writeUInt32LE(0, offset);
+    writeIndex(listOffset);
+    writeIndex(listOffset + listIndexWidth);
+
+    const result = inspectManagedMembersBytes(
+      bytes,
+      managedPeFixtureTarget(bytes),
+    );
+
+    expect(result.types[0]).toMatchObject({
+      field_list: { first_row: null, last_row: null, count: 0 },
+      method_list: { first_row: null, last_row: null, count: 0 },
+    });
+    expect(result.fields[0]).toMatchObject({
+      token: "0x04000001",
+      name: "counter",
+      declaring_type: null,
+    });
+    expect(result.methods[0]).toMatchObject({
+      token: "0x06000001",
+      name: "Main",
+      declaring_type: null,
+    });
+    expect(result.coverage).toMatchObject({
+      state: "partial",
+      issues: [
+        expect.objectContaining({
+          code: "invalid-row",
+          detail: expect.stringContaining("TypeDef FieldList start 0"),
+        }),
+        expect.objectContaining({
+          code: "invalid-row",
+          detail: expect.stringContaining("TypeDef MethodList start 0"),
+        }),
+      ],
+    });
+  });
+
+  it("does not infer an earlier owner from an invalid next list endpoint", () => {
+    const bytes = buildManagedPeFixture({ additionalEmptyTypes: 1 });
+    const pe = readManagedPeLayout(bytes);
+    if (pe.cli === null) throw new Error("fixture has no CLI header");
+    const { rva, size } = pe.cli.metadata;
+    const layout = readManagedMetadataLayout(
+      bytes,
+      pe.rvaToOffset(rva, size, "cli.metadata"),
+      size,
+    );
+    const methodStartOffset =
+      metadataRowOffset(layout, 2, 2) +
+      4 +
+      2 * layout.stringIndexSize +
+      layout.codedIndexSize("TypeDefOrRef") +
+      memberListIndexSize(layout, 4);
+    if (memberListIndexSize(layout, 6) === 2)
+      bytes.writeUInt16LE(0, methodStartOffset);
+    else bytes.writeUInt32LE(0, methodStartOffset);
+
+    const result = inspectManagedMembersBytes(
+      bytes,
+      managedPeFixtureTarget(bytes),
+    );
+
+    expect(result.methods[0]).toMatchObject({
+      token: "0x06000001",
+      declaring_type: null,
+    });
+    expect(result.types[0]?.method_list).toMatchObject({
+      first_row: null,
+      last_row: null,
+      count: 0,
+    });
+    expect(result.coverage.state).toBe("partial");
+  });
+});
+
+describe("managed TypeDef list ordering", () => {
+  it("leaves adjacent ownership unknown when valid list starts decrease", () => {
+    const bytes = buildManagedPeFixture({
+      additionalEmptyTypes: 1,
+      methodRowCount: 2,
+    });
+    const pe = readManagedPeLayout(bytes);
+    if (pe.cli === null) throw new Error("fixture has no CLI header");
+    const { rva, size } = pe.cli.metadata;
+    const layout = readManagedMetadataLayout(
+      bytes,
+      pe.rvaToOffset(rva, size, "cli.metadata"),
+      size,
+    );
+    const methodOffset =
+      4 +
+      2 * layout.stringIndexSize +
+      layout.codedIndexSize("TypeDefOrRef") +
+      memberListIndexSize(layout, 4);
+    const writeMethodStart = (row: number, value: number): void => {
+      const offset = metadataRowOffset(layout, 2, row) + methodOffset;
+      if (memberListIndexSize(layout, 6) === 2)
+        bytes.writeUInt16LE(value, offset);
+      else bytes.writeUInt32LE(value, offset);
+    };
+    writeMethodStart(1, 2);
+    writeMethodStart(2, 1);
+
+    const result = inspectManagedMembersBytes(
+      bytes,
+      managedPeFixtureTarget(bytes),
+    );
+
+    expect(result.methods.map(({ declaring_type }) => declaring_type)).toEqual([
+      null,
+      null,
+    ]);
+    expect(result.coverage).toMatchObject({
+      state: "partial",
+      issues: [
+        expect.objectContaining({
+          code: "invalid-row",
+          detail: expect.stringContaining(
+            "MethodList start 1 decreases from preceding start 2",
+          ),
+        }),
+      ],
+    });
+  });
+
+  it("accepts the one-based start for an empty ordinary member table", () => {
+    const bytes = buildManagedPeFixture({ methodRowCount: 0 });
+    const result = inspectManagedMembersBytes(
+      bytes,
+      managedPeFixtureTarget(bytes),
+    );
+    expect(result.types[0]?.method_list).toEqual({
+      first_row: null,
+      last_row: null,
+      count: 0,
+    });
+    expect(result.coverage).toMatchObject({ state: "complete", issues: [] });
+  });
+});
+
+describe("managed metadata reference bounds", () => {
   it("retains members and reports an out-of-range TypeDef coded index as partial", () => {
     const bytes = buildManagedPeFixture({ extendsRaw: 12 });
     const result = inspectManagedMembersBytes(
@@ -1358,11 +1632,15 @@ it("decodes generic instantiation member signatures as complete coverage", () =>
   // shape, with TypeRef/TypeSpec coded tokens kept as encoded.
   const bytes = buildManagedPeFixture({
     methodSignature: Buffer.from([
-      0x00, 0x01, 0x01, 0x15, 0x12, 0x71, 0x01, 0x0e,
+      0x00, 0x01, 0x01, 0x15, 0x12, 0x09, 0x01, 0x0e,
     ]),
     fieldSignature: Buffer.from([
-      0x06, 0x15, 0x11, 0x0a, 0x02, 0x13, 0x00, 0x1e, 0x01,
+      0x06, 0x15, 0x11, 0x0d, 0x02, 0x13, 0x00, 0x1e, 0x01,
     ]),
+    typeReferences: [
+      { namespace: "System", name: "Func`1" },
+      { namespace: "System", name: "ValueTuple`2" },
+    ],
   });
   const result = inspectManagedMembersBytes(
     bytes,
@@ -1372,12 +1650,12 @@ it("decodes generic instantiation member signatures as complete coverage", () =>
   expect(result.methods[0]?.signature).toMatchObject({
     parse_status: "decoded",
     return_type: "void",
-    parameter_types: ["class:113<string>"],
+    parameter_types: ["class:9<string>"],
     issue: null,
   });
   expect(result.fields[0]?.signature).toMatchObject({
     parse_status: "decoded",
-    field_type: "valuetype:10<var:0,mvar:1>",
+    field_type: "valuetype:13<var:0,mvar:1>",
   });
   expect(result.coverage).toMatchObject({ state: "complete", issues: [] });
 });
@@ -1733,5 +2011,63 @@ describe("managed member type selection", () => {
     expect(result.call_edges).toEqual([]);
     expect(result.field_accesses).toEqual([]);
     expect(result.member_refs).toEqual(everything.member_refs);
+  });
+});
+
+describe("managed member method paging", () => {
+  it("returns only the requested MethodDef rows", () => {
+    const image = buildMultiMethodManagedPeFixture({
+      methods: [
+        { name: "First", body: Buffer.from([0x2a]) },
+        { name: "Second", body: Buffer.from([0x2a]) },
+        { name: "Third", body: Buffer.from([0x2a]) },
+      ],
+    });
+    const all = inspectManagedMembersBytes(
+      image,
+      managedPeFixtureTarget(image),
+    );
+    expect(all.methods.map(({ name }) => name)).toEqual([
+      "First",
+      "Second",
+      "Third",
+    ]);
+
+    const page = inspectManagedMembersBytes(
+      image,
+      managedPeFixtureTarget(image),
+      { methodOffset: 1, methodLimit: 1 },
+    );
+
+    expect(page.methods.map(({ name, token }) => ({ name, token }))).toEqual([
+      { name: "Second", token: "0x06000002" },
+    ]);
+    expect(page.coverage.state).toBe("complete");
+
+    const offsetOnly = inspectManagedMembersBytes(
+      image,
+      managedPeFixtureTarget(image),
+      { methodOffset: 1 },
+    );
+    expect(offsetOnly.methods.map(({ name }) => name)).toEqual([
+      "Second",
+      "Third",
+    ]);
+
+    const emptyPage = inspectManagedMembersBytes(
+      image,
+      managedPeFixtureTarget(image),
+      { methodOffset: 1, methodLimit: 0 },
+    );
+    expect(emptyPage.methods).toEqual([]);
+  });
+
+  it("rejects invalid method page bounds", () => {
+    const image = buildManagedPeFixture();
+    expect(() =>
+      inspectManagedMembersBytes(image, managedPeFixtureTarget(image), {
+        methodOffset: -1,
+      }),
+    ).toThrow(RangeError);
   });
 });

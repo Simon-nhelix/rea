@@ -1,7 +1,7 @@
 {
   "name": "rea-agents",
   "mcpName": "io.github.morluto/rea",
-  "version": "6.4.0",
+  "version": "6.5.0",
   "description": "Reverse engineer anything from your terminal or agent with one CLI and MCP server.",
   "license": "MIT",
   "repository": {
@@ -195,6 +195,7 @@
     "verify:ghidra:swift": "npm run build:cached && node scripts/verify-real-ghidra-swift.mjs",
     "verify:ida": "npm run build:cached && node scripts/verify-real-ida.mjs",
     "verify:ghidra:switch": "npm run build:cached && node scripts/verify-real-ghidra-switch.mjs",
+    "verify:kuna": "npm run build:cached && node scripts/verify-real-kuna.mjs",
     "verify:ghidra:dos": "npm run build:cached && node scripts/verify-real-ghidra-dos.mjs",
     "verify:ghidra:com": "npm run build:cached && node scripts/verify-real-ghidra-com.mjs",
     "verify:ghidra:raw": "npm run build:cached && node scripts/verify-real-ghidra-raw.mjs",
@@ -213,6 +214,9 @@
     "verify:javascript-runtime": "npm run build:cached && node scripts/verify/javascript/runtime-observation.mjs",
     "verify:javascript:digests": "npm run build:cached && node scripts/verify/javascript/digests.mjs",
     "verify:javascript:output": "npm run build:cached && node scripts/verify/javascript/output.mjs",
+    "verify:javascript:module-references": "npm run build:cached && node scripts/verify/javascript/module-references.mjs",
+    "verify:javascript:native-handoffs": "npm run build:cached && node scripts/verify/javascript/native-handoffs.mjs",
+    "verify:javascript:retained-facts": "npm run build:cached && node scripts/verify/javascript/retained-facts.mjs",
     "verify:application-workflows": "npm run build:cached && node scripts/verify/javascript/application-workflows.mjs",
     "verify:managed": "npm run build:cached && node scripts/verify/managed/conformance.mjs",
     "verify:firmware": "npm run build:cached && node scripts/verify/firmware/analysis.mjs",
@@ -271,6 +275,7 @@
     "verify:windows-native": "node scripts/verify-windows-native.mjs",
     "verify:ghidra:windows:package": "node scripts/verify-packaged-ghidra-windows.mjs",
     "build:ghidra:nativeaot": "node scripts/build-ghidra-nativeaot.mjs",
+    "verify:ghidra:bridge-sources": "node scripts/verify-ghidra-bridge-sources.mjs",
     "build:fixtures:nativeaot": "node scripts/generate-nativeaot-fixtures.mjs",
     "verify:ghidra:nativeaot": "npm run build:cached && node scripts/verify-real-ghidra-nativeaot.mjs",
     "verify:browser:scripts": "npm run build:cached && node scripts/verify-browser-scripts.mjs",
@@ -291,8 +296,8 @@
     "verify:solidity:metadata": "npm run build:cached && node scripts/verify-solidity-metadata.mjs",
     "verify:recorded:crash": "npm run build:cached && node scripts/verify-recorded-crash.mjs",
     "mcp-catalog:check:built": "node scripts/generate-mcp-tool-catalog.mjs --check",
-    "compile": "node scripts/clean-build-output.mjs && tsc -p tsconfig.build.json && node scripts/bundle-runtime.mjs",
-    "compile:termux": "node scripts/clean-build-output.mjs && node --max-old-space-size=3072 node_modules/typescript-termux/lib/tsc.js -p tsconfig.build.json && node scripts/bundle-runtime.mjs",
+    "compile": "node scripts/clean-build-output.mjs && tsc -p tsconfig.build.json && node scripts/record-catalog-digests.mjs && node scripts/bundle-runtime.mjs",
+    "compile:termux": "node scripts/clean-build-output.mjs && node --max-old-space-size=3072 node_modules/typescript-termux/lib/tsc.js -p tsconfig.build.json && node scripts/record-catalog-digests.mjs && node scripts/bundle-runtime.mjs",
     "artifacts:mcp-catalog": "node scripts/generate-mcp-tool-catalog.mjs",
     "artifacts:skills": "node scripts/generate-skill-metadata.mjs",
     "artifacts:product-catalog": "node scripts/generate-product-catalog.mjs",
@@ -338,10 +343,12 @@
     "isomorphic-git": "1.38.7",
     "jsonc-parser": "3.3.1",
     "lossless-json": "4.3.1",
+    "openpgp": "6.3.2",
     "parse5": "8.0.1",
     "pino": "10.4.0",
     "playwright-core": "1.58.2",
     "plist": "5.0.0",
+    "saxes": "6.0.0",
     "semver": "7.8.5",
     "smol-toml": "1.9.0",
     "stream-chain": "4.2.6",
@@ -353,6 +360,9 @@
     "zod": "4.4.3"
   },
   "overrides": {
+    "typed-rest-client": {
+      "qs": "6.16.0"
+    },
     "vitepress": {
       "vite": "6.4.4"
     }
@@ -375,6 +385,7 @@
     "oxfmt": "0.72.0",
     "oxlint": "1.87.0",
     "rolldown": "1.2.12",
+    "tsx": "4.23.15",
     "turbo": "2.11.7",
     "typescript": "7.0.2",
     "typescript-termux": "npm:typescript@5.9.3",

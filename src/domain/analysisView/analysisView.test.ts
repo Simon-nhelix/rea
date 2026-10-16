@@ -4,6 +4,7 @@ import { expect, it } from "vitest";
 import { functionDossierSchema } from "../hopperValues.js";
 import { ghidraFunctionDossier } from "../ghidraValues.fixture.js";
 import { JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE } from "../../contracts/javascript/javascriptRuntimeReconciliationExample.js";
+import { ARTIFACT_COMPARISON_EXAMPLE } from "../../contracts/artifactComparisonExample.js";
 import {
   analysisViewBindJavaScriptGraphs,
   analysisViewJavaScriptAnalysis,
@@ -25,6 +26,7 @@ import {
   pageViewCoverage,
 } from "./analysisViewCoverage.js";
 import { sourceMapReference } from "../javascript/javascriptApplicationGraph.fixture.js";
+import { createArtifactInspection } from "../artifactInspection.js";
 import { javascriptModulePath } from "./javascriptApplicationView.js";
 import {
   inspectAnalysisViewInputSchema,
@@ -160,6 +162,28 @@ it("preserves native API limitations and unavailable residual unknowns", () => {
   expect(available.value.limitations).toEqual(
     expect.arrayContaining(original.native_api.limitations),
   );
+});
+
+it("rejects artifact summary views when inspection substep coverage count disagrees", () => {
+  const source = ARTIFACT_COMPARISON_EXAMPLE.left;
+  const inspection = createArtifactInspection(source);
+  const parent: AnalysisViewParent = {
+    evidenceId: `ev_${"a".repeat(64)}`,
+    operation: "inspect_artifact",
+    normalizedResult: {
+      ...inspection,
+      coverage: {
+        ...inspection.coverage,
+        substeps_completed: inspection.substeps.length + 1,
+      },
+    },
+    subject: source.subject,
+    limitations: [],
+  };
+  expect(projectAnalysisView(parent, { kind: "summary" })).toMatchObject({
+    ok: false,
+    error: { _tag: "AnalysisInputError" },
+  });
 });
 
 it("pages every retained dossier collection and the native API record", () => {
@@ -457,6 +481,240 @@ it("projects JavaScript summary and preserves selected module observations", () 
   });
 });
 
+it("projects typed module facts without source bodies and keeps source coverage independent of paging", () => {
+  const analysis = analysisViewJavaScriptAnalysisWithSource();
+  const parent = javascriptParent(analysis);
+  const input = inspectAnalysisViewInputSchema.parse({
+    source: { kind: "retained-evidence", evidence_id: parent.evidenceId },
+    view: {
+      kind: "javascript",
+      collection: "modules",
+      projection: "references",
+      where: { path: "renderer.js" },
+      limit: 1,
+    },
+  });
+  const projected = projectAnalysisView(parent, input.view);
+  if (!projected.ok) throw projected.error;
+  if (projected.value.kind !== "javascript")
+    throw new Error("expected JavaScript view");
+  const node = analysis.graph.nodes[0];
+  if (!node) throw new Error("missing module");
+  expect(projected.value.rows).toEqual([
+    {
+      node_id: node.node_id,
+      kind: node.kind,
+      path: "renderer.js",
+      identity: node.identity,
+      retained_source_range_count: 0,
+      basis: [
+        { authority: "artifact-bytes", state: "observed", confidence: "exact" },
+      ],
+    },
+  ]);
+  expect(projected.value.coverage).toMatchObject({ total: 1, exhausted: true });
+  expect(projected.value.source_coverage).toMatchObject({
+    application: analysis.graph.coverage,
+    semantic: { status: analysis.semantic_graph.coverage.status },
+  });
+  expect(JSON.stringify(projected.value.rows)).not.toMatch(
+    /secret|should not leak|observations/,
+  );
+  const row = projected.value.rows[0];
+  if (!row) throw new Error("missing reference");
+  const retainedIdentity = structuredClone(node.identity);
+  if (row.identity.strategy !== "content-digest")
+    throw new Error("expected digest identity");
+  row.identity.sha256 = "e".repeat(64);
+  expect(node.identity).toEqual(retainedIdentity);
+  const empty = projectAnalysisView(parent, {
+    ...input.view,
+    kind: "javascript",
+    collection: "modules",
+    projection: "references",
+    where: { kind: "javascript-module" },
+    offset: 0,
+    limit: 1,
+  });
+  if (!empty.ok) throw empty.error;
+  expect(empty.value).toMatchObject({
+    rows: [],
+    coverage: { total: 0, exhausted: true },
+  });
+});
+
+it("counts retained range observations including repeats and skips unavailable locations", () => {
+  const analysis = analysisViewJavaScriptAnalysis();
+  const original = analysis.graph.nodes[0];
+  const observed = original?.observations[0];
+  if (!original || !observed) throw new Error("missing module observation");
+  const range = {
+    kind: "source-range",
+    source: "renderer.js",
+    start: { line: 1, column: 0 },
+    end: { line: 1, column: 8 },
+  };
+  const node = createJavaScriptApplicationNode({
+    kind: original.kind,
+    identity: original.identity,
+    observations: [
+      ...["first retained observation", "second retained observation"].map(
+        (label) => ({
+          label,
+          properties: {},
+          evidence: {
+            ...observed.evidence,
+            location: { available: true, value: range },
+          },
+        }),
+      ),
+      {
+        label: "unavailable location",
+        properties: {},
+        evidence: {
+          ...observed.evidence,
+          authority: "unknown",
+          state: "unavailable",
+          confidence: "unknown",
+          location: {
+            available: false,
+            reason: "not-observed",
+            detail: "Location was not recorded.",
+          },
+          limitations: ["Location was not recorded."],
+        },
+      },
+    ],
+  });
+  const { graph_id: _graphId, ...application } = analysis.graph;
+  const graph = createJavaScriptApplicationGraph({
+    ...application,
+    nodes: [node],
+    root_node_ids: [node.node_id],
+  });
+  const parent = javascriptParent(
+    analysisViewBindJavaScriptGraphs(analysis, graph),
+  );
+  const references = projectAnalysisView(parent, {
+    kind: "javascript",
+    collection: "modules",
+    projection: "references",
+    where: {},
+    offset: 0,
+    limit: 1,
+  });
+  const item = projectAnalysisView(parent, {
+    kind: "item",
+    collection: "modules",
+    selector: { node_id: node.node_id },
+  });
+  if (!references.ok) throw references.error;
+  if (!item.ok) throw item.error;
+  expect(references.value).toMatchObject({
+    rows: [{ node_id: node.node_id, retained_source_range_count: 2 }],
+  });
+  expect(item.value).toMatchObject({ item: { source_ranges: [range, range] } });
+});
+
+it("validates typed module selectors without coercing null or empty paths", () => {
+  const source = {
+    kind: "retained-evidence",
+    evidence_id: javascriptParent().evidenceId,
+  };
+  const view = {
+    kind: "javascript",
+    collection: "modules",
+    projection: "references",
+  };
+  for (const path of [null, "", "renderer.js"])
+    expect(
+      inspectAnalysisViewInputSchema.safeParse({
+        source,
+        view: { ...view, where: { path } },
+      }).success,
+    ).toBe(true);
+  for (const where of [
+    { path: 1 },
+    { kind: "electron-main" },
+    { glob: "*.js" },
+  ])
+    expect(
+      inspectAnalysisViewInputSchema.safeParse({
+        source,
+        view: { ...view, where },
+      }).success,
+    ).toBe(false);
+  expect(
+    projectAnalysisView(layoutParent(), {
+      ...view,
+      kind: "javascript",
+      collection: "modules",
+      projection: "references",
+      where: {},
+      offset: 0,
+      limit: 1,
+    }).ok,
+  ).toBe(false);
+});
+
+it("keeps mixed observation support distinct instead of promoting a module to observed", () => {
+  const analysis = analysisViewJavaScriptAnalysis();
+  const original = analysis.graph.nodes[0];
+  const observed = original?.observations[0];
+  if (!original || !observed) throw new Error("missing module observation");
+  const inferred = {
+    ...observed.evidence,
+    authority: "static-relationship-inference" as const,
+    state: "inferred" as const,
+    confidence: "low" as const,
+    limitations: ["Static candidate; runtime loading is unknown."],
+  };
+  const node = createJavaScriptApplicationNode({
+    kind: original.kind,
+    identity: original.identity,
+    observations: [
+      {
+        label: observed.label,
+        properties: observed.properties,
+        evidence: observed.evidence,
+      },
+      { label: "candidate one", properties: {}, evidence: inferred },
+      { label: "candidate two", properties: {}, evidence: inferred },
+    ],
+  });
+  const { graph_id: _graphId, ...application } = analysis.graph;
+  const graph = createJavaScriptApplicationGraph({
+    ...application,
+    nodes: [node],
+    root_node_ids: [node.node_id],
+  });
+  const result = projectAnalysisView(
+    javascriptParent(analysisViewBindJavaScriptGraphs(analysis, graph)),
+    {
+      kind: "javascript",
+      collection: "modules",
+      projection: "references",
+      where: {},
+      offset: 0,
+      limit: 1,
+    },
+  );
+  if (!result.ok) throw result.error;
+  if (result.value.kind !== "javascript")
+    throw new Error("expected references");
+  expect(result.value.rows[0]?.basis).toHaveLength(2);
+  expect(result.value.rows[0]?.basis).toEqual(
+    expect.arrayContaining([
+      { authority: "artifact-bytes", state: "observed", confidence: "exact" },
+      {
+        authority: "static-relationship-inference",
+        state: "inferred",
+        confidence: "low",
+      },
+    ]),
+  );
+});
+
 it("rejects ambiguous JavaScript module paths with candidate node ids", () => {
   const analysis = analysisViewJavaScriptAnalysis();
   const first = analysis.graph.nodes[0];
@@ -511,6 +769,28 @@ it("rejects ambiguous JavaScript module paths with candidate node ids", () => {
       },
     ],
   });
+  const view = {
+    kind: "javascript",
+    collection: "modules",
+    projection: "references",
+    where: { path: "renderer.js" },
+    offset: 0,
+    limit: 1,
+  } as const;
+  const ids: string[] = [];
+  for (const offset of [0, 1, 2, Number.MAX_SAFE_INTEGER]) {
+    const page = projectAnalysisView(parent, { ...view, offset });
+    if (!page.ok) throw page.error;
+    if (page.value.kind !== "javascript")
+      throw new Error("expected references");
+    ids.push(...page.value.rows.map(({ node_id }) => node_id));
+    expect(page.value.coverage).toMatchObject({
+      total: 2,
+      next_offset: offset === 0 ? 1 : null,
+      exhausted: offset !== 0,
+    });
+  }
+  expect(ids).toEqual(graph.nodes.map(({ node_id }) => node_id));
 });
 
 it("pages actual modules, including unknown and empty paths, without unrelated roles", () => {
@@ -620,6 +900,24 @@ it("pages actual modules, including unknown and empty paths, without unrelated r
     collection: "modules",
     selector: { path: "" },
   });
+  for (const [path, kind] of [
+    [null, "javascript-module"],
+    ["", "source-module"],
+  ] as const) {
+    const references = projectAnalysisView(parent, {
+      kind: "javascript",
+      collection: "modules",
+      projection: "references",
+      where: { path },
+      offset: 0,
+      limit: 1,
+    });
+    if (!references.ok) throw references.error;
+    expect(references.value).toMatchObject({
+      rows: [{ path, kind }],
+      coverage: { total: 1, exhausted: true },
+    });
+  }
   expect(emptyPath.ok).toBe(true);
   const role = nodes.find((node) => node.kind === "electron-renderer");
   if (role === undefined) throw new Error("missing role");
@@ -852,6 +1150,22 @@ it.each(["partial", "unknown"] as const)(
     for (const view of [
       { kind: "page", collection: "modules", offset: 0, limit: 10 },
       {
+        kind: "javascript",
+        collection: "modules",
+        projection: "references",
+        where: {},
+        offset: 0,
+        limit: 10,
+      },
+      {
+        kind: "javascript",
+        collection: "modules",
+        projection: "references",
+        where: { path: "not-retained.js" },
+        offset: 0,
+        limit: 10,
+      },
+      {
         kind: "item",
         collection: "modules",
         selector: { path: "renderer.js" },
@@ -860,6 +1174,12 @@ it.each(["partial", "unknown"] as const)(
       const result = projectAnalysisView(parent, view);
       if (!result.ok) throw result.error;
       expect(result.value.coverage.exhausted).toBe(true);
+      if (result.value.kind === "javascript")
+        expect(result.value.source_coverage).toMatchObject({
+          application: { status, omitted_count: null },
+          semantic: { status: "unknown" },
+          application_unknown_count: 1,
+        });
       expect(result.value.unknowns).toEqual([
         "1 application graph unknowns remain in the parent Evidence.",
         ...messages.slice(0, 65),

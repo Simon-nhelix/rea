@@ -7,14 +7,15 @@ import {
   systemLinuxHopperLauncherCandidates,
   supportsReaHost,
 } from "./LinuxHopper.js";
+import {
+  MAC_HOPPER_SYSTEM_LAUNCHER,
+  macHopperCanonicalLauncherCandidates,
+} from "./MacHopperPaths.js";
 import type {
   DoctorCheck,
   DoctorHost,
   DoctorProviderInspection,
 } from "./Doctor.js";
-
-const DEFAULT_HOPPER =
-  "/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
 
 /** Ordered environment diagnostics consumed by the Doctor report assembler. */
 export interface DoctorDiagnostics {
@@ -150,10 +151,17 @@ const findHopper = async (host: DoctorHost): Promise<string | undefined> => {
   const candidates =
     host.configuredHopperPath === undefined
       ? [
-          DEFAULT_HOPPER,
+          ...(host.platform === "darwin"
+            ? macHopperCanonicalLauncherCandidates(host.homeDirectory)
+            : [MAC_HOPPER_SYSTEM_LAUNCHER]),
           ...(host.platform === "linux"
             ? linuxHopperLauncherCandidates(host.homeDirectory)
             : [...systemLinuxHopperLauncherCandidates]),
+          ...(host.platform === "darwin"
+            ? []
+            : macHopperCanonicalLauncherCandidates(host.homeDirectory).slice(
+                1,
+              )),
           ...(await host.manualHopperPaths()),
         ]
       : [host.configuredHopperPath];
@@ -201,17 +209,34 @@ const optionalHopperVersionCheck = async (
   hopperPath: string | undefined,
 ): Promise<DoctorCheck | undefined> => {
   if (host.platform !== "linux" || hopperPath === undefined) return undefined;
-  return check(
-    "hopper-version",
-    await host.supportedLinuxHopper(hopperPath),
-    hopperPath,
-    {
-      remediation: unsupportedHopperRemediation(
-        host.configuredHopperPath === hopperPath,
-      ),
-      classification: "config_drift",
-    },
-  );
+  const inspected = await host.inspectLinuxHopper(hopperPath);
+  const buildCheck = check("hopper-version", inspected.ok, hopperPath, {
+    remediation: unsupportedHopperRemediation(
+      host.configuredHopperPath === hopperPath,
+    ),
+    classification:
+      !inspected.ok &&
+      [
+        "release_metadata",
+        "download",
+        "verification_unavailable",
+        "cancelled",
+        "cleanup_failed",
+      ].includes(inspected.error.reason)
+        ? "unknown"
+        : "config_drift",
+  });
+  return {
+    ...buildCheck,
+    details: inspected.ok
+      ? {
+          reported_release_version: inspected.value.version,
+          launcher_sha256: inspected.value.sha256,
+          primary_fingerprint: inspected.value.primaryFingerprint,
+          source: inspected.value.source,
+        }
+      : { reason: inspected.error.reason, message: inspected.error.message },
+  };
 };
 
 const optionalHopperDemoCheck = async (
@@ -289,8 +314,8 @@ const providerDoctorChecks = (
 
 const unsupportedHopperRemediation = (configured: boolean): string =>
   configured
-    ? "Unset or update HOPPER_LAUNCHER_PATH, install the Hopper build supported by this REA release, or update REA."
-    : "Install the Hopper build supported by this REA release, or update REA for a newer Hopper build.";
+    ? "Check HOPPER_LAUNCHER_PATH and its publisher verification evidence. Run rea setup to install and retain an authenticated official Hopper package for offline use."
+    : "Run rea setup to install and retain an authenticated official Hopper package for offline use.";
 
 const parseMajor = (version: string | undefined): number =>
   Number.parseInt(version?.split(".")[0] ?? "0", 10);

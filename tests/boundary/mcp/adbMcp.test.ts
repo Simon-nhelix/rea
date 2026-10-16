@@ -94,7 +94,7 @@ const results: Readonly<Record<string, unknown>> = {
     serial: "emulator-5554",
     package_name: "com.example",
     version_name: "1.2.3",
-    version_code: 45,
+    version_code: "45",
     first_install_time: "2026-01-02 03:04:05",
     last_update_time: "2026-02-03 04:05:06",
     installer_package_name: null,
@@ -233,7 +233,8 @@ const results: Readonly<Record<string, unknown>> = {
     apk_path: "/tmp/app.apk",
     bytes: 2048,
     sha256: "a".repeat(64),
-    replaced: false,
+    replace_requested: false,
+    replaced: null,
   },
   uninstall_adb_package: {
     client: clientIdentity,

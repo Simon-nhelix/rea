@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { fixedTupleSchema } from "./fixedTupleSchema.js";
 import { addressCoordinate } from "./native/addressCoordinate.js";
 
 import type { JsonValue } from "./jsonValue.js";
@@ -25,17 +26,14 @@ export interface SegmentSummary {
 }
 
 /** Return a bounded byte distance between canonical addresses in one space. */
-export const addressDistance = (start: string, end: string): number => {
+export const addressDistance = (start: string, end: string): number | null => {
   const left = addressCoordinate(start);
   const right = addressCoordinate(end);
-  if (left === null || right === null || left.space !== right.space) return 0;
+  if (left === null || right === null || left.space !== right.space)
+    return null;
   const distance = right.offset - left.offset;
-  if (distance <= 0n) return 0;
-  return Number(
-    distance > BigInt(Number.MAX_SAFE_INTEGER)
-      ? BigInt(Number.MAX_SAFE_INTEGER)
-      : distance,
-  );
+  if (distance < 0n || distance > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return Number(distance);
 };
 
 const procedureMapSchema = z.record(z.string(), z.string());
@@ -289,10 +287,10 @@ const swiftStringLiteralFields = {
   value: z
     .string()
     .describe("Decoded UTF-8 text, including the canonical empty string."),
-  registers: z.tuple([z.string(), z.string()]),
-  words: z
-    .tuple([z.string(), z.string()])
-    .describe("Observed constant register values, in register order."),
+  registers: fixedTupleSchema([z.string(), z.string()]),
+  words: fixedTupleSchema([z.string(), z.string()]).describe(
+    "Observed constant register values, in register order.",
+  ),
 };
 
 /** A Swift String literal decoded from the two words of its ABI value, not a data reference. */

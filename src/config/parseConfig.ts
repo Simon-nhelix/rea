@@ -1,4 +1,4 @@
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, statSync } from "node:fs";
 
 import type { ConfigurationError } from "../domain/configurationErrors.js";
 import { ok, type Result } from "../domain/result.js";
@@ -9,13 +9,14 @@ import {
   linuxHopperLauncherCandidates,
   REA_MANAGED_LINUX_HOPPER_LAUNCHER,
 } from "../application/LinuxHopper.js";
-
-const DEFAULT_HOPPER_LAUNCHER_PATH =
-  "/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
+import {
+  MAC_HOPPER_SYSTEM_LAUNCHER,
+  macHopperLauncherCandidates,
+} from "../application/MacHopperPaths.js";
 const executableAvailable = (path: string): boolean => {
   try {
     accessSync(path, constants.X_OK);
-    return true;
+    return statSync(path).isFile();
   } catch {
     return false;
   }
@@ -26,7 +27,12 @@ export const defaultHopperLauncherPath = (
   homeDirectory: string,
   executable: (path: string) => boolean = executableAvailable,
 ): string => {
-  if (platform !== "linux") return DEFAULT_HOPPER_LAUNCHER_PATH;
+  if (platform === "darwin") {
+    for (const candidate of macHopperLauncherCandidates(homeDirectory))
+      if (executable(candidate)) return candidate;
+    return MAC_HOPPER_SYSTEM_LAUNCHER;
+  }
+  if (platform !== "linux") return MAC_HOPPER_SYSTEM_LAUNCHER;
   return (
     linuxHopperLauncherCandidates(homeDirectory).find(executable) ??
     REA_MANAGED_LINUX_HOPPER_LAUNCHER
@@ -37,7 +43,12 @@ export const defaultHopperLauncherPath = (
 export const parseConfig = (
   environment: Readonly<Record<string, string | undefined>>,
 ): Result<AppConfig, ConfigurationError> => {
-  const parsed = parseEnvironment(environment);
+  // JEB validates its own timeout during optional provider composition. It is
+  // not an AppConfig setting and must not prevent unrelated CLI/MCP startup.
+  // Registration validation still checks the complete environment directly.
+  const { REA_JEB_MCP_TIMEOUT_MS: _jebTimeout, ...appEnvironment } =
+    environment;
+  const parsed = parseEnvironment(appEnvironment);
   if (!parsed.ok) return parsed;
   const env = parsed.value;
   return ok({

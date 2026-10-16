@@ -234,7 +234,7 @@ export const adbInputSchemas = {
       .boolean()
       .default(false)
       .describe(
-        "Replace an existing installation and keep its data (adb install -r)",
+        "Request replacement mode and keep existing app data if present (adb install -r); does not establish whether the app was already installed",
       ),
   }),
   uninstall_adb_package: z.strictObject({
@@ -527,7 +527,13 @@ export const adbResultSchemas = {
     serial: z.string().min(1),
     package_name: packageNameSchema,
     version_name: z.string().nullable(),
-    version_code: z.number().int().nullable(),
+    version_code: z
+      .string()
+      .regex(/^-?\d+$/u)
+      .nullable()
+      .describe(
+        "Long version code exactly as dumpsys package prints it; may exceed the JSON safe-integer range",
+      ),
     first_install_time: z.string().nullable(),
     last_update_time: z.string().nullable(),
     installer_package_name: z.string().nullable(),
@@ -685,7 +691,8 @@ export const adbResultSchemas = {
     apk_path: z.string().min(1),
     bytes: z.number().int().nonnegative(),
     sha256: z.string().regex(/^[a-f0-9]{64}$/u),
-    replaced: z.boolean(),
+    replace_requested: z.boolean(),
+    replaced: z.boolean().nullable(),
   }),
   uninstall_adb_package: z.strictObject({
     client,
@@ -750,15 +757,17 @@ export type AdbAcquiredFilePartialObservation =
   | {
       readonly provider_id: "adb";
       readonly operation: "pull_adb_file";
-      readonly result: {
-        readonly client: z.infer<
-          typeof adbResultSchemas.pull_adb_file
-        >["client"];
-        readonly serial: string;
-        readonly local_path: string;
-        readonly device_path: string;
-        readonly digest_status: "unknown";
-      };
+      readonly result:
+        | {
+            readonly client: z.infer<
+              typeof adbResultSchemas.pull_adb_file
+            >["client"];
+            readonly serial: string;
+            readonly local_path: string;
+            readonly device_path: string;
+            readonly digest_status: "unknown";
+          }
+        | z.infer<typeof adbResultSchemas.pull_adb_file>;
     }
   | {
       readonly provider_id: "adb";

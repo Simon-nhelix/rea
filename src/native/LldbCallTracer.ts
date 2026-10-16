@@ -41,6 +41,7 @@ import {
 } from "../process/ProviderDeadline.js";
 import { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
 import { resolveXcrunTool, type ResolvedTool } from "./CommandRunner.js";
+import { projectNativeCalls } from "./NativeCallObservation.js";
 import {
   readLldbObservationJournal,
   readBoundedPrefix,
@@ -123,6 +124,8 @@ const tracerOutputSchema = z.discriminatedUnion("status", [
       "tracer-error",
     ]),
     error: z.string().nullable(),
+    target_process_created: z.boolean().optional(),
+    target_process_exit_observed: z.boolean().optional(),
   }),
 ]);
 
@@ -163,7 +166,7 @@ export interface NativeCallTracer {
 
 /** Remediation for a target LLDB may not debug. */
 const ATTACH_REMEDIATION =
-  "Allow debugging for this user (Developer Tools access: `DevToolsSecurity -enable`, or membership in the _developer group). A hardened-runtime target is debuggable only with the com.apple.security.get-task-allow entitlement; see inspect_signature's debugger-attach facet.";
+  "Allow debugging for this user (Developer Tools access: `DevToolsSecurity -enable`, or membership in the _developer group). A hardened-runtime target is debuggable only with the com.apple.security.get-task-allow entitlement; inspect_signature reports hardened_runtime and entitlements.";
 
 /** Production tracer: `lldb --batch` running the REA LLDB bridge. */
 export class LldbCallTracer implements NativeCallTracer {
@@ -284,6 +287,16 @@ export class LldbCallTracer implements NativeCallTracer {
         ),
       );
     }
+    if (result.ok && signal?.aborted === true)
+      return err(
+        new AnalysisCancelledError(OPERATION, {
+          partialObservation: partialObservationFromTrace(
+            request,
+            result.value,
+            "cancelled",
+          ),
+        }),
+      );
     return result;
   }
 
@@ -420,14 +433,20 @@ export class LldbCallTracer implements NativeCallTracer {
       exited.kind === "exited"
         ? await readTracerOutput(paths.result)
         : undefined;
-    let targetTermination: TargetTermination = exited.targetLaunched
-      ? await ensureTerminated(paths.pid, exited.targetIdentity, true)
-      : "terminated";
-    // These two bridge outcomes are emitted before a target process exists.
-    // Other missing-PID cases, including a missing result, remain unknown.
+    // An explicit bridge observation can prove no process was created or that
+    // the created process exited. A missing PID alone remains ambiguous.
+    const bridgeObservedExit =
+      output !== undefined &&
+      output.status !== "traced" &&
+      output.target_process_exit_observed === true;
+    let targetTermination: TargetTermination =
+      exited.targetLaunched && !bridgeObservedExit
+        ? await ensureTerminated(paths.pid, exited.targetIdentity, true)
+        : "terminated";
     if (
       output !== undefined &&
-      (output.status === "target-error" || output.status === "launch-error") &&
+      output.status !== "traced" &&
+      output.target_process_created === false &&
       (await readTargetPid(paths.pid)) === undefined
     )
       targetTermination = "terminated";
@@ -690,27 +709,23 @@ const partialNativeObservation = async (options: {
 const partialObservationFromTrace = (
   request: Parameters<NativeCallTracer["trace"]>[0],
   trace: NativeCallTrace,
-): NativeCallPartialObservation =>
-  projectLldbPartialObservation({
-    target: {
+  reason: NativeCallPartialObservation["coverage"]["reason"] = "cleanup-failure",
+): NativeCallPartialObservation => {
+  const observation = projectNativeCalls(
+    {
       path: request.executable,
       sha256: request.expectedSha256,
       architecture: request.architecture,
-      arguments: request.input.arguments,
-      environment: request.input.environment,
-      working_directory: request.input.working_directory ?? null,
     },
-    pid: trace.run.pid,
-    stdout: trace.stdout,
-    stderr: trace.stderr,
-    version: trace.run.version,
-    journal: {
-      events: trace.run.events,
-      otherStops: trace.run.other_stops,
-      limitations: [],
-    },
-    reason: "cleanup-failure",
-  });
+    request.input,
+    trace,
+  );
+  return {
+    kind: "native-call-observation",
+    ...observation,
+    coverage: { ...observation.coverage, status: "partial", reason },
+  };
+};
 
 const lldbRuntimePaths = (directory: string) => ({
   config: join(directory, "config.json"),

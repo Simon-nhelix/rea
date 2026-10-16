@@ -99,13 +99,19 @@ const runSetupWorkflow = async (
       [host, plannedActions, appliedActions, clients, clientStates],
       readinessScope,
     );
+  const failSkill = async (
+    error: SetupSkillInstallError,
+  ): Promise<SetupResult> => ({
+    ...(await fail(error.remediation)),
+    code: "skill_install_failed",
+  });
   const unsupported = await hostRemediation(host, false);
   if (unsupported !== undefined) return fail(unsupported);
   const initialState = await host.initialSetupState(options.readinessScope);
   let { hopperPath, providerEnvironment } = initialState;
   const discovery = await discoverSetupState({
     host,
-    providerEnvironment,
+    providerConfigured: initialState.providerConfigured,
     forceHopperInstall: options.installHopper,
     hopperLauncherConfigured: initialState.hopperLauncherConfigured === true,
     proposeHopper:
@@ -235,6 +241,12 @@ const runSetupWorkflow = async (
   );
 
   const manualRemediation = manualClientsRemediation(planned.selectedClients);
+  if (skillSelected) {
+    const admission = await host.validateSkillDirectories(
+      selectedSkillClientIds,
+    );
+    if (!admission.ok) return failSkill(admission.error);
+  }
   if (options.dryRun === true)
     return {
       status: "planned",
@@ -285,8 +297,16 @@ const runSetupWorkflow = async (
         : {}),
     };
 
+  // Approval may pause while a skill manager changes a selected directory.
+  if (planSelection.skillSelected) {
+    const admission = await host.validateSkillDirectories(
+      selectedSkillClientIds,
+    );
+    if (!admission.ok) return failSkill(admission.error);
+  }
   let selectedClients: readonly SetupClient[] =
     planSelection.clientsToConfigure;
+  let hopperWarning: string | undefined;
   if (
     planSelection.installHopper &&
     (interactiveApproval || options.installHopper)
@@ -303,7 +323,12 @@ const runSetupWorkflow = async (
       clientStates,
     });
     if ("failure" in install) return install.failure;
-    ({ hopperPath, providerEnvironment, selectedClients } = install);
+    ({
+      hopperPath,
+      providerEnvironment,
+      selectedClients,
+      warning: hopperWarning,
+    } = install);
   }
   const clientFailure = await configureDetectedClients({
     host,
@@ -325,10 +350,7 @@ const runSetupWorkflow = async (
       selectedSkillClientIds,
     );
     if (skillFailure !== undefined) {
-      return {
-        ...(await fail(skillFailure.remediation)),
-        code: "skill_install_failed",
-      };
+      return failSkill(skillFailure);
     }
   }
   const doctor = summarizeDoctor(await host.doctor(readinessScope));
@@ -339,6 +361,7 @@ const runSetupWorkflow = async (
       doctor.healthy,
       hopperPath,
     ),
+    hopperWarning,
     manualRemediation,
   );
   return {
@@ -391,14 +414,17 @@ const installHopperAction = async (input: {
     };
   }
   input.appliedActions.push("installed_hopper");
+  const warning = [installed.warning, installed.cleanupFailure]
+    .filter((value): value is string => value !== undefined)
+    .join(" ");
   emitProgress(input.options, {
     actionId: "install_hopper",
     label,
-    state: installed.cleanupFailure === undefined ? "completed" : "warning",
+    state: warning === "" ? "completed" : "warning",
     detail:
-      installed.cleanupFailure === undefined
+      warning === ""
         ? installed.launcherPath
-        : `${installed.launcherPath}; ${installed.cleanupFailure}`,
+        : `${installed.launcherPath}; ${warning}`,
   });
   const providerEnvironment = {
     ...input.providerEnvironment,
@@ -407,6 +433,7 @@ const installHopperAction = async (input: {
   return {
     hopperPath: installed.launcherPath,
     providerEnvironment,
+    ...(warning === "" ? {} : { warning }),
     selectedClients: await filterClientsNeedingConfigure(
       input.host,
       input.selectedClients,

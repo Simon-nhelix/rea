@@ -37,6 +37,8 @@ import {
   runWithExecutionLimits,
 } from "./PlaywrightElectronActiveActions.js";
 import { projectElectronActiveCapture } from "./PlaywrightElectronActiveProjection.js";
+import { readElectronFuseImage } from "../electron/ElectronFuseReader.js";
+import { assertNodeCliInspectArgumentsSupported } from "./PlaywrightElectronActiveFuses.js";
 
 const OPERATION = "capture_electron_scenario" as const;
 const STARTUP_TIMEOUT_MS = 60_000;
@@ -61,6 +63,7 @@ export class PlaywrightElectronActiveProvider implements ElectronActiveObservati
     // Load Playwright only when a capture launches; MCP startup stays off its module graph.
     private readonly launch: typeof electron.launch = async (options) =>
       (await import("playwright-core"))._electron.launch(options),
+    private readonly readFuseImage: typeof readElectronFuseImage = readElectronFuseImage,
   ) {}
 
   identity(): ProviderIdentity {
@@ -92,6 +95,14 @@ export class PlaywrightElectronActiveProvider implements ElectronActiveObservati
         application: input.application_path,
         root: input.application_root,
       };
+      await runWithExecutionLimits(
+        assertNodeCliInspectArgumentsSupported(paths.executable, {
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+          readFuseImage: this.readFuseImage,
+        }),
+        options.signal,
+        startupDeadline,
+      );
       const captureBaseline =
         await systemProcessOwnershipHost.captureBaseline?.(options.signal);
       if (options.signal?.aborted)
@@ -145,11 +156,7 @@ export class PlaywrightElectronActiveProvider implements ElectronActiveObservati
           )
         : ok(capture);
     } catch (cause: unknown) {
-      if (
-        options.signal?.aborted &&
-        paths !== undefined &&
-        initialState !== undefined
-      ) {
+      if (paths !== undefined && initialState !== undefined) {
         const retainedCapture = projectElectronActiveCapture(
           paths,
           actions,
@@ -159,25 +166,33 @@ export class PlaywrightElectronActiveProvider implements ElectronActiveObservati
           ...retainedCapture,
           limitations: [
             ...retainedCapture.limitations,
-            `Final Electron state was unavailable after cancellation: ${cause instanceof Error ? cause.message : String(cause)}. Windows, metrics, IPC, and timeline are the snapshot collected before actions and may omit their effects.`,
+            `Capture stopped after the initial pre-action snapshot: ${cause instanceof Error ? cause.message : String(cause)}. Final Windows, metrics, IPC, and timeline state is unknown; the retained snapshot may omit action effects.`,
           ],
         };
       }
-      outcome = err(
-        options.signal?.aborted === true
-          ? new BrowserObservationError(OPERATION, "cancelled", {
-              cause,
-              ...(capture === undefined
-                ? {}
-                : {
-                    partialObservation: {
-                      kind: "electron-active-observation" as const,
-                      capture,
-                    },
-                  }),
-            })
-          : providerError(cause),
-      );
+      if (options.signal?.aborted === true)
+        outcome = err(
+          new BrowserObservationError(OPERATION, "cancelled", {
+            cause,
+            ...(capture === undefined
+              ? {}
+              : {
+                  partialObservation: {
+                    kind: "electron-active-observation" as const,
+                    capture,
+                  },
+                }),
+          }),
+        );
+      else {
+        const error = providerError(cause);
+        if (capture !== undefined)
+          error.retainPartialObservation({
+            kind: "electron-active-observation",
+            capture,
+          });
+        outcome = err(error);
+      }
     }
     if (application !== undefined) {
       if (ownership !== undefined) {
@@ -277,14 +292,17 @@ export const cleanupElectronProcesses = async (
     terminateTree: cleanupWindowsProcessTree,
   },
 ): Promise<ProcessCleanupResult> => {
+  if (lineage?.status !== "verified") {
+    if (host.platform !== "win32") {
+      const root = await cleanupOwnedProcessGroup(ownership);
+      if (!root.cleaned) return root;
+    }
+    return {
+      cleaned: false,
+      reason: `${lineage?.reason ?? "owned Electron lineage was not observed"}; helper cleanup was not proven`,
+    };
+  }
   if (host.platform === "win32") {
-    // An empty Windows process table is not ownership proof for this PID.
-    if (lineage?.status !== "verified")
-      return {
-        cleaned: false,
-        reason:
-          "owned Electron lineage was unavailable; helper cleanup was not proven",
-      };
     const root = await host.terminateTree(ownership.leaderPid);
     if (!root.cleaned) return root;
     for (const descendant of lineage.lineage.descendants) {
@@ -292,16 +310,6 @@ export const cleanupElectronProcesses = async (
       if (!result.cleaned) return result;
     }
     return root;
-  }
-  if (lineage?.status !== "verified") {
-    const root = await cleanupOwnedProcessGroup(ownership);
-    return root.cleaned
-      ? {
-          cleaned: false,
-          reason:
-            "owned Electron lineage was unavailable; helper cleanup was not proven",
-        }
-      : root;
   }
   const groupIds = selectCapturedProcessGroupIds(
     ownership.leaderPid,

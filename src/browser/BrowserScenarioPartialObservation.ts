@@ -56,6 +56,8 @@ const browserScenarioLimitations = (
     ...(session.mode === "connect"
       ? [
           "CDP attachment cannot recover pre-attach events or guarantee launch-time context options.",
+          `Attached locale ${scenario.environment.locale} applies to Intl formatting only; navigator.language(s) and Accept-Language remain caller-controlled. Use launch mode for matching page and request languages.`,
+          "Detaching a CDP page session may clear caller-owned navigator.platform emulation. REA cannot snapshot the caller's complete user-agent/client-hint state before attachment; use launch mode to avoid mutating that external browser.",
         ]
       : []),
   ];
@@ -90,6 +92,7 @@ export const browserScenarioCaptureData = (input: {
         .sort(),
       network_content: input.scenario.capture.network,
       event_families: [...new Set(input.scenario.capture.events)].sort(),
+      limits: input.scenario.capture.limits,
     },
     duration_ms: Math.max(0, Math.round(performance.now() - input.startedAt)),
     steps: [...input.steps],

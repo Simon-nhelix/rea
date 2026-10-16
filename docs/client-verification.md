@@ -6,6 +6,28 @@ and provider lanes. Each record below states its host, client version, model
 fixture, and remaining coverage; a native-client run with a loopback model does
 not establish live model-service acceptance.
 
+## Published Pi code-mode renderer limit
+
+A separate probe of the published `@earendil-works/pi-codemode` 1.1.0 and 1.2.0
+declaration renderers rendered the full `compare_web_captures` input as
+`args: unknown`: its generated TypeScript type exceeds Pi's 16,000-character
+default. REA keeps the full advertisement's fields by inlining references when
+the shared form would exceed Pi's 32-reference expansion limit; retaining that
+shared form would leave later fields unknown instead. The existing
+`REA_MCP_INPUT_SCHEMA_PROFILE=compact` profile lets callers stay below
+its character limit by advertising reduced nested validation structure, while
+REA continues to validate calls against the complete canonical input schema.
+Compact applies to the server's advertised inputs and is not an automatic
+full-profile fallback; see the [compact input schema profile](mcp-contracts.md#compact-input-schema-profile)
+for details of its reduced forms.
+
+Custom renderer hosts can raise `inputMaxChars` through `renderToolSignature` or
+`renderToolSample`; `renderDeclarations` does not expose that override. The
+probe exercised the published renderer code, not a native Pi host or model, and
+does not establish broader Pi compatibility. See the pinned upstream
+[`declarations.ts`](https://github.com/earendil-works/pi/blob/b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb/packages/codemode/src/declarations.ts)
+and [renderer usage notes](https://github.com/earendil-works/pi/blob/b45e0ebcc5ae2fc42a6f2f23104d10e656e6bedb/packages/codemode/README.md#declarations-for-the-model).
+
 ## End-to-end, integration and golden evidence
 
 The optional `verify:qwen-client`, `verify:pi-client`, and `verify:hermes-client`
@@ -376,6 +398,11 @@ does not wait for an unlock prompt from a reachable but locked desktop keyring.
 Such a stall leaves the initial page unloaded with empty or placeholder CDP URLs;
 it does not establish permission to capture that page. See
 [the keyring diagnosis](https://github.com/morluto/rea/issues/1384#issuecomment-6093781686).
+
+On Windows, browser verifier lanes that launch an owned fixture require a
+standard, non-elevated caller token. They inspect the verifier caller before
+allocating fixture resources and refuse elevated or unobservable tokens; they do
+not change caller authority or claim to inspect the browser process token.
 
 `verify:browser` also captures a source-owned noise canvas as a real PNG above
 8 MiB through the CLI and stdio MCP, with complete byte/digest parity and real PNG

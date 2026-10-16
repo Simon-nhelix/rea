@@ -1103,6 +1103,26 @@ describe("source-map dependency coverage of hard-to-parse sources", () => {
       ["./lib.js"],
     ],
     [
+      "type-only import equals",
+      'import type Types = require("./types.js");\nimport lib = require("./lib.js");',
+      ["./lib.js"],
+    ],
+    [
+      "whole-statement type-only import",
+      'import type { Value } from "./types.js";',
+      [],
+    ],
+    [
+      "whole-statement type-only export",
+      'export type { Value } from "./types.js";',
+      [],
+    ],
+    [
+      "inline type import retains module side effects",
+      'import { type Value } from "./types.js";',
+      ["./types.js"],
+    ],
+    [
       "a local import alias",
       'import lib = localAlias;\nimport "./a.js";',
       ["./a.js"],

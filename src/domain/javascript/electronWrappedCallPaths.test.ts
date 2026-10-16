@@ -140,6 +140,40 @@ it("preserves an observed empty contextBridge API object", () => {
   expect(result.parse_status).toBe("complete");
 });
 
+it.each([
+  [
+    "explicit nested paths after an unknown spread",
+    `{ ...extra, a: { b: 1 }, c: 2 }`,
+    ["a", "a.b", "c"],
+    1,
+    "dynamic",
+  ],
+  [
+    "a direct object literal",
+    `{ a: { b: 1 }, c: 2 }`,
+    ["a", "a.b", "c"],
+    0,
+    "object-literal",
+  ],
+  ["a dynamic API argument", "getApi()", [], 1, "dynamic"],
+] as const)(
+  "preserves directly observed nested bridge members for %s",
+  (_name, api, members, unknownMembers, apiStatus) => {
+    const result = analyzeJavaScriptStaticSource(`
+      const { contextBridge } = require("electron");
+      contextBridge.exposeInMainWorld("api", ${api});
+    `);
+    expect(result.electron.context_bridge_apis).toContainEqual(
+      expect.objectContaining({
+        api_key: "api",
+        api_status: apiStatus,
+        members,
+        unknown_members: unknownMembers,
+      }),
+    );
+  },
+);
+
 describe("wrapped contextBridge exposure methods", () => {
   it("retains the original expression for a dynamic isolated world id", () => {
     const result = analyzeJavaScriptStaticSource(
@@ -147,7 +181,9 @@ describe("wrapped contextBridge exposure methods", () => {
         `const worldId = selectWorld(); electron.contextBridge.exposeInIsolatedWorld(worldId, "isolatedApi", {ping: true});`,
       ),
     );
-    expect(result.electron.context_bridge_apis).toContainEqual(
+    // The proven Webpack bootstrap resolves `load(2)` directly, so the complete
+    // direct observation is retained instead of a wrapper substitution.
+    expect(result.electron.context_bridge_apis).toEqual([
       expect.objectContaining({
         world: "isolated",
         world_id: {
@@ -156,9 +192,15 @@ describe("wrapped contextBridge exposure methods", () => {
           expression: "worldId",
         },
         api_key: "isolatedApi",
+        api_status: "object-literal",
         members: ["ping"],
-        resolution_basis: "wrapper-substitution",
+        unknown_members: 0,
+        module_key: "9",
+        module_runtime: "webpack-bootstrap@0",
       }),
+    ]);
+    expect(result.electron.context_bridge_apis[0]).not.toHaveProperty(
+      "resolution_basis",
     );
     expect(result.parse_status).toBe("partial");
   });
@@ -310,6 +352,22 @@ it("retains distinct wrapper invocation ranges for one IPC API source", () => {
   expect(findings[0]?.invocation_location).not.toEqual(
     findings[1]?.invocation_location,
   );
+});
+it("keeps one wrapper registration when one invocation reaches it twice", () => {
+  const result = analyzeJavaScriptStaticSource(`
+      const e=require("electron");
+      const copy=event=>event.sender.copy();
+      function register(channel,handler){e.ipcMain.on(channel,handler);}
+      function twice(channel){register(channel,copy);register(channel,copy);}
+      twice("same:invocation");
+    `);
+  expect(
+    result.electron.ipc.filter(
+      ({ resolution_basis, channel }) =>
+        resolution_basis === "wrapper-substitution" &&
+        channel === "same:invocation",
+    ),
+  ).toHaveLength(1);
 });
 it("keeps a directly observed renderer operation singular when tracing its exposed callback", () => {
   const result = analyzeJavaScriptStaticSource(`
@@ -713,3 +771,24 @@ describe("wrapped Electron API identity", () => {
     );
   });
 });
+
+it.each([false, true])(
+  "preserves a guarded bridge entry sharing a registration with an unconditional member (reverse=%s)",
+  (reverse) => {
+    const members = ["always:register", "conditional:flag?register:()=>{}"];
+    if (reverse) members.reverse();
+    const result = analyzeJavaScriptStaticSource(`const e=require("electron");
+    function register(){e.ipcMain.on("bridge:register",()=>{});}
+    e.contextBridge.exposeInMainWorld("api",{${members.join(",")}});`);
+    expect(result.electron.call_paths).toContainEqual(
+      expect.objectContaining({
+        entry_kind: "bridge-member",
+        entry: "api.conditional",
+        terminal: "electron.ipcMain.on",
+        conditions: expect.arrayContaining([
+          expect.objectContaining({ expression: "flag" }),
+        ]),
+      }),
+    );
+  },
+);

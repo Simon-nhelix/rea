@@ -206,3 +206,66 @@ describe("JavaScript semantic analysis: child-process signals", () => {
     ]);
   });
 });
+
+describe("JavaScript semantic analysis: configuration value escapes", () => {
+  const configurationReads = (body: string) =>
+    analyzeJavaScriptSemantics(`function run() { ${body} }`)
+      .configurationOperations.filter(({ kind }) => kind !== "default")
+      .map(({ kind, key }) => [kind, key]);
+
+  it.each([
+    [
+      "an environment value",
+      "return Number(process.env.PORT);",
+      "environment",
+      "PORT",
+    ],
+    ["an argv entry", "return Number(process.argv[2]);", "argv", "2"],
+  ])("keeps a read after passing %s to a call", (_name, body, kind, key) => {
+    expect(configurationReads(body)).toEqual([[kind, key]]);
+  });
+
+  it.each([
+    "patch(process.argv[key]); return process.argv[3];",
+    "patch(process.argv.__proto__); return process.argv[3];",
+    "const args = process.argv; patch(args[key]); return args[3];",
+  ])(
+    "retains uncertainty after an object-valued argv selection escapes: %s",
+    (body) => {
+      expect(configurationReads(body)).not.toContainEqual(["argv", "3"]);
+    },
+  );
+
+  it("preserves an earlier top-level read and unrelated configuration after an argv escape", () => {
+    const captured = analyzeJavaScriptSemantics(
+      "const saved = process.argv[3]; patch(process.argv[key]); globalThis.saved = saved;",
+    );
+    expect(
+      captured.configurationOperations.map(({ kind, key }) => [kind, key]),
+    ).toContainEqual(["argv", "3"]);
+    expect(
+      configurationReads("patch(process.argv[key]); return process.env.PORT;"),
+    ).toContainEqual(["environment", "PORT"]);
+  });
+
+  it.each([
+    [
+      "a direct argv entry",
+      "process.argv[2] = {}; return Number(process.argv[2]);",
+    ],
+    [
+      "an aliased argv entry",
+      "const argv = process.argv; argv[2] = {}; return Number(process.argv[2]);",
+    ],
+    [
+      "the argv container",
+      "mutate(process.argv); return Number(process.argv[2]);",
+    ],
+    [
+      "the env container",
+      "mutate(process.env); return Number(process.env.PORT);",
+    ],
+  ])("leaves a read unknown after replacing %s", (_name, body) => {
+    expect(configurationReads(body)).toEqual([]);
+  });
+});

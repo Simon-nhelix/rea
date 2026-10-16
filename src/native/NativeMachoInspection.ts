@@ -39,14 +39,17 @@ interface NativeMachoInspectionContext {
   ) => NativeCommandInvocation;
 }
 
-const DISCOVERY_COMMANDS = [
-  ["file", ["-b"]],
-  ["lipo", ["-detailed_info"]],
-] as const;
+const DISCOVERY_COMMANDS = [["lipo", ["-detailed_info"]]] as const;
+
+// llvm-nm's default dyld-info pass fakes up symbols the symbol table lacks
+// from dyld metadata. It takes seconds on large apps (Keynote arm64: 5.8 s
+// versus 0.01 s without it), and under -gU it can only add export-trie names.
+const SYMBOL_TABLE_EXPORTS = ["nm", ["-gjU", "--no-dyldinfo"]] as const;
+const DYLD_INFO_EXPORTS = ["nm", ["-gjU"]] as const;
 
 const REQUIRED_SLICE_COMMANDS = [
   ["otool", ["-h", "-l"]],
-  ["nm", ["-gjU"]],
+  SYMBOL_TABLE_EXPORTS,
   ["dyld_info", ["-imports"]],
   ["dyld_info", ["-exports"]],
   ["dwarfdump", ["--uuid"]],
@@ -98,22 +101,42 @@ export const inspectNativeMacho = async (
       ],
       context.signal,
     );
+  // vtool knows no variant subtypes, so no spelling selects an arm64e.x1 slice.
+  const vtoolSelectsSlice =
+    selectedArchitecture === null ||
+    !toolArchitectureName("vtool", selectedArchitecture).includes(".");
   // Slice commands only read the selected artifact, so launch them together.
   // Every launch settles before return; declared order fixes provenance and
   // which failure is reported.
   const [required, optional] = await Promise.all([
     Promise.all(REQUIRED_SLICE_COMMANDS.map(runSliceCommand)),
-    runSliceCommand(OPTIONAL_VTOOL_COMMAND),
+    vtoolSelectsSlice ? runSliceCommand(OPTIONAL_VTOOL_COMMAND) : null,
   ]);
   for (const captured of required) {
     if (!captured.ok) return err(captured.error);
     captures.push(captured.value);
   }
   const limitations: string[] = [];
-  if (optional.ok) captures.push(optional.value);
+  if (optional === null)
+    limitations.push(
+      `vtool cannot select the ${selectedArchitecture} slice; build metadata is normalized from otool only.`,
+    );
+  else if (optional.ok) captures.push(optional.value);
   else if (optional.error._tag === "AnalysisCapabilityUnavailableError")
     limitations.push(VTOOL_UNAVAILABLE_LIMITATION);
   else return err(optional.error);
+  const nmIndex = captures.findIndex(({ tool }) => tool === "nm");
+  const dyldExports = captures.filter(({ tool }) => tool === "dyld_info")[1];
+  if (nmIndex < 0 || dyldExports === undefined)
+    throw new TypeError("Missing nm or dyld_info export capture");
+  // A stripped symbol table (strip -T) can omit names the export trie keeps.
+  // Only then does llvm-nm's dyld-info pass add names, and its exact names
+  // disambiguate dyld_info rows, so rerun it rather than lose them.
+  if (!namesEveryExport(captures[nmIndex]!.stdout, dyldExports)) {
+    const withDyldInfo = await runSliceCommand(DYLD_INFO_EXPORTS);
+    if (!withDyldInfo.ok) return err(withDyldInfo.error);
+    captures[nmIndex] = withDyldInfo.value;
+  }
   const otool = captures.find(({ tool }) => tool === "otool");
   if (otool === undefined) throw new TypeError("Missing otool capture");
   let load: ReturnType<typeof parseOtoolLoadCommands>;
@@ -214,7 +237,15 @@ const normalizeMacho = (
     load.commands,
     dwarfdump.stdout,
     artifactPath,
-    selectedArchitecture.name,
+    selectedArchitecture.name === null
+      ? null
+      : {
+          name: selectedArchitecture.name,
+          dwarfdumpName: toolArchitectureName(
+            "dwarfdump",
+            selectedArchitecture.name,
+          ),
+        },
   );
   const provenance = captures.map(toInvocation);
   // A thread-state command carries the entrypoint in architecture-specific
@@ -247,8 +278,8 @@ const normalizeMacho = (
   return inspectMachoSchema.parse({
     format: "mach-o",
     selected_architecture: selectedArchitecture,
-    endian: parseEndian(byTool("file").stdout),
-    word_size: parseWordSize(byTool("file").stdout),
+    endian: load.endian,
+    word_size: load.wordSize,
     file_type: load.fileType,
     flags: load.flags,
     uuid: uuid.value,
@@ -296,6 +327,34 @@ const captureLookup =
     return capture;
   };
 
+/**
+ * Whether every dyld_info export row names a symbol-table export. A row this
+ * parser cannot read counts as uncovered, so an unfamiliar format falls back.
+ */
+const namesEveryExport = (
+  nmOutput: string,
+  dyldExports: NativeCommandCapture,
+): boolean => {
+  const names = new Set(parseNmExports(nmOutput).map(({ name }) => name));
+  return sliceOutput(dyldExports)
+    .split(/\r?\n/u)
+    .every((rawLine, index) => {
+      const line = rawLine.trim();
+      if (
+        line.length === 0 ||
+        (index === 0 && line.endsWith(":")) ||
+        /^-?exports:$/u.test(line) ||
+        /^offset\s+symbol$/u.test(line)
+      )
+        return true;
+      const rows = parseDyldSymbols(line, "exports", null, names);
+      // The parser withholds a row only when nm names both of its readings.
+      if (rows.length === 0)
+        return names.has(/^0x[\da-f]+\s+(.+)$/iu.exec(line)?.[1] ?? "");
+      return rows.length === 1 && names.has(rows[0]!.name);
+    });
+};
+
 const parseNmExports = (output: string) =>
   output
     .split(/\r?\n/u)
@@ -307,16 +366,6 @@ const parseNmExports = (output: string) =>
       reexport: null,
       source: "nm",
     }));
-
-const parseEndian = (output: string): "little" | "big" | null =>
-  /little-endian/iu.test(output)
-    ? "little"
-    : /big-endian/iu.test(output)
-      ? "big"
-      : null;
-
-const parseWordSize = (output: string): 32 | 64 | null =>
-  /64-bit/iu.test(output) ? 64 : /32-bit/iu.test(output) ? 32 : null;
 
 const covered = <Value>(
   items: readonly Value[],
@@ -386,16 +435,21 @@ export const architectureLocations = (
   return locations;
 };
 
+/**
+ * lipo appends the pointer-auth ABI version to arm64e (`arm64e.v1`). Only
+ * dyld_info accepts that spelling; the other Apple tools select the slice by
+ * its CPU-family name. Other variants are distinct subtypes (`arm64e.x1`)
+ * that the tools address only by their exact name.
+ */
+const toolArchitectureName = (tool: string, architecture: string): string =>
+  tool === "dyld_info" ? architecture : architecture.replace(/\.v\d+$/u, "");
+
 const selectedArchitectureArguments = (
   tool: string,
   architecture: string | null,
 ): string[] => {
   if (architecture === null) return [];
-  const baseArchitecture = architecture.split(".")[0] ?? architecture;
-  // dyld_info distinguishes arm64e ABI variants; the other Apple tools use
-  // the base CPU-family spelling for the same slice.
-  const toolArchitecture =
-    tool === "dyld_info" ? architecture : baseArchitecture;
+  const toolArchitecture = toolArchitectureName(tool, architecture);
   return tool === "dwarfdump"
     ? [`--arch=${toolArchitecture}`]
     : ["-arch", toolArchitecture];

@@ -162,10 +162,14 @@ it("ends worker stdin and unreferences process handles when cleanup reports insp
   let unreferenced = false;
   let permitCleanup = false;
   let childStdin: typeof process.stdin | undefined;
+  let childExit: Promise<void> | undefined;
   const worker = new JavaScriptAnalysisWorker(
     { heapMb: 128, timeoutMs: 30_000 },
     async (request) => {
       const launched = await spawnOwnedProviderProcess(request);
+      childExit = new Promise((resolve) => {
+        launched.process.once("exit", () => resolve());
+      });
       const originalUnref = launched.process.unref;
       launched.process.unref = () => {
         unreferenced = true;
@@ -208,6 +212,7 @@ it("ends worker stdin and unreferences process handles when cleanup reports insp
     expect(childStdin?.listenerCount("error")).toBeLessThanOrEqual(
       errorListeners ?? 0,
     );
+    await childExit;
     permitCleanup = true;
     await worker.close();
   } finally {
@@ -269,6 +274,55 @@ catch (error) {
     expect(await cleanupOwnedProcessGroup(ownership)).toMatchObject({
       cleaned: true,
     });
+  }
+});
+
+// The real server reports a parent-declined semantic budget through its
+// resource frame.
+it("formats a real worker's declined semantic budget once", async () => {
+  const worker = new JavaScriptAnalysisWorker(
+    { heapMb: 128, timeoutMs: 30_000 },
+    async (request) => {
+      const spawned = await spawnOwnedProviderProcess(request);
+      const stdin = spawned.process.stdin;
+      if (stdin === null || stdin === undefined)
+        throw new Error("Owned analyzer has no stdin");
+      const write = stdin.write.bind(stdin) as (
+        chunk: string,
+        callback: (error?: Error | null) => void,
+      ) => boolean;
+      stdin.write = ((
+        chunk: string,
+        callback: (error?: Error | null) => void,
+      ) =>
+        write(
+          chunk.replace(
+            /"semantic_result_budget_bytes":\d+/u,
+            '"semantic_result_budget_bytes":0',
+          ),
+          callback,
+        )) as typeof stdin.write;
+      return spawned;
+    },
+  );
+  try {
+    const result = await worker.analyze(
+      source("main.js", "export const observed = 7;"),
+      100,
+    );
+    if (result.ok) throw new Error("expected a declined semantic budget");
+    const { error } = result.error;
+    expect(error).toMatchObject({
+      _tag: "AnalysisResourceConstraintError",
+      reason:
+        "The parent reserved its remaining result capacity for static observations; semantic analysis of main.js was not started",
+      reportedLimits: { semantic_result_budget_bytes: 0 },
+    });
+    expect(error.message.match(/Resource constraint during/gu)).toHaveLength(1);
+    expect(error.message.match(/main\.js:/gu)).toBeNull();
+    expect(result.error.javascript?.parse_status).toBe("complete");
+  } finally {
+    await worker.close();
   }
 });
 

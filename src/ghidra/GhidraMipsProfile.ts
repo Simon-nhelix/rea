@@ -1,5 +1,8 @@
 import type { GhidraLanguageOverride } from "../config/ghidraLanguageOverride.js";
-import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import type {
+  BinaryTarget,
+  MipsElfMetadata,
+} from "../domain/binaryTargetTypes.js";
 import { isConsoleTargetFormat } from "../domain/consoleRom.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 
@@ -69,6 +72,41 @@ const hasLegacyMipsHeaderShape = (target: BinaryTarget): boolean => {
   );
 };
 
+/** Return a refusal for GNU ABI attributes this existing MIPS lane cannot model. */
+/**
+ * Every MIPS lane, including PSP, needs every ABI declaration source examined:
+ * headers outside the captured file may hold declarations that would refuse it.
+ */
+export const ghidraMipsIncompleteDeclarationsReason = (
+  metadata: MipsElfMetadata,
+): string | null =>
+  (metadata.limitations?.length ?? 0) > 0
+    ? [
+        "MIPS ABI declaration inspection is incomplete; unsupported attributes or conflicting declaration sources may remain unknown.",
+        ...(metadata.limitations ?? []),
+      ].join(" ")
+    : null;
+
+export const ghidraMipsGnuAttributesUnsupportedReason = (
+  metadata: MipsElfMetadata,
+): string | null => {
+  const attributes = metadata.gnuAttributes;
+  if (attributes === undefined)
+    return "GNU MIPS ABI attribute inspection is unavailable; provider selection cannot treat it as absent.";
+  if (attributes === null) return null;
+  if (attributes.msa !== null && attributes.msa !== 0)
+    return "The GNU MIPS MSA ABI attribute declares an unsupported or unknown vector argument ABI.";
+  if (
+    metadata.abiFlags === null &&
+    attributes.fpAbi !== null &&
+    attributes.fpAbi !== 0 &&
+    attributes.fpAbi !== 1 &&
+    attributes.fpAbi !== 5
+  )
+    return "Without a MIPS ABI flags record, the GNU floating-point ABI attribute must be absent, any, double-precision, or FPXX for the verified recordless lane.";
+  return null;
+};
+
 /** Keep family recognition separate from the deliberately bounded Ghidra lane. */
 export const ghidraMipsUnsupportedReason = (
   target: BinaryTarget,
@@ -85,6 +123,9 @@ export const ghidraMipsUnsupportedReason = (
   const shared = isGhidraMips16SharedTarget(target);
   if (metadata.elfClass !== 32)
     return "This Ghidra MIPS lane supports ELF32 only; MIPS64 and n64 remain unsupported.";
+  const gnuAttributesReason =
+    ghidraMipsGnuAttributesUnsupportedReason(metadata);
+  if (gnuAttributesReason !== null) return gnuAttributesReason;
   if (
     metadata.type !== MIPS_ET_EXEC &&
     metadata.type !== MIPS_ET_REL &&
@@ -145,11 +186,8 @@ export const ghidraMipsUnsupportedReason = (
     if (load.symbolRelativeCount !== 0)
       return "Symbol-bearing R_MIPS_REL32 is unsupported: Ghidra normalizes MIPS16 function addresses and can lose the source function-pointer mode tag. Symbol-index-zero REL32 is verified separately.";
   }
-  if ((metadata.limitations?.length ?? 0) > 0)
-    return [
-      "MIPS ABI declaration inspection is incomplete; unsupported attributes or conflicting declaration sources may remain unknown.",
-      ...(metadata.limitations ?? []),
-    ].join(" ");
+  const incomplete = ghidraMipsIncompleteDeclarationsReason(metadata);
+  if (incomplete !== null) return incomplete;
   const abi = metadata.abiFlags;
   if (shared && abi === null && (metadata.limitations?.length ?? 0) === 0)
     return null; // Inspected absence leaves FP semantics unknown, never inferred.
@@ -311,6 +349,17 @@ export const ghidraMipsProfileParameters = (
               flags1: abi.flags1,
               flags2: abi.flags2,
             },
+      ...(target.mips.gnuAttributes === undefined
+        ? {}
+        : {
+            gnu_attributes:
+              target.mips.gnuAttributes === null
+                ? null
+                : {
+                    fp_abi: target.mips.gnuAttributes.fpAbi,
+                    msa: target.mips.gnuAttributes.msa,
+                  },
+          }),
       ...(target.mips.sharedLoad === undefined
         ? {}
         : {

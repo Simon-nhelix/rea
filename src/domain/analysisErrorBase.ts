@@ -135,6 +135,7 @@ import type { WebScriptExportPartialObservation } from "./webScriptExport.js";
 import type { JavaScriptRecoveryPartialObservation } from "./javascript/javascriptRecovery.js";
 import type { BrowserScenarioPartialObservation } from "./browserScenarioCapture.js";
 import type { Evidence } from "./evidence.js";
+import type { ElectronPagePartialObservation } from "./javascript/electronObservation.js";
 import type { AndroidPartialObservation } from "./android/androidPartialObservation.js";
 import type { FirmwarePartialObservation } from "./firmware/firmwareAnalysis.js";
 import type {
@@ -148,6 +149,9 @@ import type {
   RecordedCrash,
   RecordedCrashPartialObservation,
 } from "./native/recordedCrash.js";
+import type { WebPageInspection } from "./browserObservationSchemas.js";
+import type { WebExecution } from "./webExecution.js";
+import type { WebEventListeners } from "./webEventListeners.js";
 
 /** Provider-neutral evidence collected before a typed analysis failure. */
 export type AnalysisPartialObservation =
@@ -156,6 +160,9 @@ export type AnalysisPartialObservation =
   | FileOffsetPartialObservation
   | ElectronActivePartialObservation
   | BrowserScenarioPartialObservation
+  | WebPageInspection
+  | WebExecution
+  | WebEventListeners
   | JavaScriptRuntimeObservation
   | ArtifactInventoryPartialObservation
   | ArtifactExtractionPartialObservation
@@ -168,6 +175,7 @@ export type AnalysisPartialObservation =
   | AndroidPartialObservation
   | FirmwarePartialObservation
   | NativeUiObservationResult
+  | ElectronPagePartialObservation
   | AdbActivityStartPartialObservation
   | AdbAcquiredFilePartialObservation
   | AdbPackagePullPartialObservation;

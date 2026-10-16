@@ -69,7 +69,6 @@ const doctorHost = (
     validTarget: () => Promise.resolve(true),
     executable: (path) =>
       Promise.resolve(hopperAvailable && path.includes("Hopper")),
-    supportedLinuxHopper: () => Promise.resolve(true),
     linuxDemoRuntimeCheck: () =>
       Promise.resolve({
         name: "hopper-demo-runtime",
@@ -273,7 +272,7 @@ describe("Windows native doctor failure diagnostics", () => {
       "artifact",
       "runtime_missing",
       "missing_dependency",
-      "bundled native addon",
+      "native/windows/README.md",
     ],
     [
       "self-test",

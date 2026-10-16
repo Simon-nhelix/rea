@@ -198,6 +198,8 @@ const normalizedNodeToken = (node: t.Node, parent: t.Node | null): string => {
     primitiveAttribute(node, "optional"),
     primitiveAttribute(node, "async"),
     primitiveAttribute(node, "generator"),
+    primitiveAttribute(node, "delegate"),
+    primitiveAttribute(node, "prefix"),
   ].filter((value): value is string => value !== null);
   return [node.type, ...attributes].join(":");
 };
@@ -250,6 +252,9 @@ const controlFlowToken = (node: t.Node): string | null => {
 };
 
 const semanticLiteral = (node: t.Node): string | null => {
+  // Babel retains directive escapes in value; decoding them would erase the
+  // distinction between a strict-mode directive and an escaped lookalike.
+  if (t.isDirectiveLiteral(node)) return `directive:${node.value}`;
   if (t.isStringLiteral(node)) return `string:${node.value}`;
   if (t.isNumericLiteral(node)) return `number:${String(node.value)}`;
   if (t.isBooleanLiteral(node)) return `boolean:${String(node.value)}`;

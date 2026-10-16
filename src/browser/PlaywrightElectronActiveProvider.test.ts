@@ -1,7 +1,15 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { dirname } from "node:path";
+import { writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+
+import { createTestTempDirectory } from "../../tests/fixtures/temporaryDirectory.js";
+import {
+  OBSIDIAN_FUSE_BYTES,
+  thinFuseImage,
+} from "../../tests/fixtures/electron/fuseImage.js";
 
 import * as processOwnership from "../process/ProcessOwnership.js";
+import * as ownershipObservation from "../process/ProcessOwnershipObservation.js";
 import * as electronActions from "./PlaywrightElectronActiveActions.js";
 import { electronActiveObservationInputSchema } from "../domain/javascript/electronActiveObservation.js";
 import type { OwnedProcessGroup } from "../process/ProcessOwnership.js";
@@ -73,31 +81,106 @@ const ownership = {
   expectedParentPid: 1,
 } satisfies OwnedProcessGroup;
 
-it("does not signal a Windows Electron PID when lineage is unavailable", async () => {
-  const terminateTree = vi.fn(async () => ({
-    cleaned: true as const,
-    signaled: true,
-  }));
-  const result = await cleanupElectronProcesses(
-    ownership,
-    {
-      status: "unavailable",
-      observedAt: "2026-10-10T00:00:00.000Z",
-      runId: ownership.runId,
-      launcherPid: ownership.leaderPid,
-      processGroupId: ownership.processGroupId,
-      reason: "owned launcher is not live",
-    },
-    { platform: "win32", terminateTree },
-  );
+const emptyHookSnapshot = () => ({
+  events: [],
+  retention_budget_bytes: 0,
+  estimated_retained_bytes: 0,
+  event_serialized_byte_upper_bound: 0,
+  retained: 0,
+  dropped: 0,
+  dropped_ipc: 0,
+  dropped_runtime: 0,
+  dropped_event_families: [],
+  dropped_event_roles: [],
+  observed: 0,
+  observed_ipc: 0,
+  observed_runtime: 0,
+  hook_error: false,
+});
 
-  expect(terminateTree).not.toHaveBeenCalled();
-  expect(result).toEqual({
+it.each([
+  "owned launcher is not live",
+  "process table permission denied",
+  "process ownership did not match",
+])(
+  "does not signal a Windows Electron PID when lineage is unavailable: %s",
+  async (reason) => {
+    const terminateTree = vi.fn(async () => ({
+      cleaned: true as const,
+      signaled: true,
+    }));
+    const result = await cleanupElectronProcesses(
+      ownership,
+      {
+        status: "unavailable",
+        observedAt: "2026-10-10T00:00:00.000Z",
+        runId: ownership.runId,
+        launcherPid: ownership.leaderPid,
+        processGroupId: ownership.processGroupId,
+        reason,
+      },
+      { platform: "win32", terminateTree },
+    );
+
+    expect(terminateTree).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      cleaned: false,
+      reason: `${reason}; helper cleanup was not proven`,
+    });
+  },
+);
+
+it("does not signal an unobserved Windows Electron lineage", async () => {
+  const terminateTree = vi.fn();
+  expect(
+    await cleanupElectronProcesses(ownership, undefined, {
+      platform: "win32",
+      terminateTree,
+    }),
+  ).toEqual({
     cleaned: false,
     reason:
-      "owned Electron lineage was unavailable; helper cleanup was not proven",
+      "owned Electron lineage was not observed; helper cleanup was not proven",
   });
+  expect(terminateTree).not.toHaveBeenCalled();
 });
+
+it.each([0, 1])(
+  "preserves a Windows termination failure at tree index %i",
+  async (failedIndex) => {
+    const failure = { cleaned: false as const, reason: "termination denied" };
+    const terminateTree = vi
+      .fn<typeof processOwnership.cleanupWindowsProcessTree>()
+      .mockResolvedValue({ cleaned: true, signaled: true });
+    terminateTree.mockImplementationOnce(async () =>
+      failedIndex === 0 ? failure : { cleaned: true, signaled: true },
+    );
+    if (failedIndex === 1) terminateTree.mockResolvedValueOnce(failure);
+    const result = await cleanupElectronProcesses(
+      ownership,
+      {
+        status: "verified",
+        observedAt: "2026-10-10T00:00:00.000Z",
+        lineage: {
+          runId: ownership.runId,
+          launcherPid: ownership.leaderPid,
+          launcherParentPid: 1,
+          processGroupId: ownership.processGroupId,
+          descendants: [
+            {
+              pid: 4343,
+              parentPid: ownership.leaderPid,
+              processGroupId: ownership.processGroupId,
+            },
+          ],
+        },
+      },
+      { platform: "win32", terminateTree },
+    );
+    expect(result).toBe(failure);
+    expect(terminateTree).toHaveBeenCalledTimes(failedIndex + 1);
+  },
+);
 
 it("signals a Windows Electron tree only after lineage is verified", async () => {
   const terminateTree = vi.fn(async () => ({
@@ -133,32 +216,28 @@ it("signals a Windows Electron tree only after lineage is verified", async () =>
 
 it("retains the partial capture without taskkill when Windows lineage is unavailable", async () => {
   // Exercise the Windows decision branch; this is not native Windows coverage.
+  // The injected unavailable observation keeps this independent of host PID reuse.
+  vi.spyOn(
+    ownershipObservation,
+    "observeOwnedProcessLineage",
+  ).mockResolvedValue({
+    status: "unavailable",
+    observedAt: "2026-10-10T00:00:00.000Z",
+    runId: "fixture-run",
+    launcherPid: 424242,
+    processGroupId: 424242,
+    reason: "process table permission denied",
+  });
   const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
   Object.defineProperty(process, "platform", { value: "win32" });
   const terminateTree = vi
     .spyOn(processOwnership, "cleanupWindowsProcessTree")
     .mockResolvedValue({ cleaned: true, signaled: true });
-  const hookSnapshot = {
-    events: [],
-    retention_budget_bytes: 0,
-    estimated_retained_bytes: 0,
-    event_serialized_byte_upper_bound: 0,
-    retained: 0,
-    dropped: 0,
-    dropped_ipc: 0,
-    dropped_runtime: 0,
-    dropped_event_families: [],
-    dropped_event_roles: [],
-    observed: 0,
-    observed_ipc: 0,
-    observed_runtime: 0,
-    hook_error: false,
-  };
   vi.spyOn(electronActions, "readApplicationState").mockResolvedValue({
     windows: [],
     metrics: [],
     electronVersion: "44.0.0",
-    hookSnapshot,
+    hookSnapshot: emptyHookSnapshot(),
   });
   const application = {
     process: () => ({ pid: 424242 }),
@@ -190,7 +269,7 @@ it("retains the partial capture without taskkill when Windows lineage is unavail
       reason: "cleanup_failed",
       cleanup: {
         reason:
-          "owned Electron lineage was unavailable; helper cleanup was not proven",
+          "process table permission denied; helper cleanup was not proven",
       },
       partialObservation: {
         kind: "electron-active-observation",
@@ -205,4 +284,81 @@ it("retains the partial capture without taskkill when Windows lineage is unavail
     if (originalPlatform !== undefined)
       Object.defineProperty(process, "platform", originalPlatform);
   }
+});
+
+it("retains the initial snapshot when the final state read fails", async () => {
+  const initialState = {
+    windows: [],
+    metrics: [],
+    electronVersion: "44.0.0",
+    hookSnapshot: emptyHookSnapshot(),
+  };
+  vi.spyOn(electronActions, "readApplicationState")
+    .mockResolvedValueOnce(initialState)
+    .mockRejectedValueOnce(new Error("final renderer state unavailable"));
+  const application = {
+    process: () => ({ pid: 424242 }),
+    close: vi.fn(async () => undefined),
+    windows: () => [],
+  };
+  const provider = new PlaywrightElectronActiveProvider(
+    {},
+    async () =>
+      application as unknown as Awaited<
+        ReturnType<typeof import("playwright-core")._electron.launch>
+      >,
+  );
+
+  const result = await provider.capture({
+    ...electronActiveObservationInputSchema.parse({
+      executable_path: process.execPath,
+      application_path: process.execPath,
+      actions: [],
+    }),
+    application_root: dirname(process.execPath),
+  });
+
+  expect(result.ok).toBe(false);
+  if (result.ok) throw new Error("Expected final state capture to fail");
+  const partialObservation = result.error.partialObservation;
+  expect(partialObservation).toMatchObject({
+    kind: "electron-active-observation",
+    capture: {
+      application: { electron_version: "44.0.0" },
+      limitations: expect.arrayContaining([
+        expect.stringContaining("initial pre-action snapshot"),
+      ]),
+    },
+  });
+});
+
+it("rejects active capture before launch when EnableNodeCliInspectArguments fuse is disabled", async () => {
+  const root = await createTestTempDirectory("rea-active-provider-fuse-");
+  const disabledBinary = join(root, "disabled-electron");
+  await writeFile(disabledBinary, thinFuseImage(OBSIDIAN_FUSE_BYTES).bytes);
+
+  const launchSpy = vi.fn(async () => {
+    throw new Error("launch should not be called when fuse is disabled");
+  });
+
+  const provider = new PlaywrightElectronActiveProvider({}, launchSpy);
+
+  const result = await provider.capture({
+    ...electronActiveObservationInputSchema.parse({
+      executable_path: disabledBinary,
+      application_path: disabledBinary,
+    }),
+    application_root: root,
+  });
+
+  expect(result.ok).toBe(false);
+  if (result.ok) throw new Error("Expected capture to fail");
+  expect(launchSpy).not.toHaveBeenCalled();
+  expect(result.error).toMatchObject({
+    _tag: "AnalysisUnsupportedTargetError",
+    operation: "capture_electron_scenario",
+    path: disabledBinary,
+    message: expect.stringContaining("EnableNodeCliInspectArguments"),
+    remediationAction: expect.stringContaining("inspect_electron_page"),
+  });
 });

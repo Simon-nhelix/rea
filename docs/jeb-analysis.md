@@ -10,6 +10,27 @@ Start a JEB client that serves MCP and point REA at it:
 - In the JEB GUI client, start the MCP server from the _File_ menu (or via the VIBRE assistant).
 - Headless, use JEB's documented programmatic route (`JebMcpServerInstance` from the JEB API) with the JEB client on your classpath; JEB 5.48's `-c` headless mode does not accept `--mcp` directly.
 
+For setup registration, set `REA_JEB_MCP_URL` in the REA process environment
+before running `rea setup`. The approved setup plan preserves the exact selected
+URL after validating its syntax. That validation does not establish that the
+JEB service is reachable or that a project is open; use the existing
+`inspect-jeb-client` command for a read-only service query.
+
+MCP `binary_session` probes the live JEB service and its advertised tool catalog.
+Availability is reported per operation: a reachable headless client can support
+inspection and decompilation while refusing `open_jeb_project`. Catalog discovery
+uses one 60-second deadline across connection and pagination; a responsive server
+cannot keep discovery running indefinitely by returning more pages.
+
+Each upstream tool call has an absolute 60-second request deadline by default.
+Set `REA_JEB_MCP_TIMEOUT_MS` to a positive decimal number of milliseconds to
+select a different per-request budget, for example `REA_JEB_MCP_TIMEOUT_MS=300000`
+for a five-minute decompilation. This budget starts after discovery and applies
+to each individual `tools/call`; it does not extend the separate catalog deadline
+or establish one end-to-end deadline across a whole CLI or MCP operation. A
+request that reaches its budget returns a typed timeout, while caller
+cancellation remains a cancellation.
+
 Verified against JEB 5.48.0 (Linux x64, licensed build) serving `jeb-mcp-server` 1.3.0 over streamable HTTP.
 
 ## Operations

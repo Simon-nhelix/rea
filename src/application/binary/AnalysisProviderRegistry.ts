@@ -1,3 +1,4 @@
+import { ProviderCleanupError } from "../../domain/providerCleanupError.js";
 import {
   analysisProviderIdSchema,
   analysisProviderSelectorSchema,
@@ -26,6 +27,7 @@ import {
   type AnalysisProviderCandidateEvaluation,
 } from "./AnalysisProviderEvaluation.js";
 import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
+import type { FileCloseResourceOwner } from "../AnalysisProvider.js";
 
 /** Deterministic discovery truth for one configured deep provider. */
 export interface AnalysisProviderCandidateStatus {
@@ -65,6 +67,7 @@ interface TargetSelectionContext {
   readonly target: BinaryTarget;
   readonly baseline: readonly AnalysisProviderCandidateStatus[];
   readonly signal: AbortSignal | undefined;
+  readonly fileCloseResources?: FileCloseResourceOwner;
 }
 
 /**
@@ -135,6 +138,35 @@ export class AnalysisProviderRegistry {
     );
   }
 
+  /** Report retained candidate resources without retrying cleanup. */
+  hasPendingOwnedResources(): boolean {
+    return this.#providers.some(
+      (provider) => provider.hasPendingOwnedResources?.() === true,
+    );
+  }
+
+  /** Close candidate-owned resources even when no target client was opened. */
+  async closeOwnedResources(): Promise<Result<null, AnalysisError>> {
+    const failures: AnalysisError[] = [];
+    for (const provider of this.#providers) {
+      if (provider.closeOwnedResources === undefined) continue;
+      const result = await provider.closeOwnedResources();
+      if (!result.ok) failures.push(result.error);
+    }
+    if (failures.length === 0) return ok(null);
+    if (failures.length === 1) return err(failures[0]!);
+    return err(
+      new ProviderCleanupError(
+        "rea",
+        failures.flatMap((failure) => failure.cleanupResources),
+        {
+          reason: failures.map((failure) => failure.message).join("; "),
+        },
+        { cause: new AggregateError(failures) },
+      ),
+    );
+  }
+
   /** List the unique deep-operation declarations without probing candidates. */
   declaredOperations(): readonly string[] {
     return [...this.#declaredOperations];
@@ -151,7 +183,10 @@ export class AnalysisProviderRegistry {
   async select(
     target: BinaryTarget,
     requestedSelector?: AnalysisProviderSelector,
-    options: { readonly signal?: AbortSignal } = {},
+    options: {
+      readonly signal?: AbortSignal;
+      readonly fileCloseResources?: FileCloseResourceOwner;
+    } = {},
   ): Promise<Result<AnalysisProviderSelection, AnalysisError>> {
     if (signalIsAborted(options.signal))
       return err(new AnalysisCancelledError("open_binary"));
@@ -189,7 +224,14 @@ export class AnalysisProviderRegistry {
       });
     if (selector !== "auto")
       return this.#selectConcrete(
-        { target, baseline, signal: options.signal },
+        {
+          target,
+          baseline,
+          signal: options.signal,
+          ...(options.fileCloseResources === undefined
+            ? {}
+            : { fileCloseResources: options.fileCloseResources }),
+        },
         selector,
         request === undefined ? "environment" : "request",
       );
@@ -197,6 +239,9 @@ export class AnalysisProviderRegistry {
       target,
       baseline,
       signal: options.signal,
+      ...(options.fileCloseResources === undefined
+        ? {}
+        : { fileCloseResources: options.fileCloseResources }),
     });
   }
 
@@ -245,6 +290,7 @@ export class AnalysisProviderRegistry {
       initial,
       target,
       signal,
+      context.fileCloseResources,
     );
     if (!evaluation.ok) return evaluation;
     const evaluated = evaluation.value;
@@ -291,6 +337,7 @@ export class AnalysisProviderRegistry {
                 status,
                 target,
                 signal,
+                context.fileCloseResources,
               )
             : ok({
                 candidate: provider,

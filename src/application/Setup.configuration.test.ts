@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 
 import { FakeSetupHost, options } from "./Setup.fixture.js";
 import { runSetup } from "./Setup.js";
 import { setupRegistrationCommand } from "./SetupHost.js";
+import { CURRENT_ENTRYPOINT_PATH } from "../process/CurrentEntrypointPath.js";
 import { discoverSetupState } from "./SetupPlan.js";
 import type { MsixPackageView } from "./MsixPackageStorage.js";
 import type { SetupClient } from "./SupportedClients.js";
@@ -205,9 +206,10 @@ describe("configured Linux Hopper selection", () => {
     host.hopperLauncherConfigured = true;
     host.linuxDemoRuntimeMissing = true;
     const doctor = await host.doctor();
+    const initial = await host.initialSetupState();
     const discovery = await discoverSetupState({
       host,
-      providerEnvironment: { HOPPER_LAUNCHER_PATH: host.hopper },
+      providerConfigured: initial.providerConfigured,
       forceHopperInstall: false,
       proposeHopper: true,
       hopperLauncherConfigured: true,
@@ -226,9 +228,10 @@ describe("configured Linux Hopper selection", () => {
     };
     host.hopper = "/opt/hopper/bin/Hopper";
     host.unsupportedHopperVersion = true;
+    const initial = await host.initialSetupState();
     const discovery = await discoverSetupState({
       host,
-      providerEnvironment: { HOPPER_LAUNCHER_PATH: host.hopper },
+      providerConfigured: initial.providerConfigured,
       forceHopperInstall: false,
       proposeHopper: true,
       initialDoctor: await host.doctor(),
@@ -333,13 +336,13 @@ describe("setup workflow action selection", () => {
 
     expect(result.status).toBe("ready");
     expect(host.configuredCommands).toEqual([
-      setupRegistrationCommand("win32", undefined),
+      setupRegistrationCommand("win32", undefined, CURRENT_ENTRYPOINT_PATH),
     ]);
-    expect(setupRegistrationCommand("win32", undefined)).toEqual([
-      process.execPath,
-      resolve(process.argv[1] ?? "rea"),
-      "mcp",
-    ]);
+    expect(
+      setupRegistrationCommand("win32", undefined, CURRENT_ENTRYPOINT_PATH),
+    ).toEqual([process.execPath, CURRENT_ENTRYPOINT_PATH, "mcp"]);
+    expect(setupRegistrationCommand("win32", undefined, undefined)).toEqual([]);
+    expect(setupRegistrationCommand("win32", "npx", undefined)).not.toEqual([]);
   });
 
   it.each([

@@ -12,6 +12,9 @@ import {
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { Ajv2020 } from "ajv/dist/2020.js";
+import { PACKET_ARTIFACTS, measurePacketEntry } from "./packet-entry.mjs";
+import { SIGNAL_ARTIFACTS, measureSignalEntry } from "./signal-entry.mjs";
+import { SAZ_ARTIFACTS, measureSazEntry } from "./saz-entry.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const { values } = parseArgs({
@@ -29,6 +32,9 @@ const { values } = parseArgs({
     "managed-question": { type: "string", default: "inventory" },
     schemas: { type: "string", default: "default" },
     "sqlite-selection": { type: "string", default: "all" },
+    "packet-selection": { type: "string", default: "baseline" },
+    "signal-selection": { type: "string", default: "baseline" },
+    "saz-selection": { type: "string", default: "baseline" },
   },
 });
 if (
@@ -39,12 +45,33 @@ if (
   !isAbsolute(values.path) ||
   !isAbsolute(values.output) ||
   !["complete", "summary"].includes(values.delivery) ||
+  !["baseline", "focused", "retained"].includes(values["saz-selection"]) ||
+  (!Object.hasOwn(SAZ_ARTIFACTS, values.artifact) &&
+    values["saz-selection"] !== "baseline") ||
+  (Object.hasOwn(SAZ_ARTIFACTS, values.artifact) &&
+    values.delivery !== "complete") ||
+  !["baseline", "focused", "discovery", "pages"].includes(
+    values["signal-selection"],
+  ) ||
+  (!Object.hasOwn(SIGNAL_ARTIFACTS, values.artifact) &&
+    values["signal-selection"] !== "baseline") ||
+  (Object.hasOwn(SIGNAL_ARTIFACTS, values.artifact) &&
+    values.delivery !== "complete") ||
   !["entry", "entry-and-main", "entry-views"].includes(
     values["native-question"],
   ) ||
   !["inventory", "selected"].includes(values["javascript-question"]) ||
   !["default", "selected"].includes(values.schemas) ||
   !["all", "columns"].includes(values["sqlite-selection"]) ||
+  !["baseline", "focused", "discovery", "pages"].includes(
+    values["packet-selection"],
+  ) ||
+  (!Object.hasOwn(PACKET_ARTIFACTS, values.artifact) &&
+    values["packet-selection"] !== "baseline") ||
+  (Object.hasOwn(PACKET_ARTIFACTS, values.artifact) &&
+    values.delivery !== "complete") ||
+  (values["packet-selection"] === "pages" &&
+    values.artifact !== "wireshark-pgsql-jdbc.pcap") ||
   (values.artifact !== "qgis-world-map.gpkg" &&
     values["sqlite-selection"] !== "all") ||
   (values.artifact === "qgis-world-map.gpkg" &&
@@ -141,6 +168,24 @@ const fingerprints = {
   measure_source_sha256: await fileSha(fileURLToPath(import.meta.url)),
   native_workflow_source_sha256: await fileSha(
     fileURLToPath(new URL("./native-entry.mjs", import.meta.url)),
+  ),
+  packet_workflow_source_sha256: await fileSha(
+    fileURLToPath(new URL("./packet-entry.mjs", import.meta.url)),
+  ),
+  packet_oracle_source_sha256: await fileSha(
+    fileURLToPath(new URL("./packet-oracle.py", import.meta.url)),
+  ),
+  signal_workflow_source_sha256: await fileSha(
+    fileURLToPath(new URL("./signal-entry.mjs", import.meta.url)),
+  ),
+  signal_oracle_source_sha256: await fileSha(
+    fileURLToPath(new URL("./signal-oracle.py", import.meta.url)),
+  ),
+  saz_workflow_source_sha256: await fileSha(
+    fileURLToPath(new URL("./saz-entry.mjs", import.meta.url)),
+  ),
+  saz_oracle_source_sha256: await fileSha(
+    fileURLToPath(new URL("./saz-oracle.py", import.meta.url)),
   ),
   runtime_files_sha256: sha(JSON.stringify(runtimeFiles)),
   runtime_dispatcher_sha256: await fileSha(
@@ -722,6 +767,24 @@ const inspectPcapTarget = async () => {
 };
 
 const workflows = {
+  ...Object.fromEntries(
+    Object.keys(SAZ_ARTIFACTS).map((artifact) => [
+      artifact,
+      () => measureSazEntry({ values, call, inputSha }),
+    ]),
+  ),
+  ...Object.fromEntries(
+    Object.keys(SIGNAL_ARTIFACTS).map((artifact) => [
+      artifact,
+      () => measureSignalEntry({ values, call, inputSha, catalogDefinitions }),
+    ]),
+  ),
+  ...Object.fromEntries(
+    Object.keys(PACKET_ARTIFACTS).map((artifact) => [
+      artifact,
+      () => measurePacketEntry({ values, call, inputSha, catalogDefinitions }),
+    ]),
+  ),
   "wireshark-http.cap": inspectPcapTarget,
   "wireshark-http_redirects.pcapng": inspectPcapTarget,
   "qgis-world-map.gpkg": async () => {
@@ -1144,6 +1207,9 @@ const report = {
   artifact_sha256: inputSha,
   artifact_sha256_after: finalInputSha,
   delivery: values.delivery,
+  saz_selection: Object.hasOwn(SAZ_ARTIFACTS, values.artifact)
+    ? values["saz-selection"]
+    : null,
   sdk_schema_mode: values.schemas,
   retained_verification: values["verify-retained"],
   native_question: NATIVE_ARTIFACTS.includes(values.artifact)
@@ -1160,6 +1226,12 @@ const report = {
     values.artifact === "qgis-world-map.gpkg"
       ? values["sqlite-selection"]
       : null,
+  packet_selection: Object.hasOwn(PACKET_ARTIFACTS, values.artifact)
+    ? values["packet-selection"]
+    : null,
+  signal_selection: Object.hasOwn(SIGNAL_ARTIFACTS, values.artifact)
+    ? values["signal-selection"]
+    : null,
   provider_settings_sha256: sha(JSON.stringify(selectedProviders)),
   provider_search_path_sha256: sha(
     selectedProviders.PATH ?? process.env.PATH ?? "",

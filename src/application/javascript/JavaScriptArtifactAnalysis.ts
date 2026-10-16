@@ -5,10 +5,7 @@ import { setImmediate } from "node:timers/promises";
 
 import { resolveJavaScriptSourceMapReferences } from "../../domain/javascript/javascriptSourceMapPaths.js";
 import { analyzeParsedJavaScriptStaticSourceSteps } from "../../domain/javascript/javascriptStaticAnalysis.js";
-import {
-  analyzeParsedJavaScriptSemanticsSteps,
-  classifyParsedJavaScriptOpenReceiversSteps,
-} from "../../domain/javascript/javascriptSemanticAnalysis.js";
+import { analyzeParsedJavaScriptSemanticsSteps } from "../../domain/javascript/javascriptSemanticAnalysis.js";
 import type { JavaScriptSemanticIr } from "../../domain/javascript/javascriptSemanticIr.js";
 import { projectJavaScriptModuleSemantics } from "../../domain/javascript/javascriptModuleSemanticIr.js";
 import { parseJavaScriptSource } from "../../domain/javascript/javascriptSourceParser.js";
@@ -25,6 +22,8 @@ import type {
 } from "../../domain/javascript/javascriptArtifactFiles.js";
 import type {
   AnalyzedJavaScriptArtifactFile,
+  JavaScriptArtifactAnalysisFailure,
+  JavaScriptArtifactAnalysisScope,
   JavaScriptArtifactAnalysis,
   JavaScriptModuleArtifactAnalysis,
   JavaScriptModuleSemanticIr,
@@ -35,6 +34,7 @@ import type {
   JavaScriptSourceMapObservation,
   JavaScriptSourceMapOriginal,
 } from "./JavaScriptArtifactAnalysisTypes.js";
+import { javascriptArtifactAnalysisScopes } from "./JavaScriptArtifactAnalysisTypes.js";
 import { analyzeJavaScriptJsonModule } from "./JavaScriptJsonModules.js";
 import { completeJavaScriptAnalysisSteps } from "./JavaScriptAnalysisControl.js";
 import { htmlArtifactReferences } from "../../domain/javascript/htmlArtifactReferences.js";
@@ -144,6 +144,7 @@ export const analyzeAndAdoptJavaScriptArtifactFiles = async (
     fileSet.files.length - (fileSet.source_selection?.unselected_files ?? 0);
   let selectedFileIndex = 0;
   for (const file of fileSet.files) {
+    let analysisStarted = false;
     try {
       await setImmediate();
       if (classifyOutsideAnalysisScope(file, state, projection)) {
@@ -158,6 +159,7 @@ export const analyzeAndAdoptJavaScriptArtifactFiles = async (
       if (signal?.aborted === true)
         throw new AnalysisCancelledError("analyze_javascript_application");
       await beforeFile(file, selectedFileIndex++, selectedFileCount);
+      analysisStarted = true;
       if (file.kind !== "javascript" || !file.text.included) {
         const steps = analyzeArtifactFileSteps(file, {
           state,
@@ -185,10 +187,12 @@ export const analyzeAndAdoptJavaScriptArtifactFiles = async (
           : error instanceof AnalysisTimeoutError
             ? { worker_timeout_ms: error.timeoutMs }
             : null;
-      const failure =
+      const failure: JavaScriptArtifactAnalysisFailure | undefined =
         error === null
           ? undefined
           : {
+              scope: javascriptArtifactAnalysisScopes.javascript,
+              status: "interrupted",
               reason: `${file.path}: ${error.message}`,
               error: projectAnalysisError(error),
               limits,
@@ -248,15 +252,22 @@ export const analyzeAndAdoptJavaScriptArtifactFiles = async (
             ? cause
             : null;
       if (interruption !== null) {
+        const scope = javascriptArtifactAnalysisScopes[file.kind];
         state.files.push({
           file,
           javascript: null,
           semantic: null,
-          analysis_failure: {
-            reason: `${file.path}: ${interruption.message}`,
-            error: projectAnalysisError(interruption),
-            limits: null,
-          },
+          ...(scope === null
+            ? {}
+            : {
+                analysis_failure: {
+                  scope,
+                  status: analysisStarted ? "interrupted" : "not-started",
+                  reason: `${file.path}: ${interruption.message}`,
+                  error: projectAnalysisError(interruption),
+                  limits: null,
+                },
+              }),
         });
         projection.recordUnavailableFile(
           file,
@@ -280,25 +291,36 @@ export const analyzeAndAdoptJavaScriptArtifactFiles = async (
             ? { worker_timeout_ms: interruption.timeoutMs }
             : null,
     };
+    // This interruption has one cause. Share its immutable failure per phase
+    // rather than copying it for every unvisited source in a large bundle.
+    const failures = new Map<
+      JavaScriptArtifactAnalysisScope,
+      JavaScriptArtifactAnalysisFailure
+    >();
     for (const file of fileSet.files) {
       if (analyzedPaths.has(file.path)) continue;
       if (classifyOutsideAnalysisScope(file, state, projection)) continue;
+      const scope = javascriptArtifactAnalysisScopes[file.kind];
+      let unavailable = scope === null ? undefined : failures.get(scope);
+      if (scope !== null && unavailable === undefined) {
+        unavailable = { ...failure, scope, status: "not-started" };
+        failures.set(scope, unavailable);
+      }
       state.files.push({
         file,
         javascript: null,
         semantic: null,
-        analysis_failure: failure,
+        ...(unavailable === undefined ? {} : { analysis_failure: unavailable }),
       });
-      if (file.kind === "javascript")
-        projection.recordUnavailableFile(
-          file,
-          failure.reason,
-          failure.limits,
-          interruption instanceof AnalysisResourceConstraintError ||
-            interruption instanceof AnalysisTimeoutError
-            ? "resource-limit"
-            : "incomplete-module",
-        );
+      projection.recordUnavailableFile(
+        file,
+        failure.reason,
+        failure.limits,
+        interruption instanceof AnalysisResourceConstraintError ||
+          interruption instanceof AnalysisTimeoutError
+          ? "resource-limit"
+          : "incomplete-module",
+      );
     }
   }
   return { analysis: finalizeArtifactAnalysis(state), interruption };
@@ -382,12 +404,9 @@ function* analyzeArtifactFileSteps<
     state.parseFailures += 1;
     return;
   }
-  const openReceiverFacts =
-    yield* classifyParsedJavaScriptOpenReceiversSteps(parsed);
   const analysis = yield* analyzeParsedJavaScriptStaticSourceSteps(
     file.text.value,
     parsed,
-    openReceiverFacts,
   );
   const staticFindings = findingCount(analysis);
   yield;
@@ -429,13 +448,12 @@ const classifyOutsideAnalysisScope = <
   if (file.text.included || file.text.reason !== "outside-analysis-scope")
     return false;
   state.files.push({ file, javascript: null, semantic: null });
-  if (file.kind === "javascript")
-    projection?.recordUnavailableFile(
-      file,
-      "Source was not analyzed because it is outside the caller-selected source_paths.",
-      null,
-      "incomplete-module",
-    );
+  projection?.recordUnavailableFile(
+    file,
+    "Source was not analyzed because it is outside the caller-selected source_paths.",
+    null,
+    "incomplete-module",
+  );
   return true;
 };
 

@@ -291,25 +291,51 @@ describe("function comparison normalized identity", () => {
       ).toMatchObject({ status: "unknown" });
     },
   );
+});
+
+describe("function comparison address-derived call names", () => {
   it.each([
-    { name: "sub_deallocate", status: "unchanged" },
-    { name: "sub_deadbeef", status: "unknown" },
-    { name: "FUN_00401000", status: "unknown" },
-    { name: "FUN_initialize", status: "unchanged" },
-  ])("preserves the calls dimension for callee $name", ({ name, status }) => {
-    const calling = (base: "0x1000" | "0x2000") =>
-      functionDossierSchema.parse({
-        ...dossier("return helper();", base),
-        callees: [procedure(base === "0x1000" ? "0x1010" : "0x2010", name)],
-      });
-    const result = compareFunctions(
-      observe("6", calling("0x1000")),
-      observe("7", calling("0x2000")),
-    );
-    expect(
-      result.dimensions.find(({ dimension }) => dimension === "calls"),
-    ).toMatchObject({ status });
-  });
+    { name: "sub_deallocate", status: "unchanged", diagnostic: undefined },
+    {
+      name: "sub_deadbeef",
+      status: "unknown",
+      diagnostic: "Provider retained an unresolved call target.",
+    },
+    { name: "FUN_00401000", status: "unknown", diagnostic: undefined },
+    { name: "FUN_initialize", status: "unchanged", diagnostic: undefined },
+  ])(
+    "preserves the calls dimension for callee $name",
+    ({ name, status, diagnostic }) => {
+      const calling = (base: "0x1000" | "0x2000") =>
+        functionDossierSchema.parse({
+          ...dossier("return helper();", base),
+          callees: [procedure(base === "0x1000" ? "0x1010" : "0x2010", name)],
+        });
+      const result = compareFunctions(
+        observe("6", calling("0x1000")),
+        observe(
+          "7",
+          calling("0x2000"),
+          "rea-workflow",
+          diagnostic === undefined
+            ? { status: "complete" }
+            : { status: "complete", diagnostics: [diagnostic] },
+        ),
+      );
+      const calls = result.dimensions.find(
+        ({ dimension }) => dimension === "calls",
+      );
+      expect(calls).toMatchObject({ status });
+      if (diagnostic !== undefined)
+        expect(calls).toMatchObject({
+          status: "unknown",
+          limitations: expect.arrayContaining([
+            "Address-derived callee or caller names cannot be matched safely.",
+            `Right: ${diagnostic}`,
+          ]),
+        });
+    },
+  );
 });
 
 describe("function call relationship coverage", () => {
@@ -573,11 +599,20 @@ describe("function comparison ordering controls", () => {
       makeEvidence("e", rightWithoutNativeApi),
     );
 
-    expect(comparison.status).toBe("unchanged");
-    for (const dimension of ["calls", "references", "strings_names"] as const)
+    for (const dimension of ["calls", "strings_names"] as const)
       expect(
         comparison.dimensions.find((item) => item.dimension === dimension),
       ).toMatchObject({ status: "unchanged" });
+    // Unnamed endpoints in different artifacts have no stable identity.
+    expect(
+      comparison.dimensions.find((item) => item.dimension === "references"),
+    ).toMatchObject({
+      status: "unknown",
+      limitations: expect.arrayContaining([
+        expect.stringContaining("Unnamed reference endpoints"),
+      ]),
+    });
+    expect(comparison.status).toBe("unknown");
   });
 });
 
@@ -681,6 +716,52 @@ describe("function comparison unresolved text", () => {
 });
 
 describe("function comparison", () => {
+  it("retains complete call coverage diagnostics without blocking observed-set equality", () => {
+    const diagnostic = "Indirect calls remain unresolved.";
+    const left = observe("a", dossier("return 0;", "0x1000"), "rea-workflow", {
+      status: "complete",
+      diagnostics: [diagnostic],
+    });
+    const right = observe("b", dossier("return 0;", "0x2000"), "rea-workflow", {
+      status: "complete",
+      diagnostics: [diagnostic],
+    });
+    const comparison = compareFunctions(left, right);
+    expect(
+      comparison.dimensions.find(({ dimension }) => dimension === "calls"),
+    ).toMatchObject({
+      status: "unchanged",
+      limitations: [`Left: ${diagnostic}`, `Right: ${diagnostic}`],
+    });
+  });
+
+  it("retains diagnostics alongside incomplete call coverage blockers", () => {
+    const diagnostic = "Indirect calls remain unresolved.";
+    const left = observe("c", dossier("return 0;", "0x1000"), "rea-workflow", {
+      status: "partial",
+      limitations: ["Provider read limit reached."],
+      diagnostics: [diagnostic],
+    });
+    const right = observe("d", dossier("return 0;", "0x2000"), "rea-workflow", {
+      status: "partial",
+      limitations: ["Provider read limit reached."],
+      diagnostics: [diagnostic],
+    });
+    expect(
+      compareFunctions(left, right).dimensions.find(
+        ({ dimension }) => dimension === "calls",
+      ),
+    ).toMatchObject({
+      status: "unknown",
+      limitations: expect.arrayContaining([
+        "Left: Provider read limit reached.",
+        `Left: ${diagnostic}`,
+        "Right: Provider read limit reached.",
+        `Right: ${diagnostic}`,
+      ]),
+    });
+  });
+
   it("preserves text changes alongside complete inline dossier facets", () => {
     const result = compareFunctions(
       FUNCTION_COMPARISON_EXAMPLE.left,
@@ -1202,3 +1283,48 @@ it.each([
     }
   },
 );
+
+describe("function comparison unnamed reference endpoints", () => {
+  it("distinguishes unnamed reference targets by address within one artifact", () => {
+    const unnamedTarget = (target: string) =>
+      functionDossierSchema.parse({
+        ...dossierWithReference("0x1000", "call"),
+        outgoing_references: [
+          {
+            ...dossierWithReference("0x1000", "call").outgoing_references[0],
+            target_address: target,
+            target_procedure: null,
+          },
+        ],
+      });
+    const reference = (left: string, right: string, digits = ["a", "a"]) =>
+      compareFunctions(
+        observe(digits[0] ?? "a", unnamedTarget(left)),
+        observe(digits[1] ?? "a", unnamedTarget(right)),
+      ).dimensions.find(({ dimension }) => dimension === "references");
+    expect(reference("0x1010", "0x1020")).toMatchObject({ status: "changed" });
+    expect(reference("0x1010", "0x1010")).toMatchObject({
+      status: "unchanged",
+    });
+    // Across artifacts the same address does not identify the same target.
+    expect(reference("0x1010", "0x1010", ["a", "b"])).toMatchObject({
+      status: "unknown",
+    });
+  });
+
+  it("keeps known reference-kind changes beside unnamed endpoints", () => {
+    const unnamed = (kind: "call" | "data") => {
+      const edge = dossierWithReference("0x1000", kind).outgoing_references[0];
+      return functionDossierSchema.parse({
+        ...dossierWithReference("0x1000", kind),
+        outgoing_references: [{ ...edge, target_procedure: null }],
+      });
+    };
+    expect(
+      compareFunctions(
+        observe("a", unnamed("call")),
+        observe("b", unnamed("data")),
+      ).dimensions.find(({ dimension }) => dimension === "references"),
+    ).toMatchObject({ status: "changed" });
+  });
+});

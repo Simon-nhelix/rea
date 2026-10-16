@@ -27,7 +27,7 @@ const sliceSelectingRunner = (
     calls.push({ tool, arguments_ });
     const expected = tool === "dyld_info" ? dyldArchitecture : selected;
     if (
-      !["file", "lipo"].includes(tool) &&
+      tool !== "lipo" &&
       !arguments_.some(
         (argument, index) =>
           argument === expected ||
@@ -85,25 +85,41 @@ it.each([
     architectures: ["x86_64", "arm64e", "arm64e.x1"],
     selected: "arm64e",
     dyldArchitecture: "arm64e",
+    dwarfdumpArchitecture: "arm64e",
   },
   {
     architectures: ["x86_64", "arm64e.v1"],
     selected: "arm64e",
     dyldArchitecture: "arm64e.v1",
+    dwarfdumpArchitecture: "arm64e",
   },
   {
     architectures: ["arm64v8", "arm64e.v1"],
     selected: "arm64e",
     dyldArchitecture: "arm64e.v1",
+    dwarfdumpArchitecture: "arm64e",
   },
   {
     architectures: ["arm64e.v1", "arm64v8"],
     selected: "arm64e",
     dyldArchitecture: "arm64e.v1",
+    dwarfdumpArchitecture: "arm64e",
+  },
+  // arm64e.x1 is its own subtype: otool and nm cannot reach it as arm64e.
+  {
+    architectures: ["x86_64", "arm64e.x1"],
+    selected: "arm64e.x1",
+    dyldArchitecture: "arm64e.x1",
+    dwarfdumpArchitecture: "arm64e.x1",
   },
 ] as const)(
   "selects the $dyldArchitecture slice of a universal arm64e target",
-  async ({ architectures, selected, dyldArchitecture }) => {
+  async ({
+    architectures,
+    selected,
+    dyldArchitecture,
+    dwarfdumpArchitecture,
+  }) => {
     const calls: {
       readonly tool: string;
       readonly arguments_: readonly string[];
@@ -127,7 +143,7 @@ it.each([
       .join("\n");
     const fixtures = new NativeFixtureRunner({
       lipo,
-      dwarfdump: `UUID: 01234567-89AB-CDEF-0123-456789ABCDEF (${dyldArchitecture}) /owned/universal\n`,
+      dwarfdump: `UUID: 01234567-89AB-CDEF-0123-456789ABCDEF (${dwarfdumpArchitecture}) /owned/universal\n`,
     });
     const client = new NativeMacOSProvider(
       {},
@@ -154,6 +170,78 @@ it.each([
         .filter(({ tool }) => tool === "dyld_info")
         .every(({ arguments_ }) => arguments_.includes(dyldArchitecture)),
     ).toBe(true);
+    expect(
+      calls.find(({ tool }) => tool === "dwarfdump")?.arguments_,
+    ).toContain(`--arch=${dwarfdumpArchitecture}`);
+    expect(
+      result.value.limitations.some((limitation) =>
+        limitation.includes("dwarfdump"),
+      ),
+    ).toBe(false);
+    // vtool has no spelling for a variant subtype, so it is skipped rather
+    // than pointed at another slice.
+    const variant = selected.includes(".");
+    expect(calls.some(({ tool }) => tool === "vtool")).toBe(!variant);
+    expect(
+      result.value.limitations.some((limitation) =>
+        limitation.startsWith(`vtool cannot select the ${selected} slice`),
+      ),
+    ).toBe(variant);
+  },
+);
+
+it.each([
+  {
+    description: "a row explicitly naming another ABI version",
+    rows: "UUID: FEDCBA98-7654-3210-FEDC-BA9876543210 (arm64e.v2) /owned/universal\n",
+    uuid: "01234567-89AB-CDEF-0123-456789ABCDEF",
+    limitations: [
+      "dwarfdump --uuid returned no row for selected architecture arm64e.v1; using the unambiguous otool LC_UUID.",
+    ],
+  },
+  {
+    description: "a matching family row alongside another ABI version",
+    rows: "UUID: 01234567-89ab-cdef-0123-456789abcdef (arm64e) /owned/universal\nUUID: FEDCBA98-7654-3210-FEDC-BA9876543210 (arm64e.v2) /owned/universal\n",
+    uuid: "01234567-89ab-cdef-0123-456789abcdef",
+    limitations: [],
+  },
+])(
+  "preserves selected slice identity with $description",
+  async ({ rows, uuid, limitations }) => {
+    const calls: {
+      readonly tool: string;
+      readonly arguments_: readonly string[];
+    }[] = [];
+    const fixtures = new NativeFixtureRunner({
+      lipo: `architecture arm64e.v1
+    cputype ${CPU.arm64.type}
+    cpusubtype CPU_SUBTYPE_ARM64E
+    capabilities PTR_AUTH_VERSION USERSPACE 1
+    offset 16384
+    size 8192
+    align 2^14 (16384)`,
+      dwarfdump: rows,
+    });
+    const client = new NativeMacOSProvider(
+      {},
+      sliceSelectingRunner(fixtures, "arm64e", "arm64e.v1", calls),
+      "darwin",
+    ).createClient(nativeMachoTarget("/owned/universal"));
+    const result = await client.execute("inspect_macho", {});
+    if (!result.ok) throw result.error;
+    expect(result.value.result).toMatchObject({
+      uuid,
+      selected_architecture: {
+        name: "arm64e.v1",
+        container_file_offset: 16384,
+      },
+    });
+    expect(
+      result.value.limitations.filter((value) => value.includes("dwarfdump")),
+    ).toEqual(limitations);
+    expect(
+      calls.find(({ tool }) => tool === "dwarfdump")?.arguments_,
+    ).toContain("--arch=arm64e");
   },
 );
 
@@ -313,3 +401,38 @@ it.each([
     });
   },
 );
+
+it("reports the selected 32-bit slice's word size and byte order beside a 64-bit slice", async () => {
+  const i386Header = (await nativeFixture("otool-load.txt")).replace(
+    "0xfeedfacf 16777228",
+    "0xfeedface        7",
+  );
+  const fixtures = new NativeFixtureRunner({
+    lipo: [
+      "architecture x86_64\n    cputype 16777223\n    cpusubtype 3\n    offset 0\n    size 8192\n    align 2^14 (16384)",
+      "architecture i386\n    cputype 7\n    cpusubtype 3\n    offset 16384\n    size 8192\n    align 2^14 (16384)",
+    ].join("\n"),
+    "otool:-h": i386Header,
+    dwarfdump:
+      "UUID: 01234567-89AB-CDEF-0123-456789ABCDEF (i386) /owned/universal\n",
+  });
+  const base = nativeMachoTarget("/owned/universal");
+  const result = await new NativeMacOSProvider(
+    {},
+    sliceSelectingRunner(fixtures, "i386", "i386"),
+    "darwin",
+  )
+    .createClient({
+      ...base,
+      architecture: "x86",
+      availableArchitectures: ["x86_64", "x86"],
+    })
+    .execute("inspect_macho", {});
+
+  if (!result.ok) throw result.error;
+  expect(result.value.result).toMatchObject({
+    selected_architecture: { name: "i386", container_file_offset: 16384 },
+    word_size: 32,
+    endian: "little",
+  });
+});

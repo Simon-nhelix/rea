@@ -127,6 +127,13 @@ class NodeFileReader extends Reader<string> {
     const handle = this.#handle;
     if (handle === undefined) throw new Error("ZIP reader is not initialized");
     const readBytes = Math.min(length, this.size - index);
+    // A central-directory offset can point past EOF. Type that malformed ZIP
+    // read before a negative size reaches Buffer.alloc and becomes an I/O error.
+    if (readBytes < 0)
+      throw new ArtifactReaderFailure(
+        "format",
+        `ZIP archive is malformed: read at ${index} extends beyond the ${this.size}-byte archive`,
+      );
     if (
       this.maximumReadBytes !== undefined &&
       readBytes > this.maximumReadBytes
@@ -171,6 +178,9 @@ export class ZipArtifactReader implements ArtifactReader {
     this.#reader = new ZipReader(this.#source, {
       checkSignature: true,
       checkOverlappingEntry: true,
+      // Unflagged names use the ZIP legacy encoding (CP437); the UTF-8 flag
+      // and validated Unicode Path extra fields remain authoritative.
+      filenameEncoding: "cp437",
       // REA applies its own provider-neutral path validation in scanReader and
       // must preserve that typed failure instead of zip.js rejecting first.
       filenameValidation: "tolerant",
@@ -188,6 +198,7 @@ export class ZipArtifactReader implements ArtifactReader {
       // ZIP member identity is its directory occurrence, not its filename.
       // Logical path uniqueness belongs to the artifact inventory boundary.
       const metadata = projectZipEntry(entry, index++);
+      if (metadata === undefined) continue;
       // zip.js enforces each member's declared output size, so this sum bounds streamed work.
       if (
         metadata.kind === "file" &&
@@ -255,19 +266,38 @@ export class ZipArtifactReader implements ArtifactReader {
   }
 }
 
-const projectZipEntry = (entry: Entry, index: number): ArtifactEntry => {
-  const symlink = isSymlink(entry);
+const projectZipEntry = (
+  entry: Entry,
+  index: number,
+): ArtifactEntry | undefined => {
+  const kind = isSymlink(entry)
+    ? "symlink"
+    : entry.directory
+      ? "directory"
+      : "file";
+  const sourcePath = zipEntryPath(entry);
+  const path = sourcePath.replace(/^(?:\.\/)+/u, "");
+  // Root directory markers carry no inventory occurrence. A file with this
+  // spelling is still passed to the shared path validator and rejected there.
+  if (kind === "directory" && (path === "" || path === ".")) return undefined;
   return {
-    path: zipEntryPath(entry),
-    kind: entry.directory ? "directory" : symlink ? "symlink" : "file",
-    declaredSize: entry.directory ? null : entry.uncompressedSize,
-    compressedSize: entry.directory ? null : entry.compressedSize,
+    path,
+    kind,
+    declaredSize: kind === "directory" ? null : entry.uncompressedSize,
+    compressedSize: kind === "directory" ? null : entry.compressedSize,
     executable: entry.executable,
     encrypted: entry.encrypted,
     byteOffset: null,
     declaredSha256: null,
     unpacked: false,
-    limitations: symlink ? ["Archive symlink target was not read."] : [],
+    limitations: [
+      ...(kind === "symlink" ? ["Archive symlink target was not read."] : []),
+      ...(path === sourcePath
+        ? []
+        : [
+            `ZIP member name ${JSON.stringify(sourcePath)} has a leading current-directory prefix omitted from its logical path.`,
+          ]),
+    ],
     adapterKey: `zip-entry:${index}`,
   };
 };

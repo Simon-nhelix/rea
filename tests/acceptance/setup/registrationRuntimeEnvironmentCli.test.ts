@@ -175,6 +175,9 @@ cliTest(
       HOME: home,
       USERPROFILE: home,
       XDG_CONFIG_HOME: join(home, ".config"),
+      // Select an absent launcher so host-installed Hopper cannot make this
+      // configuration merge test plan an unrelated provider-environment edit.
+      HOPPER_LAUNCHER_PATH: join(home, "missing-hopper"),
     };
     const run = (args: readonly string[]) =>
       cli.run({ arguments: [...args, "--json"], cwd: home, environment });
@@ -233,3 +236,279 @@ cliTest(
       });
   },
 );
+
+cliTest(
+  "public setup propagates selected provider deadlines and input profile to Codex and Kimi",
+  async ({ cli }) => {
+    const home = await createTestTempDirectory(
+      "rea-selected-registration-env-",
+    );
+    const codexHome = join(home, "codex");
+    const kimiHome = join(home, "kimi");
+    await Promise.all(
+      [codexHome, kimiHome].map((path) => mkdir(path, { recursive: true })),
+    );
+    const environment = {
+      HOME: home,
+      USERPROFILE: home,
+      XDG_CONFIG_HOME: join(home, ".config"),
+      CODEX_HOME: codexHome,
+      KIMI_CODE_HOME: kimiHome,
+      HOPPER_LAUNCHER_PATH: join(home, "missing-hopper"),
+      REA_ANALYSIS_PROVIDER: "auto",
+      REA_GHIDRA_STARTUP_TIMEOUT_MS: "2700001",
+      REA_HOPPER_STARTUP_TIMEOUT_MS: "2800002",
+      REA_JEB_MCP_TIMEOUT_MS: "2900003",
+      REA_MCP_INPUT_SCHEMA_PROFILE: "full",
+      REA_UNRELATED_MARKER: "do-not-persist",
+    };
+    const run = (arguments_: readonly string[]) =>
+      cli.run({
+        arguments: [...arguments_, "--json"],
+        cwd: home,
+        environment,
+      });
+
+    for (const client of ["codex", "kimi"] as const) {
+      const setup = await run([
+        "setup",
+        "--client",
+        client,
+        "--skill=false",
+        "--yes",
+      ]);
+      expect(setup.exitCode, setup.stderr).toBe(0);
+      expect(setup.json).toMatchObject({ status: "ready" });
+    }
+
+    const codexConfig = await readFile(join(codexHome, "config.toml"), "utf8");
+    const codexRegistration = effectiveClientServer(
+      parseClientConfiguration(codexConfig, "toml"),
+      "rea",
+    );
+    expect(codexRegistration).toMatchObject({ tool_timeout_sec: 3021 });
+    expect(codexConfig).toContain('REA_JEB_MCP_TIMEOUT_MS = "2900003"');
+    expect(codexConfig).not.toContain("REA_UNRELATED_MARKER");
+
+    const kimiPath = join(kimiHome, "mcp.json");
+    const kimiRegistration = effectiveClientServer(
+      parseClientConfiguration(await readFile(kimiPath, "utf8"), "kimi"),
+      "rea",
+    );
+    expect(kimiRegistration).toMatchObject({
+      toolTimeoutMs: 3_020_003,
+      env: {
+        REA_ANALYSIS_PROVIDER: "auto",
+        REA_GHIDRA_STARTUP_TIMEOUT_MS: "2700001",
+        REA_HOPPER_STARTUP_TIMEOUT_MS: "2800002",
+        REA_JEB_MCP_TIMEOUT_MS: "2900003",
+        REA_MCP_INPUT_SCHEMA_PROFILE: "full",
+      },
+    });
+    expect(await readFile(kimiPath, "utf8")).not.toContain(
+      "REA_UNRELATED_MARKER",
+    );
+
+    const doctor = await run(["doctor", "--client", "kimi"]);
+    expect(doctor.exitCode, doctor.stderr).toBe(0);
+    expect(doctor.json).toMatchObject({
+      identity: {
+        registrations: expect.arrayContaining([
+          expect.objectContaining({ client: "kimi", state: "aligned" }),
+        ]),
+      },
+    });
+  },
+  120_000,
+);
+
+for (const [client, provider] of [
+  ["codex", "ida"],
+  ["kimi", "ida"],
+  ["kimi", "auto"],
+] as const)
+  cliTest(
+    `public ${client} setup and doctor use the effective IDA registration request budget with ${provider} selection`,
+    async ({ cli }) => {
+      const home = await createTestTempDirectory(
+        "rea-ida-registration-budget-",
+      );
+      const clientHome = join(home, client);
+      await mkdir(clientHome, { recursive: true });
+      const idaConfig = join(home, "ida.json");
+      const writeRegistration = (timeoutMs: number) =>
+        writeFile(
+          idaConfig,
+          JSON.stringify({
+            url: "http://127.0.0.1:12345/mcp",
+            headers: { Authorization: "Bearer fixture-credential" },
+            timeoutMs,
+          }),
+        );
+      await writeRegistration(1_800_001);
+      const environment = {
+        HOME: home,
+        USERPROFILE: home,
+        XDG_CONFIG_HOME: join(home, ".config"),
+        CODEX_HOME: clientHome,
+        KIMI_CODE_HOME: clientHome,
+        HOPPER_LAUNCHER_PATH: join(home, "missing-hopper"),
+      };
+      const setupArguments = [
+        "setup",
+        "--client",
+        client,
+        "--skill=false",
+        "--yes",
+        "--json",
+      ];
+      const configured = await cli.run({
+        arguments: setupArguments,
+        cwd: home,
+        environment: {
+          ...environment,
+          REA_ANALYSIS_PROVIDER: provider,
+          REA_IDA_MCP_CONFIG: idaConfig,
+        },
+      });
+      expect(configured.exitCode, configured.stdout).toBe(0);
+      const config = join(
+        clientHome,
+        client === "codex" ? "config.toml" : "mcp.json",
+      );
+      const text = await readFile(config, "utf8");
+      expect(
+        effectiveClientServer(
+          parseClientConfiguration(text, client === "codex" ? "toml" : "kimi"),
+          "rea",
+        ),
+      ).toMatchObject({
+        ...(client === "codex"
+          ? { tool_timeout_sec: 1921 }
+          : { toolTimeoutMs: 1_920_001 }),
+        env: { REA_ANALYSIS_PROVIDER: provider, REA_IDA_MCP_CONFIG: idaConfig },
+      });
+      expect(text).not.toContain("fixture-credential");
+      const run = (arguments_: readonly string[]) =>
+        cli.run({ arguments: arguments_, cwd: home, environment });
+      const healthy = await run(["doctor", "--client", client, "--json"]);
+      expect(healthy.exitCode, healthy.stdout).toBe(0);
+      expect(JSON.stringify(healthy.json)).not.toContain('"advisory"');
+
+      // Only the stored client's provider path identifies this changed budget;
+      // the doctor/setup process has no IDA configuration in its environment.
+      await writeRegistration(2_400_001);
+      const doctor = await run(["doctor", "--client", client, "--json"]);
+      expect(doctor.exitCode, doctor.stdout).toBe(0);
+      expect(doctor.json).toMatchObject({
+        identity: {
+          registrations: expect.arrayContaining([
+            expect.objectContaining({
+              client,
+              state: "aligned",
+              advisory: expect.stringContaining(
+                client === "codex"
+                  ? "tool_timeout_sec = 2521 seconds"
+                  : "toolTimeoutMs = 2520001 ms",
+              ),
+            }),
+          ]),
+        },
+      });
+      const repeated = await run(setupArguments);
+      expect(repeated.exitCode, repeated.stdout).toBe(0);
+      expect(repeated.json).toMatchObject({
+        status: "ready",
+        plannedActions: [],
+        appliedActions: [],
+      });
+      expect(await readFile(config, "utf8")).toBe(text);
+      await expect(access(`${config}.rea.backup`)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      if (provider === "ida") {
+        await writeRegistration(0);
+        const invalidDoctor = await run([
+          "doctor",
+          "--client",
+          client,
+          "--json",
+        ]);
+        expect(invalidDoctor.exitCode).toBe(1);
+        expect(invalidDoctor.json).toMatchObject({
+          identity: {
+            registrations: expect.arrayContaining([
+              expect.objectContaining({
+                client,
+                state: "invalid",
+                remediation: expect.stringContaining("REA_IDA_MCP_CONFIG"),
+              }),
+            ]),
+          },
+        });
+        const invalidSetup = await run(setupArguments);
+        expect(invalidSetup.exitCode).toBe(1);
+        expect(invalidSetup.stdout).toContain("REA_IDA_MCP_CONFIG");
+        expect(await readFile(config, "utf8")).toBe(text);
+        await expect(access(`${config}.rea.backup`)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      }
+    },
+    120_000,
+  );
+
+for (const invalidSetting of [
+  { setting: "REA_MCP_INPUT_SCHEMA_PROFILE", value: "unknown" },
+  { setting: "REA_GHIDRA_STARTUP_TIMEOUT_MS", value: "0" },
+  { setting: "REA_JEB_MCP_TIMEOUT_MS", value: "1.5" },
+] as const)
+  cliTest(
+    `setup rejects malformed selected ${invalidSetting.setting} before writing`,
+    async ({ cli }) => {
+      const home = await createTestTempDirectory(
+        "rea-invalid-selected-registration-env-",
+      );
+      const kimiHome = join(home, "kimi");
+      await mkdir(kimiHome, { recursive: true });
+      const config = join(kimiHome, "mcp.json");
+      const environment = {
+        HOME: home,
+        USERPROFILE: home,
+        XDG_CONFIG_HOME: join(home, ".config"),
+        KIMI_CODE_HOME: kimiHome,
+        HOPPER_LAUNCHER_PATH: join(home, "missing-hopper"),
+        [invalidSetting.setting]: invalidSetting.value,
+      };
+      const result = await cli.run({
+        arguments: [
+          "setup",
+          "--client",
+          "kimi",
+          "--skill=false",
+          "--yes",
+          "--json",
+        ],
+        cwd: home,
+        environment,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.json).toMatchObject({
+        code: "configuration_invalid",
+        category: "invalid_input",
+        details: {
+          settings: [
+            expect.objectContaining({ setting: invalidSetting.setting }),
+          ],
+        },
+      });
+      expect(`${result.stdout}\n${result.stderr}`).toContain(
+        invalidSetting.setting,
+      );
+      await expect(access(config)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(access(`${config}.rea.backup`)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+    120_000,
+  );

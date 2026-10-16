@@ -92,6 +92,7 @@ interface ManagedSession extends ManagedRemoteConnection {
   resumeAfterDetachPending: boolean;
   capturedBytes: number;
   messagesTruncated: boolean;
+  readonly truncatedScripts: Set<string>;
 }
 
 export interface FridaInstrumentationManagerOptions {
@@ -115,6 +116,7 @@ export class FridaInstrumentationManager implements FridaInstrumentationPort {
   readonly #remoteQueues = new Map<string, Promise<void>>();
   readonly #deviceManagerLoader: () => Promise<DeviceManager>;
   #deviceManager: DeviceManager | undefined;
+  #deviceManagerLoading: Promise<DeviceManager> | undefined;
   #availabilityFailure: OptionalProviderLoadFailure | undefined;
   readonly #operations = new Set<Promise<unknown>>();
   #closing = false;
@@ -273,9 +275,14 @@ export class FridaInstrumentationManager implements FridaInstrumentationPort {
       let pid: number;
       let target: string;
       if (input.mode === "attach") {
-        const process = await device.getProcessByPid(input.pid);
-        pid = process.pid;
-        target = `${process.name} (pid ${process.pid})`;
+        pid = input.pid;
+        target = `pid ${pid}`;
+        try {
+          const process = await device.getProcessByPid(pid);
+          target = `${process.name} (pid ${pid})`;
+        } catch {
+          // Frida can attach to processes absent from its enumeration snapshot.
+        }
       } else {
         pid = await device.spawn(
           input.program,
@@ -307,10 +314,15 @@ export class FridaInstrumentationManager implements FridaInstrumentationPort {
         resumeAfterDetachPending: false,
         capturedBytes: 0,
         messagesTruncated: false,
+        truncatedScripts: new Set(),
       };
       session.detached.connect(() => {
         managed.state = "detached";
       });
+      // A target can exit while metadata lookup/attach is pending, before
+      // Frida installs this listener. Subscribe first, then reconcile the
+      // current provider state so an already-emitted detach is not lost.
+      if (session.isDetached()) managed.state = "detached";
       this.#sessions.set(id, managed);
       return ok(sessionObservation(managed));
     } catch (cause: unknown) {
@@ -432,7 +444,7 @@ export class FridaInstrumentationManager implements FridaInstrumentationPort {
         sourcePath: source.sourceKind === "file" ? source.path : null,
         sourceSha256,
         messages: managed.messagesByScript.get(scriptId)?.toArray() ?? [],
-        messagesTruncated: managed.messagesTruncated,
+        messagesTruncated: managed.truncatedScripts.has(scriptId),
       };
       if (signal?.aborted) {
         const cleanupReason = await this.#releaseScript(managed, entry);
@@ -598,6 +610,7 @@ export class FridaInstrumentationManager implements FridaInstrumentationPort {
     }
     managed.scripts.delete(entry.id);
     managed.messagesByScript.delete(entry.id);
+    managed.truncatedScripts.delete(entry.id);
     return undefined;
   }
 
@@ -916,7 +929,7 @@ export class FridaInstrumentationManager implements FridaInstrumentationPort {
           bytes: Buffer.byteLength('{"payload_unavailable":true}'),
         };
       }
-      if (payloadResult.truncated) managed.messagesTruncated = true;
+      if (payloadResult.truncated) markMessageTruncated(managed, scriptId);
     }
     let binaryResult: Record<string, JsonValue> = {};
     if (data !== null) {
@@ -939,7 +952,7 @@ export class FridaInstrumentationManager implements FridaInstrumentationPort {
           data_truncated: true,
           data_bytes: data.byteLength,
         };
-        managed.messagesTruncated = true;
+        markMessageTruncated(managed, scriptId);
       } else {
         binaryResult = { data_base64: data.toString("base64") };
       }
@@ -961,12 +974,21 @@ export class FridaInstrumentationManager implements FridaInstrumentationPort {
       message.stack === undefined
         ? undefined
         : boundedRedactedString(message.stack, MAX_MESSAGE_TEXT_BYTES, secrets);
+    const fileName =
+      message.fileName === undefined
+        ? undefined
+        : boundedRedactedString(
+            message.fileName,
+            MAX_MESSAGE_TEXT_BYTES,
+            secrets,
+          );
     if (
       type.truncated ||
       description?.truncated === true ||
-      stack?.truncated === true
+      stack?.truncated === true ||
+      fileName?.truncated === true
     )
-      managed.messagesTruncated = true;
+      markMessageTruncated(managed, scriptId);
     const observation: JsonValue = {
       script_id: scriptId,
       type: type.value,
@@ -989,11 +1011,27 @@ export class FridaInstrumentationManager implements FridaInstrumentationPort {
             stack: stack.value,
             ...(stack.truncated ? { stack_truncated: true } : {}),
           }),
+      ...(fileName === undefined
+        ? {}
+        : {
+            file_name: fileName.value,
+            ...(fileName.truncated ? { file_name_truncated: true } : {}),
+          }),
+      ...(typeof message.lineNumber === "number" &&
+      Number.isSafeInteger(message.lineNumber) &&
+      message.lineNumber >= 0
+        ? { line_number: message.lineNumber }
+        : {}),
+      ...(typeof message.columnNumber === "number" &&
+      Number.isSafeInteger(message.columnNumber) &&
+      message.columnNumber >= 0
+        ? { column_number: message.columnNumber }
+        : {}),
       ...binaryResult,
     };
     const charge = Buffer.byteLength(JSON.stringify(observation));
     if (charge > MAX_SESSION_CAPTURE_BYTES) {
-      managed.messagesTruncated = true;
+      markMessageTruncated(managed, scriptId);
       return;
     }
     while (
@@ -1008,8 +1046,8 @@ export class FridaInstrumentationManager implements FridaInstrumentationPort {
         const scriptMessages = managed.messagesByScript.get(removed.scriptId);
         if (scriptMessages?.peek() === removed.observation)
           scriptMessages.shift();
+        markMessageTruncated(managed, removed.scriptId);
       }
-      managed.messagesTruncated = true;
     }
     managed.messages.push({ observation, scriptId, charge });
     managed.messagesByScript.get(scriptId)?.push(observation);
@@ -1017,18 +1055,26 @@ export class FridaInstrumentationManager implements FridaInstrumentationPort {
   }
 
   async #getDeviceManager(): Promise<DeviceManager> {
-    if (this.#deviceManager === undefined) {
-      try {
-        this.#deviceManager = await this.#deviceManagerLoader();
-      } catch (cause: unknown) {
-        this.#availabilityFailure = {
-          providerId: "frida",
-          reason: cause instanceof Error ? cause.message : String(cause),
-        };
-        throw cause;
-      }
+    if (this.#deviceManager !== undefined) return this.#deviceManager;
+    if (this.#deviceManagerLoading !== undefined)
+      return this.#deviceManagerLoading;
+    const loading = Promise.resolve().then(this.#deviceManagerLoader);
+    this.#deviceManagerLoading = loading;
+    try {
+      this.#deviceManager = await loading;
+      if (this.#availabilityFailure?.providerId === "frida")
+        this.#availabilityFailure = undefined;
+      return this.#deviceManager;
+    } catch (cause: unknown) {
+      this.#availabilityFailure = {
+        providerId: "frida",
+        reason: boundedRedactedString(errorMessage(cause), 4096, []).value,
+      };
+      throw cause;
+    } finally {
+      if (this.#deviceManagerLoading === loading)
+        this.#deviceManagerLoading = undefined;
     }
-    return this.#deviceManager;
   }
 
   async #selectDevice(
@@ -1054,7 +1100,14 @@ export class FridaInstrumentationManager implements FridaInstrumentationPort {
       let reference = this.#remoteDevices.get(remote.address);
       if (reference !== undefined) {
         if (reference.optionsDigest !== optionsDigest)
-          throw new AnalysisInputError("frida_remote_connection");
+          throw new AnalysisInputError("frida_remote_connection", undefined, [
+            {
+              path: ["remote"],
+              reason: "invalid_value",
+              message:
+                "This endpoint is already retained with different connection options. Reuse the existing options or close its sessions before changing them.",
+            },
+          ]);
         reference.references += 1;
       } else {
         const device = manager.addRemoteDevice(
@@ -1361,6 +1414,8 @@ const providerError = (
   remote?: FridaRemoteConnection,
   cleanupReason?: string,
 ): AnalysisError => {
+  if (cause instanceof AnalysisInputError)
+    return new AnalysisInputError(operation, { cause }, cause.issues);
   if (cause instanceof AnalysisCancelledError)
     return new AnalysisCancelledError(operation, {
       cause: cause.cause,
@@ -1402,6 +1457,15 @@ interface CapturedMessage {
   /** Serialized bytes charged against the session capture budget. */
   readonly charge: number;
 }
+
+const markMessageTruncated = (
+  managed: ManagedSession,
+  scriptId: string,
+): void => {
+  managed.messagesTruncated = true;
+  if (managed.messagesByScript.has(scriptId))
+    managed.truncatedScripts.add(scriptId);
+};
 
 /**
  * Arrival-ordered queue whose eviction advances a head offset. A full capture

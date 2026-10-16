@@ -1,22 +1,24 @@
 import { createHash } from "node:crypto";
 import { stat } from "node:fs/promises";
 
+import { withOwnedRegularFile } from "./OwnedRegularFile.js";
 import {
-  openRegularFile,
   RegularFileChangedError,
   sameRegularFileState,
 } from "./RegularFile.js";
+import type { OwnedFileHandle } from "./OwnedFileHandle.js";
+
+export interface StableFileHashOptions {
+  readonly signal?: AbortSignal;
+  readonly retainFailedClose: (owner: OwnedFileHandle) => void;
+}
 
 /** Hash one regular file from its admitted descriptor and verify its path state. */
 export const hashStableFile = async (
   path: string,
-  signal?: AbortSignal,
-): Promise<{ readonly sha256: string; readonly bytes: number }> => {
-  const handle = await openRegularFile(path, {
-    symlinks: "follow",
-    signal,
-  });
-  try {
+  options: StableFileHashOptions,
+): Promise<{ readonly sha256: string; readonly bytes: number }> =>
+  withOwnedRegularFile(path, options, async (handle) => {
     const initial = await handle.stat();
     if (!Number.isSafeInteger(initial.size) || initial.size < 0)
       throw new RangeError(
@@ -26,22 +28,22 @@ export const hashStableFile = async (
     const chunk = Buffer.allocUnsafe(64 * 1024);
     let position = 0;
     while (position <= initial.size) {
-      signal?.throwIfAborted();
+      options.signal?.throwIfAborted();
       const length = Math.min(chunk.length, initial.size - position + 1);
       if (length <= 0) break;
       const read = await handle.read(chunk, 0, length, position);
-      signal?.throwIfAborted();
+      options.signal?.throwIfAborted();
       if (read.bytesRead === 0) break;
       hash.update(chunk.subarray(0, read.bytesRead));
       position += read.bytesRead;
       if (position > initial.size) throw new RegularFileChangedError(path);
     }
-    signal?.throwIfAborted();
+    options.signal?.throwIfAborted();
     const [opened, currentPath] = await Promise.all([
       handle.stat(),
       stat(path),
     ]);
-    signal?.throwIfAborted();
+    options.signal?.throwIfAborted();
     if (
       position !== initial.size ||
       !sameRegularFileState(initial, opened) ||
@@ -49,7 +51,4 @@ export const hashStableFile = async (
     )
       throw new RegularFileChangedError(path);
     return { sha256: hash.digest("hex"), bytes: position };
-  } finally {
-    await handle.close();
-  }
-};
+  });

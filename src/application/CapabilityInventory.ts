@@ -22,6 +22,7 @@ import type { ToolKind } from "../contracts/toolContractTypes.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { isMachOFormat } from "../domain/binaryTargetTypes.js";
 import type { ProviderAvailability } from "./AnalysisProvider.js";
+import type { JebAnalysisAvailability } from "./jeb/JebAnalysisPort.js";
 import { TOOL_CONTRACTS } from "../contracts/toolContracts.js";
 import { FRIDA_TOOL_CONTRACTS } from "../contracts/fridaToolContracts.js";
 import {
@@ -54,7 +55,9 @@ export type AvailabilityPolicy = {
   readonly firmwareInspectionEnabled?: boolean;
   readonly firmwareExtractionEnabled?: boolean;
   readonly androidAnalysisAvailability?: ProviderAvailability;
-  readonly jebAnalysisAvailability?: ProviderAvailability;
+  readonly adbAnalysisAvailability?: ProviderAvailability;
+  readonly apktoolAnalysisAvailability?: ProviderAvailability;
+  readonly jebAnalysisAvailability?: JebAnalysisAvailability;
   readonly javascriptRecoveryEnabled?: boolean;
   readonly webModuleResolutionEnabled?: boolean;
   readonly browserObservationEnabled?: boolean;
@@ -482,15 +485,32 @@ const workflowAvailabilityFor = ({
             policy.androidAnalysisAvailability?.reason ??
             "Set REA_JADX_MCP_JAR to a caller-supplied jadx-headless-mcp 0.7.1 JAR and provide a full JDK on Linux, macOS, or Windows x64 with its matching bundled native controls.",
         };
-  if (kind === "jeb-provider")
-    return policy.jebAnalysisAvailability?.status === "available"
-      ? { reason: "available", remediation: null }
-      : {
-          reason: "provider_missing",
-          remediation:
-            policy.jebAnalysisAvailability?.reason ??
-            "Start a JEB client serving MCP (GUI client, or headless via its programmatic launcher) and point REA_JEB_MCP_URL at it (default http://127.0.0.1:8425/mcp). REA does not install or launch JEB.",
-        };
+  if (kind === "adb-provider")
+    return ownerProbeAvailability(
+      policy.adbAnalysisAvailability,
+      "Set REA_ADB_PATH to a caller-supplied adb executable or make adb available on PATH. This checks the client version only; device and serial availability depend on the request.",
+    );
+  if (kind === "apktool-provider")
+    return ownerProbeAvailability(
+      policy.apktoolAnalysisAvailability,
+      "Set REA_APKTOOL_COMMAND to a caller-supplied Apktool executable or make Apktool 2.7.0 or newer available on PATH.",
+    );
+  if (kind === "jeb-provider") {
+    const availability = policy.jebAnalysisAvailability;
+    if (availability?.status === "available")
+      return availability.supportedOperations.some(
+        (operation) => operation === name,
+      )
+        ? { reason: "available", remediation: null }
+        : {
+            reason: "provider_unavailable",
+            remediation: `The running JEB endpoint does not advertise support for ${name}. Use a JEB client build that provides this operation.`,
+          };
+    return ownerProbeAvailability(
+      availability,
+      "Start a JEB client serving MCP (GUI client, or headless via its programmatic launcher) and point REA_JEB_MCP_URL at it (default http://127.0.0.1:8425/mcp). REA does not install or launch JEB.",
+    );
+  }
   const browser = browserProviderAvailability(name, kind, policy);
   if (browser !== null) return browser;
   if (name === "capture_process_scenario" && !policy.processCaptureEnabled)
@@ -513,6 +533,25 @@ const workflowAvailabilityFor = ({
         };
   if (kind === "session") return { reason: "available", remediation: null };
   return null;
+};
+
+const ownerProbeAvailability = (
+  observation: ProviderAvailability | undefined,
+  missingRemediation: string,
+): Availability => {
+  if (observation === undefined)
+    return { reason: "provider_missing", remediation: missingRemediation };
+  if (observation.status === "available")
+    return { reason: "available", remediation: null };
+  return {
+    reason:
+      observation.code === "unsupported_host"
+        ? "unsupported_host"
+        : observation.code === "not_configured"
+          ? "provider_missing"
+          : "provider_unavailable",
+    remediation: observation.reason,
+  };
 };
 
 const electronProviderAvailability = (

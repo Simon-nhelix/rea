@@ -4,6 +4,10 @@ import {
   defaultHopperLauncherPath,
   parseConfig,
 } from "./config/parseConfig.js";
+import {
+  parseEnvironmentValues,
+  parseJebMcpTimeoutMs,
+} from "./config/environment.js";
 import { projectAnalysisError } from "./domain/analysisErrorProjection.js";
 
 it("reports a configuration failure for a NUL in Hopper loader arguments", () => {
@@ -328,6 +332,40 @@ describe("configuration failure diagnostics", () => {
   });
 });
 
+describe("JEB MCP timeout configuration", () => {
+  it("stays optional and validates the caller-selected environment value", () => {
+    expect(parseJebMcpTimeoutMs(undefined)).toEqual({
+      ok: true,
+      value: undefined,
+    });
+    expect(parseJebMcpTimeoutMs("900000")).toEqual({
+      ok: true,
+      value: 900_000,
+    });
+    expect(
+      parseEnvironmentValues({ REA_JEB_MCP_TIMEOUT_MS: "900000" }),
+    ).toMatchObject({ ok: true, value: { REA_JEB_MCP_TIMEOUT_MS: 900_000 } });
+  });
+
+  it.each(["", "0", "-1", "1.5", "1e3", "invalid", "2147483648"])(
+    "rejects malformed timeout %j with its setting",
+    (value) => {
+      const result = parseJebMcpTimeoutMs(value);
+      if (result.ok) throw new Error("Expected invalid JEB MCP timeout");
+      expect(projectAnalysisError(result.error)).toMatchObject({
+        details: {
+          settings: [
+            {
+              setting: "REA_JEB_MCP_TIMEOUT_MS",
+              constraint: expect.any(String),
+            },
+          ],
+        },
+      });
+    },
+  );
+});
+
 describe("default Linux Hopper launcher", () => {
   const home = "/fixture/home";
   const withExecutables =
@@ -366,5 +404,31 @@ describe("default Linux Hopper launcher", () => {
         ]),
       ),
     ).toBe(`${home}/.local/share/rea/hopper/bin/Hopper`);
+  });
+});
+
+describe("default macOS Hopper launcher", () => {
+  it("selects the system path before the installer user path", () => {
+    const home = "/fixture/home";
+    const system =
+      "/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
+    const user =
+      "/fixture/home/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
+    const executable = (path: string): boolean =>
+      path === system || path === user;
+
+    expect(defaultHopperLauncherPath("darwin", home, executable)).toBe(system);
+    expect(
+      defaultHopperLauncherPath("darwin", home, (path) => path === user),
+    ).toBe(user);
+  });
+
+  it("keeps an explicit launcher path unchanged", () => {
+    const configured = "/custom/../Hopper launcher";
+    const parsed = parseConfig({ HOPPER_LAUNCHER_PATH: configured });
+    expect(parsed).toMatchObject({
+      ok: true,
+      value: { hopperLauncherPath: configured },
+    });
   });
 });

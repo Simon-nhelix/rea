@@ -8,6 +8,7 @@ import { logCliCommand } from "../cliLogging.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import { withCommandCancellation } from "./commandCancellation.js";
 import type { CliInstance } from "./types.js";
+import { cliIntegerArgument } from "./options.js";
 
 /** Register commands that control an already-running Cutter instance. */
 export const registerCutterCommands = (
@@ -33,11 +34,9 @@ export const registerCutterCommands = (
         .string()
         .uuid()
         .describe("Session ID copied from list-cutter-sessions."),
-      expectedGeneration: z.coerce
-        .number()
-        .int()
-        .nonnegative()
-        .describe("Session generation returned by list-cutter-sessions."),
+      expectedGeneration: cliIntegerArgument(0).describe(
+        "Session generation returned by list-cutter-sessions.",
+      ),
       command: z
         .string()
         .min(1)
@@ -45,10 +44,18 @@ export const registerCutterCommands = (
         .refine((value) => !/[\r\n]/u.test(value)),
     }),
     options: z.object({
+      jsonOutput: z
+        .boolean()
+        .optional()
+        .describe(
+          "Return command-specific JSON output when available (independent of CLI output formatting).",
+        ),
       json: z
         .boolean()
-        .default(false)
-        .describe("Return command-specific JSON output when available."),
+        .optional()
+        .describe(
+          "Deprecated compatibility input: use --json-output; pass --json=true or --json=false (bare --json formats CLI output).",
+        ),
     }),
     run: ({ args, options }) =>
       withCommandCancellation((signal) =>
@@ -58,7 +65,7 @@ export const registerCutterCommands = (
               session_id: args.sessionId,
               expected_generation: args.expectedGeneration,
               command: args.command,
-              json: options.json,
+              json: options.jsonOutput ?? options.json ?? false,
             },
             { signal },
           );

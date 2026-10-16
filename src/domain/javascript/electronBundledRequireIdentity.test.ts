@@ -7,7 +7,8 @@ import { analyzeJavaScriptStaticSource } from "./javascriptStaticAnalysis.js";
 const bootstrap = (external: string, consumer: string, entry = "n(100);") =>
   `(()=>{var m={45840:${external},100:(e,t,n)=>{"use strict";${consumer}}},c={};` +
   `function n(t){var r=c[t];if(void 0!==r)return r.exports;var o=c[t]={exports:{}};` +
-  `return m[t](o,o.exports,n),o.exports}${entry}})();`;
+  `return m[t](o,o.exports,n),o.exports}` +
+  `n.n=e=>e&&e.__esModule?()=>e.default:()=>e;${entry}})();`;
 
 const EXTERNAL = 'e=>{"use strict";e.exports=require("electron")}';
 const CONSUMER =
@@ -18,6 +19,67 @@ const electronOf = (source: string) =>
   analyzeJavaScriptStaticSource(source).electron;
 
 describe("Electron identity through Webpack externals", () => {
+  it("follows the default-export getter produced by webpack n.n", () => {
+    const source = bootstrap(
+      EXTERNAL,
+      'const s=n.n(n(45840));new (s().BrowserWindow)({webPreferences:{contextIsolation:false}});s().ipcMain.handle("ready",()=>{});',
+    );
+    const electron = electronOf(source);
+    expect(electron.browser_windows).toHaveLength(1);
+    expect(electron.ipc).toMatchObject([{ channel: "ready", side: "main" }]);
+  });
+
+  it.each([
+    [
+      "a fake getter",
+      bootstrap(
+        EXTERNAL,
+        "const s=n.n=e=>()=>0;new (s(n(45840))().BrowserWindow)({});",
+      ),
+    ],
+    [
+      "a getter replaced while evaluating its argument",
+      bootstrap(
+        EXTERNAL,
+        "new ((n.n=e=>()=>0,n.n(n(45840)))().BrowserWindow)({});",
+      ),
+    ],
+  ])("does not infer Electron through %s", (_name, source) => {
+    expect(electronOf(source).browser_windows).toEqual([]);
+  });
+
+  const GETTER_CONSUMER = "const s=n.n(n(45840));new (s().BrowserWindow)({});";
+  it.each([
+    ["Reflect.set", 'Reflect.set(n,"n",e=>()=>({BrowserWindow:class{}}));'],
+    [
+      "Reflect.defineProperty",
+      'Reflect.defineProperty(n,"n",{value:e=>()=>0});',
+    ],
+    ["delete", "delete n.n;"],
+    ["a destructuring write", "({g:n.n}={g:e=>()=>0});"],
+    ["an unknown key", "n[key]=e=>()=>0;"],
+  ])(
+    "does not infer Electron after a getter write through %s",
+    (_name, write) => {
+      expect(
+        electronOf(bootstrap(EXTERNAL, GETTER_CONSUMER, `${write}n(100);`))
+          .browser_windows,
+      ).toEqual([]);
+    },
+  );
+
+  it("keeps the getter after a reflective write to another loader key", () => {
+    expect(
+      electronOf(
+        bootstrap(
+          EXTERNAL,
+          GETTER_CONSUMER,
+          'Object.defineProperty(n,"d",{value:1});n(100);',
+        ),
+      ).browser_windows,
+    ).toHaveLength(1);
+  });
+
   it("follows the loader passed to a module factory", () => {
     const electron = electronOf(bootstrap(EXTERNAL, CONSUMER));
     expect(electron.browser_windows).toMatchObject([

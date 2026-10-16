@@ -10,6 +10,7 @@ import {
 } from "../domain/managed/managedArtifact.js";
 import {
   managedCli32BitRequirement,
+  managedCliIsMixedClrNative,
   readManagedPeLayout,
   type ManagedCliHeader,
   type ManagedPeLayout,
@@ -24,6 +25,7 @@ import {
   readManagedMetadataLayout,
   type ManagedMetadataLayout,
 } from "./ManagedMetadataLayout.js";
+import { readTypeMemberListFacts } from "./ManagedTypeMemberLists.js";
 import { ManagedReaderFailure } from "./ManagedReaderFailure.js";
 
 const flagNames = (flags: number): string[] => {
@@ -163,7 +165,7 @@ const runtimeFamilyFromCliHeader = (
 ): ManagedArtifactInspection["classification"]["runtime_family"] =>
   cli?.readyToRunSignature === true
     ? "modern-dotnet"
-    : cli !== null && (cli.flags & 1) === 0
+    : cli !== null && managedCliIsMixedClrNative(cli)
       ? "mixed-clr-native"
       : "unknown";
 
@@ -189,8 +191,6 @@ const runtimeFamilyFor = (
   );
   let runtimeFamily: ManagedArtifactInspection["classification"]["runtime_family"] =
     "unknown";
-  // crossgen2 clears ILONLY on ReadyToRun output, so only a clear flag
-  // without the ReadyToRun signature indicates mixed CLR/native code.
   if (runtimeFamilyFromCliHeader(cli) === "mixed-clr-native") {
     runtimeFamily = "mixed-clr-native";
     evidence.push({
@@ -384,10 +384,12 @@ export const inspectManagedArtifactBytes = (
     resourceIssues,
   );
   try {
+    const memberLists = readTypeMemberListFacts(bytes, metadata);
     const inventory = readManagedMetadataInventory(
       bytes,
       metadata,
       resourceDirectory,
+      memberLists,
     );
     const issues = [...resourceIssues, ...inventory.issues];
     const limitations = [

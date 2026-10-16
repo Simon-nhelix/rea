@@ -38,13 +38,10 @@ socket and device entries are not opened. Case-distinct archive members remain
 separate observations. Their case-insensitive materialization diagnostic does
 not reduce traversal coverage when both spellings were read.
 
-Current output also retains `coverage_status` (`complete` or `partial`) for existing clients, derived from the scoped traversal status. The owning parser normalizes retained `coverage_status` records to scoped coverage and rejects conflicting declarations.
-
-The coverage field is optional when reading older retained Evidence. The owning
-inventory parser recognizes historical REA scope notices for compatibility;
-unfamiliar legacy limitations remain conservative. Typed records do not derive
-coverage from limitation text. Pages from one inventory must carry the same
-coverage declaration.
+Current inventory Evidence requires scoped `coverage` with a `complete` or
+`unknown` status. Consumers use this producer-owned fact and reject records
+without it; limitations are explanatory and do not supply or infer coverage.
+Pages from one inventory must carry the same coverage declaration.
 
 Function dossiers can declare per-facet coverage in the optional
 `normalized_result.facet_availability` map. Each supplied facet is either
@@ -396,14 +393,30 @@ concrete version, selection source, and complete analysis profile through
 choices return typed selection details. A selected provider is never replaced
 automatically after a runtime failure.
 
-Every successful target transition allocates `binary_session.analysis_run.run_id`
-before any provider startup. `process_lineage` is `not_observed` until a dynamic
-provider starts, then becomes `snapshots` with every started provider's identity
+Each provider client receives `binary_session.analysis_run.run_id` before any
+provider startup, including clients whose startup fails. `process_lineage` is
+`not_observed` until a dynamic provider starts, then becomes `snapshots` with
+every started provider's identity
 and retained ownership observation. Each observation records `observed_at` and
 is `unavailable` with a reason when ownership could not be revalidated, or
 `verified` with launcher PID, parent PID, process group, and descendants observed
 at that bounded check. These are historical snapshots, not live process
 inventories, and do not claim that no short-lived descendant existed.
+
+`binary_session.cleanup_pending` reports whether the session retains a provider
+client, session file resource, or provider-candidate resource whose cleanup
+has not succeeded. It can be true with
+`open: false`; target retirement does not establish resource release. For a
+retained provider client, health, activity, and lineage remain available under
+its original `analysis_run.run_id` where the provider supplies them.
+Successful provider cleanup clears the retained run;
+a replacement client receives a fresh run ID. Follow the cleanup error's
+reported resources and recovery action before reopening; a missing health
+observation does not establish an idle provider.
+File cleanup can also remain after snapshot publication or after profile
+inspection fails or is cancelled before a provider client exists. If no client
+remains, no provider run or health observation is available; follow the cleanup
+error's reported resources.
 
 ## Progress and cancellation
 
@@ -431,11 +444,24 @@ Native call tracing and process capture retain available observations in
 `details.partial_observation` on failure, including when cleanup succeeds.
 The observation reports its partial coverage; cleanup details describe host
 state separately from the execution failure.
+For these tools, cancellation observed during result finalization or owned
+cleanup also returns typed cancellation with the available observations.
+A normal target exit does not establish request completion. Incomplete cleanup
+still takes precedence and retains its resource diagnostics.
 A process capture that fails during a finalization interval keeps every signal
 attempt and its delivery result in `details.partial_observation`, with
 `elapsed_ms` and `exit_code` null when no exit was observed.
 Derived comparisons and reconstruction verification yield before computation
 and before publication, so cancellation cannot race with successful Evidence.
+
+Bundle recovery requires a recorded Evidence ID. Some provider errors carry
+typed raw observations in `details.partial_observation` instead of Evidence.
+Those raw observations are not recorded in the Evidence bundle. If the SDK
+suppresses the error reply after client cancellation, Evidence tools cannot
+recover them. An empty bundle does not prove that no partial work or side
+effect occurred; output receipts and cleanup observations remain distinct.
+The broader retention decision is tracked in
+[#4276](https://github.com/morluto/rea/issues/4276).
 
 `analyze_javascript_application` also yields between reconstruction phases and
 during graph/result sealing, cross-graph binding checks, Evidence JSON validation,
@@ -500,7 +526,10 @@ declared by their tools. Artifact extraction materializes the selected regular
 files into a fresh REA-chosen temporary directory and reports its path.
 
 `analyze_javascript_application` reads the supplied local directory or ASAR path
-and returns its result and Evidence inline.
+and returns its result and Evidence inline. Its owned analysis worker and private
+temporary source files are declared as `launchesProcess` and `writesFilesystem`,
+including for a single JavaScript source. This internal analysis does not execute
+the supplied application code.
 
 ## Ghidra first-query deadlines and recovery
 
@@ -519,6 +548,14 @@ These deadlines have different owners:
 | Ghidra startup       | REA allows 330,000 ms by default; `REA_GHIDRA_STARTUP_TIMEOUT_MS` accepts decimal integers from 1–2,147,483,647 ms. Invalid supplied values fail configuration validation. Startup failure is reported by the first provider query. |
 | Darwin swiftc helper | REA allows 120,000 ms by default for ownership-helper compilation; `REA_SWIFTC_COMPILE_TIMEOUT_MS` accepts decimal integers from 1–2,147,483,647 ms. Invalid values fail configuration validation.                                  |
 | Individual tool call | The client bounds its wait, including cold engine startup. The pinned client SDK 2.3.1 defaults to 60,000 ms and can cancel earlier than REA's startup deadline.                                                                    |
+
+For [Codex and Kimi registrations](client-configuration.md), setup supplies
+missing tool deadlines from the known provider allowance plus 120 seconds of
+operation headroom: 450 seconds with the default Ghidra allowance, or 2820
+seconds with `REA_GHIDRA_STARTUP_TIMEOUT_MS=2700000`. Positive caller-selected
+deadlines remain unchanged. Doctor reports an informational recommendation
+when a configured deadline is shorter than the known provider allowance. An
+explicit JEB upstream request budget also contributes to that allowance.
 
 For an already connected client using the pinned SDK, request options are the
 **second** argument of `callTool`:
@@ -549,10 +586,20 @@ Waiting notifications stop when startup settles or the caller cancels. They do
 not measure engine work completed.
 
 The pinned SDK can reset the request's inactivity timeout on progress with
-`resetTimeoutOnProgress: true`. Also set `maxTotalTimeout` to bound the complete
-request; the provider's startup deadline still applies. These options belong in
-the same second argument of `callTool`. Without that explicit client policy, the
-default 60-second request deadline still expires despite waiting notifications.
+`resetTimeoutOnProgress: true`. These options belong in the same second
+argument of `callTool`. Without that explicit client policy, the default
+60-second request deadline still expires despite waiting notifications.
+
+SDK 2.3.1 checks `maxTotalTimeout` when progress resets the timer; it does not
+schedule a separate absolute timer for that setting. A silent interval can
+therefore run beyond the declared total. For an absolute caller deadline,
+also pass `signal: AbortSignal.timeout(totalBudgetMs)`. If the caller already
+has a cancellation signal, preserve both with
+`AbortSignal.any([callerSignal, AbortSignal.timeout(totalBudgetMs)])`.
+`maxTotalTimeout` can still bound progress resets, and REA's provider startup
+deadline still applies. Choose the total budget for the expected workload;
+neither server configuration nor progress can override a remote caller's
+deadline.
 
 The 240-second setting is a measured example, not a universal timeout: a
 controlled Linux x64/WSL2 fixture took about 64 seconds for its first overview
@@ -664,13 +711,31 @@ advertised. Every advertised example is a distinct valid canonical input.
 
 Root object unions are presented as
 one object without root `anyOf`, `oneOf`, or `allOf` for model API compatibility.
-The projection merges properties, retains shared required fields and
-group-specific field dependencies, and describes the accepted input groups.
-Canonical runtime validation enforces the exact union, including exclusions
-that the advertised projection does not express. Tests validate the schemas
+The projection merges properties, retains shared required fields, and
+describes the accepted input groups. Which fields belong together is guidance
+in that description rather than a `dependentRequired` or `dependencies`
+keyword, because Gemini function declarations reject both and one unknown
+keyword fails the client's whole tool catalog. Canonical runtime validation
+enforces the exact union, including partner fields and exclusions that the
+advertised projection does not express, so a client must not rely on the
+advertised schema to reject an incomplete group. Tests validate the schemas
 after SDK conversion and check advertised validation and actual calls.
 Individual model APIs can impose additional nesting limits; complete producer
 captures can exceed ten structural levels.
+
+Boolean literal constraints in input schemas are relaxed only in this
+advertisement. For example, a boolean `const` is presented as `type: boolean`;
+an affected `not` is omitted, conditional predicates and their branches are
+omitted together, pure boolean-literal `oneOf` branches collapse to a boolean,
+and other affected `oneOf` branches are presented as `anyOf` to retain branch
+guidance without making overlapping widened branches reject inputs.
+This can make the advertised schema accept inputs the canonical contract
+rejects. The MCP handler still validates every call with the canonical
+contract. The Gemini CLI verifier checks the outgoing
+`parametersJsonSchema` and canonical contract examples against that declaration
+using a loopback model fixture; it does not establish live Google API or
+OpenCode client behavior. Set `REA_VERIFY_GEMINI_SCHEMA_PROFILE=compact` to
+verify the compact advertisement through the same client boundary.
 
 ### Compact input schema profile
 
@@ -689,7 +754,10 @@ reported by strict-depth MCP clients in [#2813](https://github.com/morluto/rea/i
 WorkBuddy/CodeBuddy gateways have also rejected full REA catalogs with an
 opaque `11133` error while accepting the compact profile
 ([#2999](https://github.com/morluto/rea/issues/2999)); compatibility depends on
-the selected gateway and model.
+the selected gateway and model. That report used ZCode through a gateway to a
+Kimi-K3 backend, not the WorkBuddy MCP client. Set the profile on REA's
+registration in the actual MCP host; the host's name alone does not identify
+the downstream model or its schema constraints.
 
 The compact profile renders the same tool set, output schemas, annotations,
 and canonical server-side validation. It changes only the advertised input
@@ -711,9 +779,9 @@ JSON Schema:
   in a reduced form: property names, reference-resolved types (including union
   alternatives), first-level guidance, and the root's required-field constraints,
   with nested validation detail elided. The
-  canonical schema still rejects malformed calls server-side, so callers
-  following the reduced advertisement receive the canonical typed error
-  instead of silent acceptance.
+  registered canonical schema still rejects malformed calls before invoking a
+  handler. That rejection can use the MCP SDK's input-validation diagnostic;
+  it does not guarantee the application's typed input error.
 - Schemas deeper than ten nodes use the same reduced projection, with
   root-property names, types, guidance, and required fields retained. The
   server continues to enforce the full canonical input contract.
@@ -731,6 +799,11 @@ catalog refreshes and equivalent tool outputs; changing the schema changes its
 identity. Explicit schema IDs and relative external reference bases are
 preserved. This keeps every tool and validation rule in discovery and does not
 change the SDK's catalog invalidation or availability checks.
+
+The server identity's tool-schema digest includes both the canonical output
+contracts and the selected output-schema profile. `full` and `off` therefore
+have distinct identities even though `off` keeps the same canonical output
+validation on the server.
 
 Some stdio hosts reject a complete `tools/list` frame before they load any
 tools. The opt-in `REA_MCP_OUTPUT_SCHEMA_PROFILE=off` setting omits `outputSchema`
@@ -768,9 +841,10 @@ identities remains unknown.
   `normalization` defaults to `{ "rules": [] }`.
 
 The advertised schema includes complete nested capture fields and rejects
-incomplete pairs and structurally malformed captures. Mixed comparison families
-can pass advertised validation; the SDK rejects them against the canonical
-input schema before invoking the handler. Domain validation additionally checks
+incomplete pairs and structurally malformed captures. Mixed comparison families,
+and `normalization` without both scenario captures, can pass advertised
+validation; the SDK rejects them against the canonical input schema before
+invoking the handler. Domain validation additionally checks
 relationships such as event sequence references and retained counts; JSON
 Schema does not express those cross-field invariants.
 

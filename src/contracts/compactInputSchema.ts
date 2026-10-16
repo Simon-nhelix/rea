@@ -23,8 +23,16 @@ const jsonValueTypes = [
   "number",
   "string",
 ];
+// An empty item schema accepts every JSON value, including arbitrarily nested
+// arrays, while satisfying clients that require `items` for array types.
+const jsonValueSchema = () => ({ type: [...jsonValueTypes], items: {} });
 
 export type AdvertisedInputSchemaPresentation = "inline" | "reduced";
+
+/** Budget selected by the caller for compact MCP input-schema presentation. */
+export interface CompactInputSchemaPresentation {
+  readonly budgetBytes: number;
+}
 
 export interface CompactedInputSchema {
   readonly schema: Record<string, unknown>;
@@ -152,7 +160,7 @@ const inlineWithinBudget = (
       yield "]";
     } else if (isSchemaObject(value)) {
       if (position === "schema" && Object.keys(value).length === 0) {
-        yield JSON.stringify({ type: jsonValueTypes });
+        yield JSON.stringify(jsonValueSchema());
         return;
       }
       if (position === "schema" && typeof value.$ref === "string") {
@@ -284,7 +292,13 @@ const reduceToShallowProperties = (
           : {};
       return [
         name,
-        { ...(type === undefined ? {} : { type }), ...description },
+        {
+          ...(type === undefined ? {} : { type }),
+          // Reduced inputs intentionally omit nested validation, but clients
+          // still require an item schema to accept an array declaration.
+          ...(types?.includes("array") ? { items: jsonValueSchema() } : {}),
+          ...description,
+        },
       ];
     }),
   );
@@ -335,3 +349,13 @@ export const compactAdvertisedInputSchema = (
     presentation: "reduced",
   };
 };
+
+/** Return the JSON schema clients receive for the selected input presentation. */
+export const presentAdvertisedInputSchema = (
+  schema: Record<string, unknown>,
+  compactPresentation: CompactInputSchemaPresentation | undefined,
+): Record<string, unknown> =>
+  compactPresentation === undefined
+    ? schema
+    : compactAdvertisedInputSchema(schema, compactPresentation.budgetBytes)
+        .schema;

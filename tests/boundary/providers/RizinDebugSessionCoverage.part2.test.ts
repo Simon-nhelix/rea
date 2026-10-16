@@ -1,9 +1,5 @@
 import { afterEach, expect, it } from "vitest";
-import { RizinDebugSessionManager } from "../../../src/rizin/RizinDebugSessionManager.js";
-import {
-  createRizinTestManager,
-  rizinTestInferiorTty,
-} from "./RizinTestInferiorTty.js";
+import { rizinTestInferiorTty } from "./RizinTestInferiorTty.js";
 import {
   createRizinCoverageHarness,
   abortOnCheck,
@@ -11,7 +7,7 @@ import {
   incompleteStop,
 } from "./RizinDebugSessionCoverage.fixtures.js";
 
-const { cleanup, makeProvider, start, startInjected, track } =
+const { cleanup, makeProvider, start, startInjected, createManager } =
   createRizinCoverageHarness();
 afterEach(cleanup);
 
@@ -19,7 +15,8 @@ it.skipIf(process.platform === "win32")(
   "stops the session when the provider closes its stdin pipe",
   async () => {
     const provider = await makeProvider(
-      'printf "\\000"; exec 0<&-; while :; do :; done',
+      // Readiness must guarantee that the child's stdin is already closed.
+      'exec 0<&-; printf "\\000"; while :; do :; done',
       "#!/bin/sh",
     );
     const { manager, sessionId } = await start(provider, {
@@ -87,7 +84,7 @@ it.skipIf(process.platform === "win32")(
   async () => {
     for (const spawnError of [new Error("injected spawn failure"), "opaque"]) {
       const injected = createInjectedProcess({ spawnError });
-      const manager = createRizinTestManager(
+      const manager = createManager(
         { REA_RIZIN_COMMAND: "injected-rizin" },
         { spawnProcess: injected.spawnProcess },
       );
@@ -101,7 +98,7 @@ it.skipIf(process.platform === "win32")(
     const injected = createInjectedProcess({
       startup: (control) => control.closeStdin(),
     });
-    const manager = createRizinTestManager(
+    const manager = createManager(
       { REA_RIZIN_COMMAND: "injected-rizin" },
       { spawnProcess: injected.spawnProcess },
     );
@@ -123,7 +120,7 @@ it.skipIf(process.platform === "win32")(
       beforeSpawnReturns: () => abort.abort(),
       spawnError: new Error("spawn interrupted"),
     });
-    const manager = createRizinTestManager(
+    const manager = createManager(
       { REA_RIZIN_COMMAND: "injected-rizin" },
       { spawnProcess: injected.spawnProcess },
     );
@@ -146,7 +143,7 @@ it.skipIf(process.platform === "win32")(
         abort.abort();
       },
     });
-    const manager = createRizinTestManager(
+    const manager = createManager(
       { REA_RIZIN_COMMAND: "injected-rizin" },
       { spawnProcess: injected.spawnProcess },
     );
@@ -165,7 +162,7 @@ it.skipIf(process.platform === "win32")(
     const injected = createInjectedProcess({
       beforeSpawnReturns: () => abort.abort(),
     });
-    const manager = createRizinTestManager(
+    const manager = createManager(
       { REA_RIZIN_COMMAND: "injected-rizin" },
       { spawnProcess: injected.spawnProcess },
     );

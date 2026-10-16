@@ -17,6 +17,7 @@ import {
   type ManagedMemberRef,
   type ManagedMethod,
   type MemberCore,
+  type SignatureTypeName,
   type TypeRange,
 } from "./ManagedMemberInspectorCore.js";
 import {
@@ -30,6 +31,7 @@ import {
 import { readManagedValue } from "./ManagedReaderFailure.js";
 import { methodBody } from "./ManagedMethodBodyReader.js";
 import { memberDeclaringTypeRowLookup } from "./ManagedMemberOwnership.js";
+import type { TypeMemberListFacts } from "./ManagedTypeMemberLists.js";
 
 /**
  * Declaring-type tokens whose members are decoded in full; null selects every
@@ -47,7 +49,14 @@ export const parseFields = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   ranges: readonly TypeRange[],
-  selected: SelectedTypeTokens = null,
+  memberLists: TypeMemberListFacts,
+  {
+    signatureTypeName,
+    selected = null,
+  }: {
+    readonly signatureTypeName: SignatureTypeName;
+    readonly selected?: SelectedTypeTokens;
+  },
 ): {
   readonly fields: readonly ManagedField[];
   readonly core: ReadonlyMap<string, MemberCore>;
@@ -58,7 +67,7 @@ export const parseFields = (
   const issues: ManagedParseIssue[] = [];
   const table = layout.table(4);
   const ownerRow = readManagedValue(
-    () => memberDeclaringTypeRowLookup(bytes, layout, 4),
+    () => memberDeclaringTypeRowLookup(bytes, layout, 4, memberLists),
     issues,
   );
   for (let row = 1; row <= (table?.rowCount ?? 0); row += 1) {
@@ -97,7 +106,7 @@ export const parseFields = (
         declaring_type: declared?.fullName ?? null,
         name,
         flags,
-        signature: budgetedSignature(sig, layout),
+        signature: budgetedSignature(sig, layout, signatureTypeName),
       });
     }, issues);
   }
@@ -179,6 +188,7 @@ export const parseMemberRefs = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
   typeName: (token: string | null) => string | null,
+  signatureTypeName: SignatureTypeName,
 ): {
   readonly refs: readonly ManagedMemberRef[];
   readonly core: ReadonlyMap<string, MemberCore>;
@@ -230,7 +240,7 @@ export const parseMemberRefs = (
         layout.rowCounts,
       );
       const parentName = typeName(parentToken);
-      const decoded = budgetedSignature(sig, layout);
+      const decoded = budgetedSignature(sig, layout, signatureTypeName);
       refs.push({
         token,
         row_offset: cursor.start,
@@ -256,7 +266,11 @@ interface ParseMethodsInput {
   readonly layout: ManagedMetadataLayout;
   readonly pe: ManagedPeLayout;
   readonly ranges: readonly TypeRange[];
+  readonly signatureTypeName: SignatureTypeName;
+  readonly memberLists: TypeMemberListFacts;
   readonly selected?: SelectedTypeTokens;
+  readonly methodOffset?: number;
+  readonly methodLimit?: number;
 }
 
 export const parseMethods = ({
@@ -264,7 +278,11 @@ export const parseMethods = ({
   layout,
   pe,
   ranges,
+  signatureTypeName,
+  memberLists,
   selected = null,
+  methodOffset = 0,
+  methodLimit = Number.MAX_SAFE_INTEGER,
 }: ParseMethodsInput): {
   readonly methods: readonly ManagedMethod[];
   readonly core: ReadonlyMap<string, MemberCore>;
@@ -281,7 +299,7 @@ export const parseMethods = ({
   let unscannedMethods = 0;
   const table = layout.table(6);
   const ownerRow = readManagedValue(
-    () => memberDeclaringTypeRowLookup(bytes, layout, 6),
+    () => memberDeclaringTypeRowLookup(bytes, layout, 6, memberLists),
     issues,
   );
   for (let row = 1; row <= (table?.rowCount ?? 0); row += 1) {
@@ -292,12 +310,14 @@ export const parseMethods = ({
         ? undefined
         : readManagedValue(() => ownerRow(row), issues);
     const declared = owner === undefined ? undefined : ranges[owner - 1];
+    const inPage = row > methodOffset && row - methodOffset <= methodLimit;
     const mayBeSelected =
-      selected === null ||
-      owner === undefined ||
-      isSelected(selected, declared) ||
-      // A type whose name is unreadable may be one the caller requested.
-      declared?.fullName === null;
+      inPage &&
+      (selected === null ||
+        owner === undefined ||
+        isSelected(selected, declared) ||
+        // A type whose name is unreadable may be one the caller requested.
+        declared?.fullName === null);
     const produced = methods.length;
     readManagedValue(() => {
       const cursor = metadataRowCursor(bytes, layout, 6, row);
@@ -318,6 +338,7 @@ export const parseMethods = ({
         kind: "method",
       } as const;
       core.set(token, member);
+      if (!inPage) return;
       if (!isSelected(selected, declared)) return;
       const sig = readMetadataBlob(
         bytes,
@@ -326,7 +347,7 @@ export const parseMethods = ({
         layout.blob.size,
       );
       cursor.readIndex(layout.tableIndexSize(8));
-      const decoded = budgetedSignature(sig, layout);
+      const decoded = budgetedSignature(sig, layout, signatureTypeName);
       core.set(token, {
         ...member,
         genericArity: signatureGenericArity(decoded),
@@ -468,12 +489,13 @@ const callerNameBytes = (method: ManagedMethod): number =>
 const budgetedSignature = (
   bytes: Buffer,
   layout: ManagedMetadataLayout,
+  signatureTypeName: SignatureTypeName,
 ): ReturnType<typeof signature> => {
   const budget = managedDecodeBudget(layout);
   budget.admitTransient(bytes.length * 256, layout.blob.offset);
   try {
     return admitManagedProjection(
-      signature(bytes, budget.digest(bytes, "sha256")),
+      signature(bytes, budget.digest(bytes, "sha256"), signatureTypeName),
       budget,
     );
   } finally {

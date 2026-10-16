@@ -5,6 +5,7 @@ import {
   interfaceBuilderSummaryViewResultSchema,
   machoSummaryViewResultSchema,
   managedArtifactSummaryViewResultSchema,
+  managedMemberSummaryViewResultSchema,
 } from "../domain/analysisView/analysisView.js";
 import { evidenceBundleSummarySchema } from "../domain/evidenceRecordSummary.js";
 import {
@@ -55,7 +56,7 @@ import {
   listArchitecturesSchema,
 } from "../domain/native/nativeInspection.js";
 import { artifactExtractionResultSchema } from "../domain/artifactGraph.js";
-import { artifactInspectionOutputSchema } from "../domain/artifactInspection.js";
+import { artifactInspectionResultSchema } from "../domain/artifactInspection.js";
 import { interfaceBuilderAnalysisSchema } from "../domain/apple/interfaceBuilderGraph.js";
 import { dylibResolutionResultSchema } from "../domain/apple/dylibResolution.js";
 import { keyedArchiveResultSchema } from "../domain/apple/keyedArchive.js";
@@ -379,7 +380,7 @@ export const enhancedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
             name: z.string(),
             start: z.string(),
             end: z.string(),
-            length: z.number().min(0),
+            length: z.number().min(0).nullable(),
             image_base: z.string().exactOptional(),
             address_space: z.string().exactOptional(),
           }),
@@ -418,7 +419,7 @@ export const nativeOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
 export const artifactOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   inspect_artifact: evidenceResultOf(
     z.union([
-      artifactInspectionOutputSchema,
+      artifactInspectionResultSchema,
       artifactInventorySummaryViewResultSchema,
     ]),
   ),
@@ -442,7 +443,12 @@ export const managedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
       managedArtifactSummaryViewResultSchema,
     ]),
   ),
-  inspect_managed_members: evidenceResultOf(managedMemberInspectionSchema),
+  inspect_managed_members: evidenceResultOf(
+    z.union([
+      managedMemberInspectionSchema,
+      managedMemberSummaryViewResultSchema,
+    ]),
+  ),
   inspect_managed_native_boundaries: evidenceResultOf(
     managedNativeBoundaryInspectionSchema,
   ),

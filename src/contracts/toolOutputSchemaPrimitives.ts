@@ -465,6 +465,7 @@ export const expandToolAvailability = (
 
 export const sessionProvider = z
   .object({
+    cleanup_pending: z.boolean(),
     capabilities: z.array(providerCapabilitySet),
     analysis_run: analysisRun,
     analysis_activity: analysisActivity,
@@ -507,7 +508,7 @@ export const sessionProvider = z
         name: z.string(),
         version: z.string(),
         started_at: z.string(),
-        command_path: z.string(),
+        command_path: z.string().nullable(),
       }),
       sdk: z.object({
         server: z.string(),

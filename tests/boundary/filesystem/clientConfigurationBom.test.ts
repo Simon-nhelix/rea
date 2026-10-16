@@ -16,6 +16,7 @@ import {
 } from "../../../src/application/SetupClientConfiguration.js";
 import { systemUninstallHost } from "../../../src/application/Uninstall.js";
 import { supportedClients } from "../../../src/application/SupportedClients.js";
+import { CURRENT_ENTRYPOINT_PATH } from "../../../src/process/CurrentEntrypointPath.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 describe.each([
@@ -124,7 +125,7 @@ it.each(['\uFEFF{"servers": {"rea": @}}', '\uFEFF{"setting":\uFEFFtrue}'])(
   },
 );
 
-it("restores original BOM-prefixed JSONC bytes after update and removal", async () => {
+it("preserves BOM-prefixed JSONC values and comments through update and removal", async () => {
   const home = await createTestTempDirectory("rea-client-config-bom-cycle-");
   const client = supportedClients(home, "linux", {}).find(
     (candidate) => candidate.name === "cursor",
@@ -137,8 +138,10 @@ it("restores original BOM-prefixed JSONC bytes after update and removal", async 
   await mkdir(dirname(client.configPath), { recursive: true });
   await writeFile(client.configPath, original);
 
-  const firstCommand = [join(home, "bin", "rea"), "mcp"];
-  const updatedCommand = [join(home, "updated", "bin", "rea"), "mcp"];
+  if (CURRENT_ENTRYPOINT_PATH === undefined)
+    throw new Error("test runner entrypoint is unavailable");
+  const firstCommand = ["rea", "mcp"];
+  const updatedCommand = [process.execPath, CURRENT_ENTRYPOINT_PATH, "mcp"];
   expect(
     await configureClientConfiguration(client, {}, firstCommand),
   ).toMatchObject({ status: "configured" });
@@ -155,7 +158,17 @@ it("restores original BOM-prefixed JSONC bytes after update and removal", async 
     name: "cursor",
     status: "removed",
   });
-  expect(await readFile(client.configPath, "utf8")).toBe(original);
+  const removed = await readFile(client.configPath, "utf8");
+  expect(removed.startsWith("\uFEFF")).toBe(true);
+  expect(removed).toContain("\r\n  // Keep prefix \uFEFF comment.\r\n");
+  expect(removed).toContain("\r\n  // Keep suffix comment.\r\n");
+  expect(removed).toContain("// Keep this unrelated registration.");
+  expect(parseClientConfiguration(removed, client.format).document).toEqual(
+    parseClientConfiguration(original, client.format).document,
+  );
+  expect(await readFile(`${client.configPath}.rea.backup`)).toEqual(
+    Buffer.from(original),
+  );
 });
 
 it.each(["", "\n  \n", "\uFEFF"])(

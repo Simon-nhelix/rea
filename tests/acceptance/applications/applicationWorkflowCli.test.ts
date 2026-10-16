@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { Client } from "@modelcontextprotocol/client";
@@ -485,6 +486,7 @@ it("preserves complete line-comment source-map URLs through CLI and MCP", async 
           declared_url: declaredUrl,
           declared_url_sha256: digest,
           resolved_path: "app.js.map",
+          resolution_status: "resolved",
           available: true,
         },
         evidence: expect.objectContaining({
@@ -507,6 +509,7 @@ it("preserves complete line-comment source-map URLs through CLI and MCP", async 
         properties: {
           declared_url_sha256: digest,
           resolved_path: "app.js.map",
+          resolution_status: "resolved",
         },
       }),
     );
@@ -539,7 +542,7 @@ it("resolves source-map URL paths once without changing their declarations", asy
   await writeFile(
     join(root, "app.js"),
     cases.map(([url]) => `//# sourceMappingURL=${url}\n`).join("") +
-      'new Worker("./worker%20file.js");\n' +
+      'new Worker(new URL("./worker%20file.js", import.meta.url));\n' +
       'navigator.serviceWorker.register("./service%20worker.js");\n',
   );
   await writeFile(join(root, "worker file.js"), "export const worker = 1;\n");
@@ -565,6 +568,7 @@ it("resolves source-map URL paths once without changing their declarations", asy
           declared_url: declaredUrl,
           declared_url_sha256: digest,
           resolved_path: path,
+          resolution_status: "resolved",
           available: true,
         },
         evidence: expect.objectContaining({
@@ -587,31 +591,49 @@ it("resolves source-map URL paths once without changing their declarations", asy
       expect.objectContaining({
         relation: "maps_to",
         target_node_id: map?.node_id,
-        properties: { declared_url_sha256: digest, resolved_path: path },
-      }),
-    );
-  }
-  for (const [kind, specifier, path] of [
-    ["worker", "./worker%20file.js", "worker file.js"],
-    ["service-worker", "./service%20worker.js", "service worker.js"],
-  ]) {
-    const worker = graph.nodes.find((node) => node.kind === kind);
-    expect(worker?.observations).toContainEqual(
-      expect.objectContaining({
-        properties: expect.objectContaining({
-          declared_specifier: specifier,
+        properties: {
+          declared_url_sha256: digest,
           resolved_path: path,
-        }),
-      }),
-    );
-    expect(graph.edges).toContainEqual(
-      expect.objectContaining({
-        source_node_id: worker?.node_id,
-        relation: "maps_to",
-        properties: { resolved_path: path },
+          resolution_status: "resolved",
+        },
       }),
     );
   }
+  const worker = graph.nodes.find((node) => node.kind === "worker");
+  expect(worker?.observations).toContainEqual(
+    expect.objectContaining({
+      properties: expect.objectContaining({
+        declared_specifier: "./worker%20file.js",
+        resolved_path: "worker file.js",
+      }),
+    }),
+  );
+  expect(graph.edges).toContainEqual(
+    expect.objectContaining({
+      source_node_id: worker?.node_id,
+      relation: "maps_to",
+      properties: { resolved_path: "worker file.js" },
+    }),
+  );
+  // A service worker script URL is relative to the unestablished document base.
+  const serviceWorker = graph.nodes.find(
+    (node) => node.kind === "service-worker",
+  );
+  expect(serviceWorker?.observations).toContainEqual(
+    expect.objectContaining({
+      properties: expect.objectContaining({
+        declared_specifier: null,
+        expression: 'navigator.serviceWorker.register("./service%20worker.js")',
+        resolved_path: null,
+      }),
+    }),
+  );
+  expect(
+    graph.edges.some(
+      ({ source_node_id, relation }) =>
+        source_node_id === serviceWorker?.node_id && relation === "maps_to",
+    ),
+  ).toBe(false);
   expect((await analyzeThroughStdioMcp(root)).graph).toEqual(graph);
 }, 20_000);
 
@@ -829,18 +851,18 @@ describe("application workflow CLI parity", () => {
     if (seed === undefined)
       throw new TypeError("Expected at least one semantic relation");
 
-    const traced = await runCli([
+    const traced = await runCliWithRequestFile(
+      root,
       "trace-javascript-semantics",
-      JSON.stringify({
+      {
         application: analyzed.value,
         query: {
           seed: { kind: "semantic-node", node_id: seed },
           direction: "forward-influence",
           include_ambiguous_dynamic_edges: true,
         },
-      }),
-      "--json",
-    ]);
+      },
+    );
     expect(traced).toMatchObject({
       operation: "trace_javascript_semantics",
       predicate_type: "rea.javascript-semantic-trace",
@@ -1162,7 +1184,9 @@ describe("application workflow CLI copy boundaries", () => {
 
 describe("application workflow CLI and MCP capture lifetimes", () => {
   it("compares captured primitives and source values after aliases are replaced", async () => {
-    const root = await createTestTempDirectory("rea-capture-lifetime-cli-");
+    const parent = await createTestTempDirectory("rea-capture-lifetime-cli-");
+    const root = join(parent, "fixtures # capture");
+    await mkdir(root);
     const fields = [
       "rebound",
       "rest",
@@ -1226,7 +1250,9 @@ describe("application workflow CLI and MCP capture lifetimes", () => {
         "--input-type=module",
         "--eval",
         "const module = await import(process.argv[1]); console.log(JSON.stringify(module.default()));",
-        join(root, String(index), "parser.mjs"),
+        // ESM import() takes a URL specifier; a Windows drive path parses as a
+        // `c:` URL scheme and is rejected.
+        pathToFileURL(join(root, String(index), "parser.mjs")).href,
       ]);
       expect(JSON.parse(stdout)).toEqual({
         kind: "capture-boundary",
@@ -1279,18 +1305,18 @@ describe("application workflow CLI export Evidence", () => {
       'export default async function make() { return { kind: "record", extra: 1 }; }',
     ];
     const [left, right] = await analyzeComparisonSources(root, sources);
-    const compared = await runCli([
+    const compared = await runCliWithRequestFile(
+      root,
       "compare-javascript-export-shapes",
-      JSON.stringify({
+      {
         left,
         right,
         left_module_path: "parser.mjs",
         left_export_name: "default",
         right_module_path: "parser.mjs",
         right_export_name: "default",
-      }),
-      "--json",
-    ]);
+      },
+    );
     expect(compared).toMatchObject({
       operation: "compare_javascript_export_shapes",
       normalized_result: {
@@ -1576,8 +1602,11 @@ it("retains bundled isolated-world contextBridge APIs through dedicated and gene
           world: "isolated",
           world_id: { status: "literal", value: 1001, expression: null },
           api_key: "isolatedApi",
+          api_status: "object-literal",
           members: ["ping"],
-          resolution_basis: "wrapper-substitution",
+          unknown_members: 0,
+          // The proven Webpack bootstrap resolves `load(2)` directly.
+          resolution_basis: "direct-syntax",
         }),
         evidence: expect.objectContaining({
           location: expect.objectContaining({
@@ -1615,4 +1644,20 @@ const runCli = async (
       return JSON.parse(cause.stdout);
     throw cause;
   }
+};
+
+/**
+ * Pass a request carrying complete Evidence through the CLI's file-backed JSON
+ * input. Serialized Evidence exceeds the Windows command-line limit when it is
+ * passed as one argument, so spawn fails with ENAMETOOLONG before the workflow
+ * starts. Inline JSON transport keeps its own coverage in the parity tests.
+ */
+const runCliWithRequestFile = async (
+  root: string,
+  command: string,
+  request: unknown,
+): Promise<unknown> => {
+  const requestPath = join(root, "request.json");
+  await writeFile(requestPath, JSON.stringify(request));
+  return runCli([command, requestPath, "--json"]);
 };

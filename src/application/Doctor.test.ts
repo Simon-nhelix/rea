@@ -4,6 +4,8 @@ import { SUPPORTED_NODE_VERSION_PROSE } from "../domain/runtimeVersion.js";
 import type { ClientRegistrationStatus } from "./ClientRegistrationStatus.js";
 import { createDoctorHostFixture as host } from "./Doctor.fixture.js";
 import { runDoctor } from "./Doctor.js";
+import { err } from "../domain/result.js";
+import { HopperReleaseError } from "./HopperReleaseFeed.js";
 
 describe("doctor runtime check", () => {
   it("reports Node 25 as unsupported", async () => {
@@ -330,7 +332,7 @@ describe("doctor scoped readiness", () => {
         client: "cursor",
         config_path: "/home/user/.cursor/mcp.json",
         command: ["/old/rea", "mcp"],
-        state: "stale",
+        state: "unknown",
         remediation: "Run rea setup to refresh this registration.",
       },
     ];
@@ -349,7 +351,11 @@ describe("doctor scoped readiness", () => {
       expect.objectContaining({ name: "registration:codex", ok: true }),
     );
     expect(scoped.informational_checks).toContainEqual(
-      expect.objectContaining({ name: "registration:cursor", ok: false }),
+      expect.objectContaining({
+        name: "registration:cursor",
+        ok: false,
+        classification: "unknown",
+      }),
     );
 
     const staleSelected = await runDoctor(
@@ -358,6 +364,38 @@ describe("doctor scoped readiness", () => {
       { clients: ["cursor"] },
     );
     expect(staleSelected.healthy).toBe(false);
+  });
+
+  it("keeps a caller-selected short timeout healthy and reports its advisory as informational", async () => {
+    const result = await runDoctor(
+      undefined,
+      host({
+        clientRegistrations: () =>
+          Promise.resolve([
+            {
+              client: "kimi",
+              config_path: "/home/user/.kimi-code/mcp.json",
+              command: ["/current/rea", "mcp"],
+              state: "aligned",
+              remediation: null,
+              advisory: "The configured toolTimeoutMs is shorter than startup.",
+            },
+          ]),
+      }),
+      { clients: ["kimi"] },
+    );
+
+    expect(result.healthy).toBe(true);
+    expect(result.scope_checks).toContainEqual(
+      expect.objectContaining({ name: "registration:kimi", ok: true }),
+    );
+    expect(result.informational_checks).toContainEqual(
+      expect.objectContaining({
+        name: "registration_timeout:kimi",
+        ok: true,
+        detail: "The configured toolTimeoutMs is shorter than startup.",
+      }),
+    );
   });
 });
 
@@ -581,16 +619,46 @@ describe("doctor Linux and Hopper discovery", () => {
             hopperSetupSupported: true,
           }),
         executable: (candidate) => Promise.resolve(candidate === path),
-        supportedLinuxHopper: () => Promise.resolve(false),
+        inspectLinuxHopper: () =>
+          Promise.resolve(
+            err(
+              new HopperReleaseError(
+                "unsupported_hopper_build",
+                "Unverified fixture build",
+              ),
+            ),
+          ),
       }),
     );
     expect(
       result.checks.find(({ name }) => name === "hopper-version")?.remediation,
-    ).toContain("Unset or update HOPPER_LAUNCHER_PATH");
+    ).toContain("Check HOPPER_LAUNCHER_PATH");
   });
 });
 
 describe("doctor installed Hopper discovery", () => {
+  it("checks the canonical user install after the system launcher", async () => {
+    const userPath =
+      "/fixture/home/Applications/Hopper Disassembler.app/Contents/MacOS/hopper";
+    const checked: string[] = [];
+    const result = await runDoctor(
+      undefined,
+      host({
+        homeDirectory: "/fixture/home",
+        executable: (candidate) => {
+          checked.push(candidate);
+          return Promise.resolve(candidate === userPath);
+        },
+      }),
+    );
+
+    expect(result.hopperPath).toBe(userPath);
+    expect(checked.slice(0, 2)).toEqual([
+      "/Applications/Hopper Disassembler.app/Contents/MacOS/hopper",
+      userPath,
+    ]);
+  });
+
   it("detects a Homebrew cask installed outside /Applications", async () => {
     const path =
       "/opt/homebrew/Caskroom/hopper/Hopper Disassembler.app/Contents/MacOS/hopper";

@@ -5,9 +5,11 @@ import {
   nativeCalleesSchema,
   nativeXrefsSchema,
   nativeLiteralSearchPattern,
-  nativeStringsSchema,
 } from "./IdaNativeProtocol.js";
-import { analysisSearchInput } from "../contracts/analysisSearchContract.js";
+import {
+  analysisSearchPredicate,
+  analysisSearchQuerySchema,
+} from "../domain/analysisSearch.js";
 import {
   AnalysisInputError,
   AnalysisCancelledError,
@@ -32,6 +34,7 @@ import {
   disassemblySchema,
   idaAddressSchema,
   idaFunctionSchema,
+  idaStringsPageSchema,
   legacyCalleesSchema,
   legacyPageSchema,
   legacyStringSchema,
@@ -42,7 +45,6 @@ import {
   modernLookupSchema,
   modernLookupBatchSchema,
   modernPageSchema,
-  modernStringsSchema,
   modernXrefsSchema,
   nextOffset,
   surveySegmentsSchema,
@@ -82,7 +84,6 @@ const MISSING_PROCEDURE_ANSWERS: ReadonlySet<string> = new Set([
 ]);
 const lines = (asm: IdaDisassembly) =>
   asm.lines.map(({ address, instruction }) => `${address}: ${instruction}`);
-const searchQuerySchema = z.object(analysisSearchInput);
 
 /** Translate explicit analyst questions into a closed set of read-only upstream requests. */
 export class IdaOperationRunner {
@@ -319,9 +320,7 @@ export class IdaOperationRunner {
         }
         offset = page.next_offset;
       } else {
-        const page = (
-          this.protocol === "native" ? nativeStringsSchema : modernStringsSchema
-        ).parse(
+        const page = idaStringsPageSchema.parse(
           await this.call("find_regex", {
             pattern:
               this.protocol === "native"
@@ -331,6 +330,10 @@ export class IdaOperationRunner {
             limit: 100,
           }),
         );
+        if (page.error !== undefined && page.error !== null)
+          throw new AnalysisProtocolError(
+            `${this.protocol === "native" ? "Native IDA" : "IDA"} string search failed: ${page.error}`,
+          );
         result.push(
           ...page.matches.map((s) => ({ address: s.addr, value: s.string })),
         );
@@ -581,10 +584,10 @@ export class IdaOperationRunner {
   ): Promise<JsonValue> {
     const query =
       operation === "search_procedures" || operation === "search_strings"
-        ? searchQuerySchema.parse(parameters)
+        ? analysisSearchQuerySchema.parse(parameters)
         : undefined;
     const matches =
-      query === undefined ? undefined : this.searchPredicate(query);
+      query === undefined ? undefined : analysisSearchPredicate(query);
     if (operation === "list_procedures" || operation === "search_procedures") {
       const items = (await this.functions()).map((fn) => ({
         address: fn.address,
@@ -658,30 +661,6 @@ export class IdaOperationRunner {
       case "analyze_function":
         return this.dossier(fn);
     }
-  }
-
-  private searchPredicate(
-    query: z.infer<typeof searchQuerySchema>,
-  ): (value: string) => boolean {
-    let matches: (value: string) => boolean;
-    if (query.mode === "regex") {
-      try {
-        const regex = new RegExp(
-          query.pattern,
-          query.case_sensitive ? "u" : "iu",
-        );
-        matches = (value) => regex.test(value);
-      } catch (cause: unknown) {
-        throw new AnalysisInputError("search", { cause });
-      }
-    } else {
-      const needle = query.case_sensitive
-        ? query.pattern
-        : query.pattern.toLowerCase();
-      matches = (value) =>
-        (query.case_sensitive ? value : value.toLowerCase()).includes(needle);
-    }
-    return matches;
   }
 
   private async dossier(fn: IdaFunction): Promise<JsonValue> {

@@ -4,9 +4,10 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { buildBinary } from "plist";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { analyzeInterfaceBuilderBundle } from "../../../src/artifacts/apple/InterfaceBuilderAnalysis.js";
+import { InterfaceBuilderDecodeBudget } from "../../../src/artifacts/apple/InterfaceBuilderDecodeBudget.js";
 import { encodeNibArchiveFixture } from "../../../src/artifacts/apple/NibArchive.fixture.js";
 import { thinMach } from "../../../src/domain/binaryTarget.fixture.js";
 import { xcodeIbtoolAvailable } from "../../fixtures/ibtool.js";
@@ -907,6 +908,57 @@ describe("aggregate Interface Builder archive retention budget", () => {
   });
 });
 
+describe("Interface Builder XML plist depth", () => {
+  it("bounds XML archives by plist value depth, not element depth", async () => {
+    const root = await createTestTempDirectory("rea-ib-depth-test-");
+    const bundle = join(root, "Example.app");
+    const resources = join(bundle, "Contents", "Resources");
+    await mkdir(resources, { recursive: true });
+    // The root dict is value depth 0, so the leaf sits at `nested + 1`. The
+    // plist envelope and keys add XML elements but not value depth.
+    const document = (nested: number) =>
+      `<?xml version="1.0"?><plist version="1.0"><dict>${"<key>child</key><dict>".repeat(nested)}<key>leaf</key><integer>1</integer>${"</dict>".repeat(nested)}</dict></plist>`;
+    await writeFile(join(resources, "AtLimit.nib"), document(127));
+    await writeFile(join(resources, "BeyondLimit.nib"), document(128));
+
+    const release = vi.spyOn(InterfaceBuilderDecodeBudget.prototype, "release");
+    const result = await analyzeInterfaceBuilderBundle({
+      bundlePath: bundle,
+      targetSha256: "e".repeat(64),
+    });
+    const released = release.mock.calls.map(([bytes]) => bytes);
+    release.mockRestore();
+
+    // The rejected archive returns its reservation to later documents.
+    expect(released).toHaveLength(1);
+    expect(released[0]).toBeGreaterThan(0);
+    expect(result.documents.map(({ relative_path }) => relative_path)).toEqual([
+      "Contents/Resources/AtLimit.nib",
+    ]);
+    expect(result.graph.coverage).toContainEqual(
+      expect.objectContaining({
+        facet: "archive_decode",
+        status: "partial",
+        reason: "aggregate_decode_budget_exhausted",
+        examined: 2,
+        omitted: 1,
+      }),
+    );
+    expect(result.limitations).toContain(
+      "Contents/Resources/BeyondLimit.nib: omitted because aggregate decode budget exhausted.",
+    );
+  });
+
+  it("restores released representation bytes up to the initial budget", () => {
+    const budget = new InterfaceBuilderDecodeBudget(100);
+    budget.reserve(60, "reserve");
+    budget.release(60);
+    expect(budget.remainingBytes).toBe(100);
+    budget.release(10);
+    expect(budget.remainingBytes).toBe(100);
+  });
+});
+
 describe("bounded Interface Builder archive decoding", () => {
   it("counts malformed archives against the document limit", async () => {
     const root = await createTestTempDirectory("rea-ib-test-");
@@ -958,6 +1010,33 @@ describe("bounded Interface Builder archive decoding", () => {
     expect(result.graph.truncated).toBe(true);
     expect(result.limitations).toContain(
       "Contents/Resources/Prototype.nib: 1 dictionary entry keyed __proto__ was omitted because REA results cannot represent that key.",
+    );
+  });
+
+  it("decodes an archive whose date the decoder cannot represent", async () => {
+    const root = await createTestTempDirectory("rea-ib-test-");
+    const bundle = join(root, "Example.app");
+    const resources = join(bundle, "Contents", "Resources");
+    await mkdir(resources, { recursive: true });
+    // plutil writes years past 9999 unsigned, which the decoder rejects.
+    await writeFile(
+      join(resources, "Far.nib"),
+      '<?xml version="1.0"?><plist version="1.0"><dict><key>$archiver</key><string>NSKeyedArchiver</string><key>$objects</key><array><string>$null</string><date>11507-08-17T05:20:00Z</date></array><key>$top</key><dict/></dict></plist>',
+    );
+
+    const result = await analyzeInterfaceBuilderBundle({
+      bundlePath: bundle,
+      targetSha256: "f".repeat(64),
+    });
+
+    expect(result.documents).toHaveLength(1);
+    expect(result.limitations).toContainEqual(
+      expect.stringMatching(
+        /^Contents\/Resources\/Far\.nib: 1 date value\(s\)/u,
+      ),
+    );
+    expect(result.limitations).not.toContainEqual(
+      expect.stringContaining("could not be decoded"),
     );
   });
 

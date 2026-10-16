@@ -2,6 +2,8 @@ import { isDeepStrictEqual } from "node:util";
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { PACKET_ARTIFACTS } from "./packet-entry.mjs";
+import { SIGNAL_ARTIFACTS } from "./signal-entry.mjs";
 
 const { values } = parseArgs({
   options: {
@@ -33,6 +35,10 @@ const sameSettings = [
   "provider_environment_policy_sha256",
   "measure_source_sha256",
   "native_workflow_source_sha256",
+  "packet_workflow_source_sha256",
+  "packet_oracle_source_sha256",
+  "signal_workflow_source_sha256",
+  "signal_oracle_source_sha256",
   "package_lock_sha256",
   "node_version",
   "sdk_client_version",
@@ -70,12 +76,14 @@ for (const [side, answer] of [
       value: answer.evidence_ids,
     });
 }
-// PCAP delivery observations preserve each actual receipt's identity, limitations
+// Recording delivery observations preserve each actual receipt's identity, limitations
 // and view coverage. Summary/page scopes differ from complete source scope;
 // retain them separately rather than equating page exhaustion with capture
 // coverage. Repeated equivalent deliveries must also match every observation
 // field except the receipt and parent IDs, which identify their own invocations.
 if (
+  Object.hasOwn(PACKET_ARTIFACTS, left.artifact) ||
+  Object.hasOwn(SIGNAL_ARTIFACTS, left.artifact) ||
   ["wireshark-http.cap", "wireshark-http_redirects.pcapng"].includes(
     left.artifact,
   )
@@ -88,13 +96,19 @@ if (
       !Array.isArray(answer.delivery_observations) ||
       !answer.delivery_observations.length
     )
-      throw new Error("Missing original PCAP delivery observations");
+      throw new Error("Missing original recording delivery observations");
     runSpecific.push({
       side,
       path: ["delivery_observations"],
       value: answer.delivery_observations,
     });
-    if (left.delivery === right.delivery) {
+    if (
+      left.delivery === right.delivery &&
+      (!Object.hasOwn(PACKET_ARTIFACTS, left.artifact) ||
+        left.packet_selection === right.packet_selection) &&
+      (!Object.hasOwn(SIGNAL_ARTIFACTS, left.artifact) ||
+        left.signal_selection === right.signal_selection)
+    ) {
       answer.delivery_observations = answer.delivery_observations.map(
         (observation) =>
           Object.fromEntries(

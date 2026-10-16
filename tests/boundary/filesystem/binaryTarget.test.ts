@@ -31,6 +31,26 @@ import { parseExecutableHeader } from "../../../src/domain/binaryTarget.js";
 import { createEvidence, parseEvidence } from "../../../src/domain/evidence.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
+it.each([0x01c0, 0x01c2, 0x01c4, 0xaa64])(
+  "retains original PE COFF machine %i through file-backed target resolution",
+  async (peMachine) => {
+    const directory = await createTestTempDirectory("rea-pe-machine-");
+    const path = join(directory, "image.exe");
+    const bytes = pe(peMachine === 0xaa64 ? 0xaa64 : 0x01c0);
+    bytes.writeUInt16LE(peMachine, bytes.readUInt32LE(0x3c) + 4);
+    await writeFile(path, bytes);
+    const target = await parseBinaryTarget(path);
+    expect(target).toMatchObject({
+      ok: true,
+      value: {
+        format: "pe",
+        architecture: peMachine === 0xaa64 ? "arm64" : "arm",
+        peMachine,
+      },
+    });
+  },
+);
+
 it.each([{ cpus: [0x0100000c] }, { cpus: [0x01000007, 0x0100000c] }])(
   "preserves a FAT container's format in the resolved target and Evidence ($cpus)",
   async ({ cpus }) => {
@@ -409,7 +429,9 @@ describe("binary target I/O: filesystem and app bundle target resolution", () =>
       ).ok,
     ).toBe(false);
   });
+});
 
+describe("app bundle canonical containment", () => {
   it.skipIf(process.platform === "win32")(
     "rejects an app program symlink that leaves the bundle",
     async () => {
@@ -433,6 +455,68 @@ describe("binary target I/O: filesystem and app bundle target resolution", () =>
           })
         ).ok,
       ).toBe(false);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "rejects a Contents/MacOS directory symlink that leaves the bundle",
+    async () => {
+      const directory = await createTestTempDirectory("rea-target-");
+      const app = join(directory, "Escaping.app");
+      const contents = join(app, "Contents");
+      const programs = join(contents, "MacOS");
+      const outside = join(directory, "outside");
+      await mkdir(contents, { recursive: true });
+      await mkdir(outside);
+      await writeFile(
+        join(contents, "Info.plist"),
+        "<plist><dict><key>CFBundleExecutable</key><string>Escaping</string></dict></plist>",
+      );
+      await writeFile(
+        join(outside, "Escaping"),
+        thinMach(0xfeedfacf, 0x0100000c),
+      );
+      await symlink(outside, programs, "dir");
+
+      const result = await parseBinaryTarget(app, {
+        cwd: directory,
+        hostArchitecture: "arm64",
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          path: app,
+          reason: "app program directory leaves Contents/MacOS",
+        },
+      });
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "allows bundle and program directory aliases within the canonical bundle",
+    async () => {
+      const directory = await createTestTempDirectory("rea-target-");
+      const app = join(directory, "Canonical.app");
+      const alias = join(directory, "Alias.app");
+      const contents = join(app, "Contents");
+      const programs = join(contents, "Programs");
+      const executable = join(programs, "Example");
+      await mkdir(programs, { recursive: true });
+      await writeFile(executable, thinMach(0xfeedfacf, 0x0100000c));
+      await writeFile(
+        join(contents, "Info.plist"),
+        "<plist><dict><key>CFBundleExecutable</key><string>Example</string></dict></plist>",
+      );
+      await symlink(programs, join(contents, "MacOS"), "dir");
+      await symlink(app, alias, "dir");
+      const result = await parseBinaryTarget(alias, {
+        cwd: directory,
+        hostArchitecture: "arm64",
+      });
+      expect(result).toMatchObject({
+        ok: true,
+        value: { path: await realpath(executable), format: "mach-o" },
+      });
     },
   );
 });
