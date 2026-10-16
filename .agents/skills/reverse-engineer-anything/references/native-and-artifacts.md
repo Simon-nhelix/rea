@@ -326,7 +326,13 @@ analysis, and code cave discovery:
   regions to automatically discover candidate 16/24/32-bit string pointer tables
   with entry counts, unique target counts, string byte-width triage statistics
   (`min_string_bytes`, `max_string_bytes`, `avg_string_bytes`), and decoded
-  samples.
+  samples. Overlay-relative offsets: `segment_start`/`segment_length` (CLI
+  `--segment <start>:<length>`) or `segment_align` + `segment_length` (every
+  aligned start, reported per table); `target_after_terminator` keeps sentence
+  starts only; `coverage` reports whether a table covers its string region and
+  `min_coverage` filters on it; `truncated`/`next_start_offset` page large
+  scans. See
+  [console localization](https://github.com/morluto/rea/blob/main/docs/console-localization.md#overlay-relative-pointer-tables).
 - `scan_pointer_table` (CLI `rea scan-pointer-table <path> [address]`): decode a
   pointer table by virtual `address` or ROM file `table_offset` (including
   automatic bank-local 16-bit pointer resolution for `snes`, `gb`, `nes`, and
@@ -336,7 +342,8 @@ analysis, and code cave discovery:
   than `count` with `start_index` (entry and manuscript indexes stay global),
   and use `manuscript_only: true` to suppress `entries` when only the
   manuscript is needed; shared targets collapse into one record with
-  `also_referenced_by`.
+  `also_referenced_by`. `segment_start`/`segment_length` read values as
+  offsets from an overlay segment, and local results report `coverage`.
 - `find_code_caves` (CLI `rea find-code-caves <path>`): find contiguous padding
   regions (`0x00` / `0xFF` or `fill_byte`) sorted largest-first for VWF font
   hooks, expanded 2-byte glyph tables, and relocated dialogue blocks.

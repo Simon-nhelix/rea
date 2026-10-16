@@ -46,6 +46,15 @@ import {
 } from "../../domain/romHacking.js";
 import type { RomTextFilters } from "../../domain/romTextQuality.js";
 import {
+  isTerminatorAt,
+  markSentenceStarts,
+  measurePointerTableCoverage,
+  readPointerNumber,
+  type PointerBase,
+  type PointerTableCoverage,
+  type RomTerminatorUnit,
+} from "../../domain/romPointerSegments.js";
+import {
   isLocalByteSource,
   locateLocalByteOffset,
   type LocalByteSource,
@@ -392,6 +401,88 @@ const decodeWindowTruncated = (
   byteLength >= buf.length &&
   byteLength > 0 &&
   !(terminatorByte !== null && buf[byteLength - 1] === terminatorByte);
+
+/** The unit that ends a string in this request's encoding, if there is one. */
+const resolveTerminatorUnit = (
+  encoding: RomTextEncoding,
+  terminatorByte: number | null,
+  words: RomWordFormat | undefined,
+): RomTerminatorUnit | undefined => {
+  if (words !== undefined)
+    return words.terminatorWord === null
+      ? undefined
+      : {
+          size: 2,
+          value: words.terminatorWord,
+          littleEndian: words.littleEndian,
+        };
+  if (terminatorByte === null) return undefined;
+  const canonical = normalizeRomTextEncoding(encoding);
+  if (canonical === "utf-16le" || canonical === "utf-16be")
+    return {
+      size: 2,
+      value: terminatorByte * 0x101,
+      littleEndian: canonical === "utf-16le",
+    };
+  return { size: 1, value: terminatorByte };
+};
+
+/**
+ * Validate how raw pointer values become file offsets. Segment fields select
+ * segment mode unless base_mode says otherwise; segment pointers are offsets
+ * from the segment start, so base_address must stay 0.
+ */
+const resolvePointerBase = (
+  operation: string,
+  input: {
+    readonly base_mode?: "address" | "segment" | undefined;
+    readonly segment_start?: number | undefined;
+    readonly segment_length?: number | undefined;
+    readonly segment_align?: number | undefined;
+  },
+  baseAddress: bigint,
+): Result<PointerBase, AnalysisError> => {
+  const fail = (userMessage: string) =>
+    err(new AnalysisInputError(operation, { userMessage }));
+  const hasSegment =
+    input.segment_start !== undefined ||
+    input.segment_length !== undefined ||
+    input.segment_align !== undefined;
+  const mode = input.base_mode ?? (hasSegment ? "segment" : "address");
+  if (mode === "address") {
+    return hasSegment
+      ? fail(
+          "segment_start, segment_length and segment_align apply only to base_mode segment.",
+        )
+      : ok({ mode: "address" });
+  }
+  if (baseAddress !== 0n)
+    return fail(
+      "base_address applies only to base_mode address; segment pointers are offsets from the segment start.",
+    );
+  if (input.segment_length === undefined)
+    return fail("base_mode segment needs segment_length.");
+  if (input.segment_start !== undefined && input.segment_align !== undefined)
+    return fail("Use segment_start or segment_align, not both.");
+  if (input.segment_start !== undefined)
+    return ok({
+      mode: "segment",
+      start: input.segment_start,
+      length: input.segment_length,
+    });
+  if (input.segment_align !== undefined)
+    return ok({
+      mode: "segment",
+      align: input.segment_align,
+      length: input.segment_length,
+    });
+  return fail(
+    "base_mode segment needs segment_start (one segment) or segment_align (every aligned segment start).",
+  );
+};
+
+const SEGMENT_NEEDS_LOCAL_BYTES =
+  "base_mode segment reads pointer targets as file offsets and needs local file bytes (a console ROM, raw binary, or data file).";
 
 /** Manuscript strings are decoded to their terminator within this bound. */
 const MANUSCRIPT_MAX_BYTES = 4096;
@@ -1288,6 +1379,17 @@ export const executeScanPointerTable = async (
       }),
     );
   }
+  const pointerBaseResult = resolvePointerBase(
+    "scan_pointer_table",
+    input,
+    baseAddrResult.value,
+  );
+  if (!pointerBaseResult.ok) return pointerBaseResult;
+  const pointerBase = pointerBaseResult.value;
+  const segment =
+    pointerBase.mode === "segment" && "start" in pointerBase
+      ? pointerBase
+      : undefined;
 
   const tableResult = await loadCustomTable(
     "scan_pointer_table",
@@ -1306,6 +1408,12 @@ export const executeScanPointerTable = async (
   if (!wordsResult.ok) return wordsResult;
   const words = wordsResult.value;
   const localRom = await loadLocalRomContext(target);
+  if (segment !== undefined && localRom === undefined)
+    return err(
+      new AnalysisInputError("scan_pointer_table", {
+        userMessage: SEGMENT_NEEDS_LOCAL_BYTES,
+      }),
+    );
 
   const totalBytesToRead = input.count * stride;
   const pointerWidth = input.pointer_size;
@@ -1374,13 +1482,30 @@ export const executeScanPointerTable = async (
           pointerWidth,
           endian,
         );
-        const targetAddrBigInt = baseAddrResult.value + rawValue;
-        const targetAddress = `0x${targetAddrBigInt.toString(16)}`;
         const rawPointer = `0x${rawValue.toString(16).padStart(pointerWidth * 2, "0")}`;
-        const targetFileOffset = localRom.toFileOffset(
-          targetAddrBigInt,
-          entryFileOffset,
-        );
+        let targetAddress: string;
+        let targetFileOffset: number | null;
+        if (segment === undefined) {
+          const targetAddrBigInt = baseAddrResult.value + rawValue;
+          targetAddress = `0x${targetAddrBigInt.toString(16)}`;
+          targetFileOffset = localRom.toFileOffset(
+            targetAddrBigInt,
+            entryFileOffset,
+          );
+        } else {
+          // Values at or past the segment length point outside the segment.
+          const segmentOffset = segment.start + Number(rawValue);
+          targetFileOffset =
+            rawValue < BigInt(segment.length) &&
+            segmentOffset < localRom.romBytes.length
+              ? segmentOffset
+              : null;
+          targetAddress =
+            (targetFileOffset === null
+              ? null
+              : localRom.toVirtualAddress(targetFileOffset)) ??
+            `0x${segmentOffset.toString(16)}`;
+        }
 
         let previewText: string | null = null;
         let previewTruncated = false;
@@ -1519,12 +1644,33 @@ export const executeScanPointerTable = async (
           )
         : undefined;
 
+      const unit = resolveTerminatorUnit(input.encoding, terminatorByte, words);
+      const coverage =
+        unit === undefined
+          ? null
+          : measurePointerTableCoverage({
+              bytes: localRom.romBytes,
+              unit,
+              targets: enrichedEntries.flatMap((entry) =>
+                entry.target_file_offset === null
+                  ? []
+                  : [entry.target_file_offset],
+              ),
+              tableEnd:
+                tableFileOffset +
+                (input.start_index + enrichedEntries.length) * stride,
+            });
+
       return ok({
         table_address: `0x${tableAddrBigInt.toString(16)}`,
         table_file_offset: tableFileOffset,
         pointer_size: pointerWidth,
         endian,
         base_address: `0x${baseAddrResult.value.toString(16)}`,
+        base_mode: pointerBase.mode,
+        ...(segment === undefined
+          ? {}
+          : { segment_start: segment.start, segment_length: segment.length }),
         stride,
         encoding: input.encoding,
         entries: input.manuscript_only ? [] : enrichedEntries,
@@ -1534,10 +1680,19 @@ export const executeScanPointerTable = async (
         ...(manuscriptRecords === undefined
           ? {}
           : { manuscript_records: manuscriptRecords }),
+        coverage,
         ...sourceField(localRom),
       });
     }
   }
+
+  if (segment !== undefined)
+    return err(
+      new AnalysisInputError("scan_pointer_table", {
+        userMessage:
+          "The pointer table does not map to a file offset inside this file.",
+      }),
+    );
 
   const addressStr =
     input.address ?? `0x${(input.table_offset ?? 0).toString(16)}`;
@@ -1852,6 +2007,13 @@ export const executeDiscoverPointerTables = async (
       }),
     );
   }
+  const pointerBaseResult = resolvePointerBase(
+    "discover_pointer_tables",
+    input,
+    baseAddrResult.value,
+  );
+  if (!pointerBaseResult.ok) return pointerBaseResult;
+  const pointerBase = pointerBaseResult.value;
 
   const tableResult = await loadCustomTable(
     "discover_pointer_tables",
@@ -1869,7 +2031,31 @@ export const executeDiscoverPointerTables = async (
   );
   if (!wordsResult.ok) return wordsResult;
   const words = wordsResult.value;
+  const unit = resolveTerminatorUnit(input.encoding, terminatorByte, words);
+  if (input.target_after_terminator && unit === undefined)
+    return err(
+      new AnalysisInputError("discover_pointer_tables", {
+        userMessage:
+          "target_after_terminator needs a terminator: terminator_byte, or terminator_word for word encodings.",
+      }),
+    );
   const localRom = await loadLocalRomContext(target);
+  if (pointerBase.mode === "segment" && localRom === undefined)
+    return err(
+      new AnalysisInputError("discover_pointer_tables", {
+        userMessage: SEGMENT_NEEDS_LOCAL_BYTES,
+      }),
+    );
+  if (
+    input.min_coverage !== undefined &&
+    (localRom === undefined || unit === undefined)
+  )
+    return err(
+      new AnalysisInputError("discover_pointer_tables", {
+        userMessage:
+          "min_coverage needs local file bytes and a terminator (terminator_byte, or terminator_word for word encodings).",
+      }),
+    );
 
   let romBuffer: Uint8Array;
   let scanStartOffset = 0;
@@ -1879,29 +2065,44 @@ export const executeDiscoverPointerTables = async (
 
   if (localRom !== undefined) {
     romBuffer = localRom.romBytes;
-    if (input.start_offset !== undefined) {
-      scanStartOffset = Math.min(input.start_offset, romBuffer.length);
-    } else if (input.start_address !== undefined) {
-      const parsedStart = parseHexAddressBigInt(
-        "discover_pointer_tables",
-        "start_address",
-        input.start_address,
+    if (
+      pointerBase.mode === "segment" &&
+      "start" in pointerBase &&
+      input.start_offset === undefined &&
+      input.start_address === undefined &&
+      input.end_offset === undefined
+    ) {
+      // One segment and no explicit range: scan the segment itself.
+      scanStartOffset = Math.min(pointerBase.start, romBuffer.length);
+      scanEndOffset = Math.min(
+        romBuffer.length,
+        pointerBase.start + pointerBase.length,
       );
-      if (!parsedStart.ok) return parsedStart;
-      const resolved = localRom.toFileOffset(parsedStart.value);
-      if (resolved === null) {
-        return err(
-          new AnalysisInputError("discover_pointer_tables", {
-            userMessage: `start_address ${input.start_address} does not map to a file offset in this ROM.`,
-          }),
+    } else {
+      if (input.start_offset !== undefined) {
+        scanStartOffset = Math.min(input.start_offset, romBuffer.length);
+      } else if (input.start_address !== undefined) {
+        const parsedStart = parseHexAddressBigInt(
+          "discover_pointer_tables",
+          "start_address",
+          input.start_address,
         );
+        if (!parsedStart.ok) return parsedStart;
+        const resolved = localRom.toFileOffset(parsedStart.value);
+        if (resolved === null) {
+          return err(
+            new AnalysisInputError("discover_pointer_tables", {
+              userMessage: `start_address ${input.start_address} does not map to a file offset in this ROM.`,
+            }),
+          );
+        }
+        scanStartOffset = Math.min(resolved, romBuffer.length);
       }
-      scanStartOffset = Math.min(resolved, romBuffer.length);
+      scanEndOffset =
+        input.end_offset !== undefined
+          ? Math.min(input.end_offset, romBuffer.length)
+          : Math.min(romBuffer.length, scanStartOffset + input.length);
     }
-    scanEndOffset =
-      input.end_offset !== undefined
-        ? Math.min(input.end_offset, romBuffer.length)
-        : Math.min(romBuffer.length, scanStartOffset + input.length);
     toFileOffset = localRom.toFileOffset;
     toVirtualAddress = localRom.toVirtualAddress;
   } else {
@@ -1956,6 +2157,8 @@ export const executeDiscoverPointerTables = async (
       readonly byteLength: number;
     }
   >();
+  // With target_after_terminator, targets are sentence starts, empty ones included.
+  const sentenceUnit = input.target_after_terminator ? unit : undefined;
 
   const checkTargetOffset = (
     targetFileOffset: number,
@@ -1970,6 +2173,15 @@ export const executeDiscoverPointerTables = async (
       const invalid = { valid: false, text: "", byteLength: 0 };
       targetCache.set(targetFileOffset, invalid);
       return invalid;
+    }
+    if (
+      sentenceUnit !== undefined &&
+      isTerminatorAt(romBuffer, targetFileOffset, sentenceUnit)
+    ) {
+      // An empty placeholder string; sentenceKind already placed it.
+      const empty = { valid: true, text: "", byteLength: sentenceUnit.size };
+      targetCache.set(targetFileOffset, empty);
+      return empty;
     }
     const res = isLikelyValidDecodedTarget(
       romBuffer.subarray(
@@ -1986,6 +2198,314 @@ export const executeDiscoverPointerTables = async (
     return res;
   };
 
+  // Sentence starts: offsets right after a terminator (target_after_terminator).
+  const sentenceStarts =
+    sentenceUnit === undefined
+      ? undefined
+      : markSentenceStarts(romBuffer, sentenceUnit);
+  const segmentLength = pointerBase.mode === "segment" ? pointerBase.length : 0;
+  // All-ones values end a table like 0 does (e.g. FFFF list ends).
+  const endMarker = 256 ** pointerWidth - 1;
+
+  /** Target file offset of one entry, or null when the value cannot point at text. */
+  const entryTarget = (
+    entryOffset: number,
+    segmentStart: number | null,
+  ): number | null => {
+    if (segmentStart === null) {
+      const rawVal = readPointerValue(
+        romBuffer,
+        entryOffset,
+        pointerWidth,
+        endian,
+      );
+      if (rawVal === 0n) return null;
+      return toFileOffset(baseAddrResult.value + rawVal, entryOffset);
+    }
+    const raw = readPointerNumber(romBuffer, entryOffset, pointerWidth, endian);
+    if (raw === 0 || raw === endMarker || raw >= segmentLength) return null;
+    const fileOffset = segmentStart + raw;
+    return fileOffset < romBuffer.length ? fileOffset : null;
+  };
+
+  /**
+   * 0: not a sentence start. 1: after a terminator, or the segment start.
+   * 2: may be the first string after the table, which follows the last entry
+   * instead of a terminator; every such entry must then point exactly where
+   * the table ends.
+   */
+  const sentenceKind = (
+    targetOffset: number,
+    entryOffset: number,
+    tableStart: number,
+    segmentStart: number | null,
+    tableEnd: number | null,
+  ): 0 | 1 | 2 => {
+    if (sentenceStarts === undefined) return 1;
+    if (sentenceStarts[targetOffset] !== 0 || targetOffset === segmentStart)
+      return 1;
+    if (
+      targetOffset > entryOffset &&
+      (targetOffset - tableStart) % stride === 0 &&
+      (tableEnd === null || tableEnd === targetOffset)
+    )
+      return 2;
+    return 0;
+  };
+
+  type RunEntry = {
+    readonly entryFileOffset: number;
+    readonly targetFileOffset: number;
+    readonly targetAddress: string;
+    readonly text: string;
+    readonly byteLength: number;
+  };
+
+  const MAX_TABLE_ENTRIES = 512;
+  const probeTargets = new Float64Array(MAX_TABLE_ENTRIES);
+  // Per (segment start, entry residue): starts below this offset are known to
+  // fail, because a later start of the same residue only sees a suffix of a
+  // run that was already rejected.
+  const deadUntil = new Map<number, number>();
+
+  /** Distinct targets in probeTargets[from, to) that are not empty strings. */
+  const distinctTextTargets = (from: number, to: number): number => {
+    const seen = new Set<number>();
+    for (let i = from; i < to && seen.size < 2; i++) {
+      const targetOffset = probeTargets[i]!;
+      if (
+        sentenceUnit === undefined ||
+        !isTerminatorAt(romBuffer, targetOffset, sentenceUnit)
+      )
+        seen.add(targetOffset);
+    }
+    return seen.size;
+  };
+
+  /**
+   * Run of valid entries from tableStart when it is a table (at least
+   * min_entries entries and two distinct targets); cheap checks first, then
+   * decoding.
+   */
+  const probeRun = (
+    tableStart: number,
+    segmentStart: number | null,
+  ): RunEntry[] | undefined => {
+    const residue = tableStart % stride;
+    const deadKey =
+      segmentStart === null ? -1 - residue : segmentStart * stride + residue;
+    if ((deadUntil.get(deadKey) ?? -1) > tableStart) return undefined;
+    let count = 0;
+    let tableEnd: number | null = null;
+    let firstAfterTable = -1;
+    let lastAfterTable = -1;
+    let probeOffset = tableStart;
+    while (
+      probeOffset + pointerWidth <= scanEndOffset &&
+      count < MAX_TABLE_ENTRIES &&
+      (tableEnd === null || probeOffset < tableEnd)
+    ) {
+      const targetOffset = entryTarget(probeOffset, segmentStart);
+      if (targetOffset === null) break;
+      const kind = sentenceKind(
+        targetOffset,
+        probeOffset,
+        tableStart,
+        segmentStart,
+        tableEnd,
+      );
+      if (kind === 0) break;
+      if (kind === 2) {
+        tableEnd = targetOffset;
+        if (firstAfterTable === -1) firstAfterTable = count;
+        lastAfterTable = count;
+      }
+      probeTargets[count++] = targetOffset;
+      probeOffset += stride;
+    }
+    // Phase 2: decode targets; then the table must end where its first
+    // after-table string begins.
+    let length = 0;
+    let decodedTo = count;
+    let cutAtTableEnd = false;
+    if (count >= input.min_entries) {
+      while (length < count && checkTargetOffset(probeTargets[length]!).valid)
+        length++;
+      decodedTo = length;
+      if (tableEnd !== null && tableStart + length * stride !== tableEnd) {
+        length = Math.min(length, firstAfterTable);
+        cutAtTableEnd = true;
+      }
+    }
+    if (length >= input.min_entries && distinctTextTargets(0, length) >= 2) {
+      deadUntil.delete(deadKey);
+    } else {
+      // A later start k entries on (same residue) sees probes[k..] while it
+      // keeps the last after-table entry, so it is rejected whenever its
+      // entries are a subset of rejected ones. A capped run may grow.
+      let deadEntries = 1;
+      if (count < MAX_TABLE_ENTRIES) {
+        const sameProbes = lastAfterTable === -1 ? count : lastAfterTable + 1;
+        if (count < input.min_entries || distinctTextTargets(0, count) < 2)
+          deadEntries = sameProbes;
+        else
+          deadEntries = Math.min(
+            sameProbes,
+            decodedTo + 1,
+            cutAtTableEnd ? firstAfterTable + 1 : count,
+          );
+      }
+      deadUntil.set(deadKey, tableStart + Math.max(1, deadEntries) * stride);
+      return undefined;
+    }
+    const run: RunEntry[] = [];
+    for (let i = 0; i < length; i++) {
+      const targetOffset = probeTargets[i]!;
+      const checked = checkTargetOffset(targetOffset);
+      const entryFileOffset = tableStart + i * stride;
+      run.push({
+        entryFileOffset,
+        targetFileOffset: targetOffset,
+        targetAddress:
+          segmentStart === null
+            ? `0x${(baseAddrResult.value + readPointerValue(romBuffer, entryFileOffset, pointerWidth, endian)).toString(16)}`
+            : (toVirtualAddress(targetOffset) ??
+              `0x${targetOffset.toString(16)}`),
+        text: checked.text,
+        byteLength: checked.byteLength,
+      });
+    }
+    return run;
+  };
+
+  /** Cheap test of the first two entries against one segment start. */
+  const firstEntriesFit = (
+    tableStart: number,
+    segmentStart: number,
+    raw0: number,
+    raw1: number,
+  ): boolean => {
+    const target0 = segmentStart + raw0;
+    const target1 = segmentStart + raw1;
+    if (target0 >= romBuffer.length || target1 >= romBuffer.length)
+      return false;
+    const kind0 = sentenceKind(
+      target0,
+      tableStart,
+      tableStart,
+      segmentStart,
+      null,
+    );
+    if (kind0 === 0) return false;
+    const second = tableStart + stride;
+    if (kind0 === 2 && target0 <= second) return false;
+    return (
+      sentenceKind(
+        target1,
+        second,
+        tableStart,
+        segmentStart,
+        kind0 === 2 ? target0 : null,
+      ) !== 0
+    );
+  };
+
+  type FoundTable = {
+    readonly run: RunEntry[];
+    readonly segmentStart: number | null;
+    readonly coverage: PointerTableCoverage | null;
+  };
+
+  /** Coverage of an accepted run, and the min_coverage filter. */
+  const judgeRun = (
+    run: RunEntry[] | undefined,
+    tableStart: number,
+    segmentStart: number | null,
+  ): FoundTable | undefined => {
+    if (run === undefined) return undefined;
+    const coverage =
+      localRom === undefined || unit === undefined
+        ? null
+        : measurePointerTableCoverage({
+            bytes: romBuffer,
+            unit,
+            targets: run.map((e) => e.targetFileOffset),
+            tableEnd: tableStart + run.length * stride,
+          });
+    if (
+      input.min_coverage !== undefined &&
+      (coverage === null || coverage.ratio < input.min_coverage)
+    )
+      return undefined;
+    return { run, segmentStart, coverage };
+  };
+
+  /** Longest table at tableStart and the segment start it is relative to. */
+  const findRunAt = (tableStart: number): FoundTable | undefined => {
+    if (pointerBase.mode === "address")
+      return judgeRun(probeRun(tableStart, null), tableStart, null);
+    if ("start" in pointerBase)
+      return judgeRun(
+        probeRun(tableStart, pointerBase.start),
+        tableStart,
+        pointerBase.start,
+      );
+    // Every aligned start whose segment still contains the table.
+    const second = tableStart + stride;
+    if (second + pointerWidth > scanEndOffset) return undefined;
+    const raw0 = readPointerNumber(romBuffer, tableStart, pointerWidth, endian);
+    const raw1 = readPointerNumber(romBuffer, second, pointerWidth, endian);
+    if (
+      raw0 === 0 ||
+      raw1 === 0 ||
+      raw0 === endMarker ||
+      raw1 === endMarker ||
+      raw0 >= segmentLength ||
+      raw1 >= segmentLength
+    )
+      return undefined;
+    let best: FoundTable | undefined;
+    for (
+      let segmentStart = tableStart - (tableStart % pointerBase.align);
+      segmentStart >= 0 && tableStart - segmentStart < segmentLength;
+      segmentStart -= pointerBase.align
+    ) {
+      if (!firstEntriesFit(tableStart, segmentStart, raw0, raw1)) continue;
+      const found = judgeRun(
+        probeRun(tableStart, segmentStart),
+        tableStart,
+        segmentStart,
+      );
+      if (
+        found !== undefined &&
+        (best === undefined ||
+          found.run.length > best.run.length ||
+          (found.run.length === best.run.length &&
+            (found.coverage?.ratio ?? 0) > (best.coverage?.ratio ?? 0)))
+      )
+        best = found;
+    }
+    return best;
+  };
+
+  // Same pointer value repeated from an offset, per entry residue: a start
+  // with MAX_TABLE_ENTRIES identical entries ahead can only be rejected.
+  const identicalEnd: number[] = Array.from({ length: stride }, () => -1);
+  const identicalAhead = (offset: number): number => {
+    const residue = offset % stride;
+    if (identicalEnd[residue]! <= offset) {
+      const value = readPointerNumber(romBuffer, offset, pointerWidth, endian);
+      let end = offset + stride;
+      while (
+        end + pointerWidth <= scanEndOffset &&
+        readPointerNumber(romBuffer, end, pointerWidth, endian) === value
+      )
+        end += stride;
+      identicalEnd[residue] = end;
+    }
+    return (identicalEnd[residue]! - offset) / stride;
+  };
+
   const discoveredTables = [];
   const stepAlignment = pointerWidth === 4 ? 2 : 1;
   let cursor = scanStartOffset;
@@ -1994,49 +2514,16 @@ export const executeDiscoverPointerTables = async (
     cursor + input.min_entries * stride <= scanEndOffset &&
     discoveredTables.length < input.max_tables
   ) {
-    const runEntries: {
-      readonly entryFileOffset: number;
-      readonly entryAddress: string;
-      readonly targetAddress: string;
-      readonly targetFileOffset: number;
-      readonly text: string;
-      readonly byteLength: number;
-    }[] = [];
-
-    let probeOffset = cursor;
-    while (
-      probeOffset + pointerWidth <= scanEndOffset &&
-      runEntries.length < 512
-    ) {
-      const rawVal = readPointerValue(
-        romBuffer,
-        probeOffset,
-        pointerWidth,
-        endian,
-      );
-      if (rawVal === 0n) break;
-      const targetAddrBigInt = baseAddrResult.value + rawVal;
-      const targetFileOffset = toFileOffset(targetAddrBigInt, probeOffset);
-      if (targetFileOffset === null) break;
-      const checked = checkTargetOffset(targetFileOffset);
-      if (!checked.valid) break;
-      const entryAddress =
-        toVirtualAddress(probeOffset) ?? `0x${probeOffset.toString(16)}`;
-      runEntries.push({
-        entryFileOffset: probeOffset,
-        entryAddress,
-        targetAddress: `0x${targetAddrBigInt.toString(16)}`,
-        targetFileOffset,
-        text: checked.text,
-        byteLength: checked.byteLength,
-      });
-      probeOffset += stride;
-    }
-
-    const uniqueTargets = new Set(runEntries.map((e) => e.targetFileOffset))
-      .size;
-    if (runEntries.length >= input.min_entries && uniqueTargets >= 2) {
+    const found =
+      identicalAhead(cursor) >= MAX_TABLE_ENTRIES
+        ? undefined
+        : findRunAt(cursor);
+    if (found !== undefined) {
+      const { run: runEntries, segmentStart, coverage } = found;
+      const uniqueTargets = new Set(runEntries.map((e) => e.targetFileOffset))
+        .size;
       const tableFileOffset = cursor;
+      const tableEnd = cursor + runEntries.length * stride;
       const tableAddress =
         toVirtualAddress(tableFileOffset) ??
         `0x${tableFileOffset.toString(16)}`;
@@ -2058,7 +2545,9 @@ export const executeDiscoverPointerTables = async (
         .slice(0, input.sample_entries)
         .map((e, idx) => ({
           index: idx,
-          entry_address: e.entryAddress,
+          entry_address:
+            toVirtualAddress(e.entryFileOffset) ??
+            `0x${e.entryFileOffset.toString(16)}`,
           target_address: e.targetAddress,
           target_file_offset: e.targetFileOffset,
           preview_text: e.text,
@@ -2078,13 +2567,18 @@ export const executeDiscoverPointerTables = async (
         avg_string_bytes: avgBytes,
         table_xrefs: [] as string[],
         samples,
+        ...(segmentStart === null ? {} : { segment_start: segmentStart }),
+        coverage,
       });
-      cursor = probeOffset;
+      cursor = tableEnd;
       continue;
     }
 
     cursor += stepAlignment;
   }
+  const truncated =
+    discoveredTables.length >= input.max_tables &&
+    cursor + input.min_entries * stride <= scanEndOffset;
 
   const discoveredXrefs = await resolveXrefsBatched(
     analysis,
@@ -2105,8 +2599,28 @@ export const executeDiscoverPointerTables = async (
     base_address: `0x${baseAddrResult.value.toString(16)}`,
     stride,
     bytes_scanned: Math.max(0, scanEndOffset - scanStartOffset),
+    base_mode: pointerBase.mode,
+    ...(pointerBase.mode === "address"
+      ? {}
+      : "start" in pointerBase
+        ? {
+            segment_start: pointerBase.start,
+            segment_length: pointerBase.length,
+          }
+        : {
+            segment_align: pointerBase.align,
+            segment_length: pointerBase.length,
+          }),
+    ...(input.target_after_terminator ? { target_after_terminator: true } : {}),
+    ...(input.min_coverage === undefined
+      ? {}
+      : { min_coverage: input.min_coverage }),
     tables: discoveredTables,
     total_tables: discoveredTables.length,
+    truncated,
+    ...(truncated && localRom !== undefined
+      ? { next_start_offset: cursor }
+      : {}),
     ...sourceField(localRom),
   });
 };

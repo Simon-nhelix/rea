@@ -12,6 +12,7 @@ import {
   type RomTextFilters,
 } from "./romTextQuality.js";
 import { DATA_TRACK_MODES, type DataTrackMode } from "./discImage.js";
+import { pointerTableCoverageSchema } from "./romPointerSegments.js";
 
 /** Supported ROM text encodings for localization and string extraction. */
 export const ROM_TEXT_ENCODINGS = [
@@ -1516,6 +1517,34 @@ export const searchRomStringsResultSchema = z.strictObject({
   source: romByteSourceSchema.optional(),
 });
 
+/** How raw pointer values become file offsets (shared by the pointer tools). */
+export const POINTER_BASE_MODES = ["address", "segment"] as const;
+
+const pointerSegmentFields = {
+  base_mode: z
+    .enum(POINTER_BASE_MODES)
+    .optional()
+    .describe(
+      "How raw pointer values become file offsets: address = base_address + value through the target's address space; segment = segment start file offset + value (overlay-relative offsets). Defaults to segment when a segment field is set, otherwise address.",
+    ),
+  segment_start: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe(
+      "File offset of the segment (overlay block) the pointer values are relative to.",
+    ),
+  segment_length: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(
+      "Segment byte length; pointer values at or past it are invalid. Required with base_mode segment.",
+    ),
+};
+
 export const scanPointerTableInputSchema = z.strictObject({
   address: z
     .string()
@@ -1561,6 +1590,7 @@ export const scanPointerTableInputSchema = z.strictObject({
     .describe(
       "Base address added to each raw pointer value (e.g. 0x08000000 for 16-bit relative offsets).",
     ),
+  ...pointerSegmentFields,
   stride: z
     .number()
     .int()
@@ -1675,6 +1705,9 @@ export const scanPointerTableResultSchema = z.strictObject({
   pointer_size: z.union([z.literal(2), z.literal(3), z.literal(4)]),
   endian: z.enum(["little", "big"]),
   base_address: z.string(),
+  base_mode: z.enum(POINTER_BASE_MODES).optional(),
+  segment_start: z.number().int().min(0).optional(),
+  segment_length: z.number().int().min(1).optional(),
   stride: z.number().int().min(1),
   encoding: z.enum(ROM_TEXT_ENCODINGS),
   entries: z.array(pointerTableEntrySchema),
@@ -1682,6 +1715,8 @@ export const scanPointerTableResultSchema = z.strictObject({
   start_index: z.number().int().min(0).optional(),
   next_start_index: z.number().int().min(0).optional(),
   manuscript_records: z.array(manuscriptRecordSchema).optional(),
+  /** Whether the scanned entries cover their string region (local bytes with a terminator). */
+  coverage: pointerTableCoverageSchema.nullable().optional(),
   source: romByteSourceSchema.optional(),
 });
 
@@ -1783,6 +1818,29 @@ export const discoverPointerTablesInputSchema = z.strictObject({
     .max(64)
     .optional()
     .describe("Bytes per table entry; defaults to pointer_size."),
+  ...pointerSegmentFields,
+  segment_align: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(
+      "Try every multiple of this file offset as the segment start (e.g. 2048 for overlays loaded from disc sectors); each table must lie inside its segment and reports the start that fits. Use instead of segment_start.",
+    ),
+  target_after_terminator: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Accept only sentence starts as targets: the previous byte/word is the terminator, or the target is the segment start, or the string begins exactly where the table ends. Empty strings (a lone terminator) count; a table still needs two distinct non-empty targets.",
+    ),
+  min_coverage: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .describe(
+      "Keep only tables whose coverage ratio reaches this value (1 = every string start in the table's region is an entry target); needs a terminator. A rejected run does not hide a table that starts inside it.",
+    ),
   min_entries: z
     .number()
     .int()
@@ -1831,9 +1889,11 @@ export const discoverPointerTablesInputSchema = z.strictObject({
     .number()
     .int()
     .min(1)
-    .max(100)
+    .max(1000)
     .default(20)
-    .describe("Maximum number of candidate pointer tables to return."),
+    .describe(
+      "Maximum number of candidate pointer tables to return; truncated and next_start_offset report where to resume.",
+    ),
   sample_entries: z
     .number()
     .int()
@@ -1876,6 +1936,10 @@ export const discoveredPointerTableSchema = z.strictObject({
   avg_string_bytes: z.number().min(0),
   table_xrefs: z.array(z.string()),
   samples: z.array(discoveredPointerSampleSchema),
+  /** Segment start the entries are relative to (base_mode segment). */
+  segment_start: z.number().int().min(0).optional(),
+  /** Whether the table covers its string region (needs a terminator). */
+  coverage: pointerTableCoverageSchema.nullable().optional(),
 });
 
 export const discoverPointerTablesResultSchema = z.strictObject({
@@ -1885,8 +1949,18 @@ export const discoverPointerTablesResultSchema = z.strictObject({
   base_address: z.string(),
   stride: z.number().int().min(1),
   bytes_scanned: z.number().int().min(0),
+  base_mode: z.enum(POINTER_BASE_MODES).optional(),
+  segment_start: z.number().int().min(0).optional(),
+  segment_length: z.number().int().min(1).optional(),
+  segment_align: z.number().int().min(1).optional(),
+  target_after_terminator: z.boolean().optional(),
+  min_coverage: z.number().min(0).max(1).optional(),
   tables: z.array(discoveredPointerTableSchema),
   total_tables: z.number().int().min(0),
+  /** max_tables was reached before the end of the range. */
+  truncated: z.boolean().optional(),
+  /** File offset to pass as start_offset to continue a truncated scan. */
+  next_start_offset: z.number().int().min(0).optional(),
   source: romByteSourceSchema.optional(),
 });
 

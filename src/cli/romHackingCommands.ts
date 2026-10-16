@@ -5,7 +5,13 @@ import type { DirectAnalysis } from "../composition/directAnalysis.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { logCliCommand } from "../cliLogging.js";
 import { executableFormatHintSchema } from "../domain/dosCom.js";
-import { ROM_TEXT_ENCODINGS, ROM_WORD_PARITIES } from "../domain/romHacking.js";
+import {
+  POINTER_BASE_MODES,
+  ROM_TEXT_ENCODINGS,
+  ROM_WORD_PARITIES,
+} from "../domain/romHacking.js";
+import { parseSegmentSpec } from "../domain/romPointerSegments.js";
+import { AnalysisInputError } from "../domain/analysisErrorCore.js";
 import { inspectDiscImage } from "../application/romhacking/LocalByteSource.js";
 import { REA_WORKFLOW_PROVIDER } from "../application/InvestigationProviders.js";
 import { createEvidence } from "../domain/evidence.js";
@@ -106,6 +112,62 @@ const romWordFormatArguments = (options: {
     ? {}
     : { tile_attribute: options.tileAttribute }),
 });
+
+/** `--base-mode` and `--segment` shared by the pointer table commands. */
+const pointerSegmentOptions = {
+  baseMode: z
+    .enum(POINTER_BASE_MODES)
+    .optional()
+    .describe(
+      "address: base address + value; segment: segment start file offset + value (overlay-relative offsets). Default: segment when a segment option is given",
+    ),
+  segment: z
+    .string()
+    .regex(/^\s*(0x[0-9a-f]+|\d+)\s*:\s*(0x[0-9a-f]+|\d+)\s*$/iu)
+    .optional()
+    .describe(
+      "Segment (overlay block) the pointer values are relative to, as <start>:<length> file offsets (e.g. 0x19800:0xD800)",
+    ),
+};
+
+/** Map --base-mode/--segment(/--segment-align/--segment-length) to tool input. */
+const pointerSegmentArguments = (
+  operation: string,
+  options: {
+    readonly baseMode?: (typeof POINTER_BASE_MODES)[number] | undefined;
+    readonly segment?: string | undefined;
+    readonly segmentAlign?: number | undefined;
+    readonly segmentLength?: number | undefined;
+  },
+) => {
+  const segment =
+    options.segment === undefined
+      ? undefined
+      : parseSegmentSpec(options.segment);
+  const fail = (message: string): never => {
+    throw new AnalysisInputError(operation, undefined, [
+      { path: ["segment"], reason: "invalid_value", message },
+    ]);
+  };
+  if (options.segment !== undefined && segment === undefined)
+    fail("--segment expects <start>:<length> with a length of at least 1.");
+  if (segment !== undefined && options.segmentLength !== undefined)
+    fail(
+      "--segment already gives the length; --segment-length goes with --segment-align.",
+    );
+  return {
+    ...(options.baseMode === undefined ? {} : { base_mode: options.baseMode }),
+    ...(segment === undefined
+      ? {}
+      : { segment_start: segment.start, segment_length: segment.length }),
+    ...(options.segmentAlign === undefined
+      ? {}
+      : { segment_align: options.segmentAlign }),
+    ...(options.segmentLength === undefined
+      ? {}
+      : { segment_length: options.segmentLength }),
+  };
+};
 
 export const registerRomHackingCommands = (
   cli: CliInstance,
@@ -434,6 +496,7 @@ export const registerRomHackingCommands = (
         .describe(
           "Emit manuscript records and suppress pointer entries (implies --include-manuscript)",
         ),
+      ...pointerSegmentOptions,
       ...romWordFormatOptions,
       ...romOpenOptionFields,
     }),
@@ -446,6 +509,7 @@ export const registerRomHackingCommands = (
           args.path,
           "scan_pointer_table",
           {
+            ...pointerSegmentArguments("scan_pointer_table", options),
             ...(args.address === undefined ? {} : { address: args.address }),
             ...(options.tableOffset === undefined
               ? {}
@@ -573,9 +637,11 @@ export const registerRomHackingCommands = (
         .number()
         .int()
         .min(1)
-        .max(100)
+        .max(1000)
         .default(20)
-        .describe("Maximum number of candidate tables to return"),
+        .describe(
+          "Maximum number of candidate tables to return (next_start_offset resumes a truncated scan)",
+        ),
       sampleEntries: z
         .number()
         .int()
@@ -591,6 +657,37 @@ export const registerRomHackingCommands = (
         .boolean()
         .optional()
         .describe("Alias for --resolve-xrefs"),
+      ...pointerSegmentOptions,
+      segmentAlign: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          "Try every multiple of this file offset as the segment start (e.g. 2048 for disc sectors); needs --segment-length",
+        ),
+      segmentLength: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          "Segment byte length for --segment-align (e.g. 0x10000 for 16-bit offsets)",
+        ),
+      targetAfterTerminator: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Accept only sentence starts as targets: after a terminator byte/word, the segment start, or right where the table ends",
+        ),
+      minCoverage: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe(
+          "Keep only tables whose coverage ratio reaches this value (1 = every string start in the region is a target)",
+        ),
       ...romWordFormatOptions,
       ...romOpenOptionFields,
     }),
@@ -603,6 +700,11 @@ export const registerRomHackingCommands = (
           args.path,
           "discover_pointer_tables",
           {
+            ...pointerSegmentArguments("discover_pointer_tables", options),
+            target_after_terminator: options.targetAfterTerminator,
+            ...(options.minCoverage === undefined
+              ? {}
+              : { min_coverage: options.minCoverage }),
             ...(options.startAddress === undefined
               ? {}
               : { start_address: options.startAddress }),

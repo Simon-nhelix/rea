@@ -92,6 +92,81 @@ extractor trims). The tile scan found the same 37,118 BAT word lists (503
 distinct) as the project's own scanner. These counts describe one game and one
 table; they are not general precision figures.
 
+### Overlay-relative pointer tables
+
+Disc games often load a block of sectors (an overlay) into one RAM window and
+store each string pointer as an offset from the block start, not as a CPU
+address. The same block can sit on the disc many times. `--segment
+<start>:<length>` (file offsets, decimal or `0x` hex) reads every pointer value
+as `start + value`; values at or past `length` point outside the segment.
+Segment options select `--base-mode segment`; `--base-mode address` (the
+default otherwise) keeps `base_address + value` through the target's address
+mapping. In segment mode `--base-address` must stay 0, and the tools need local
+file bytes.
+
+`discover-pointer-tables --segment-align <bytes> --segment-length <bytes>`
+tries every multiple of `segment-align` as the start of a segment that still
+contains the table, and reports the start that fits as `segment_start` on each
+table. With a single `--segment` and no range options, the scan covers that
+segment. In segment mode a value of 0 or all ones (`0xFFFF` for 16-bit
+pointers) ends a table.
+
+`--target-after-terminator` accepts only sentence starts as targets: the
+previous byte or word is the terminator, the target is the segment start, or the
+string begins exactly where the table ends. The last case covers the common
+layout where the first string follows the last table entry instead of a
+terminator; every such entry must then point at the table end. Empty strings (a
+lone terminator) count as targets, but a table still needs two distinct
+non-empty targets.
+
+Each discovered table, and each `scan-pointer-table` result, reports
+`coverage` when a terminator is known. The region runs from the lowest target to
+the end of the farthest target string. The walk steps from string to string by
+terminators and counts `strings`, `referenced_strings`, `unreferenced_offsets`
+(first 16), `targets_inside_strings` (targets that are not at a walked string
+start), `padding_bytes` (terminators that no entry points at) and
+`unreached_targets` (targets after a walk that found no terminator within 4096
+bytes). `ratio` is `referenced_strings / (strings + targets_inside_strings +
+unreached_targets)`. `complete` means every walked string is a target, no target
+falls inside a string, and the walk ended exactly at `region_end`.
+`adjacent_to_table` means the region starts where the table ends.
+`--min-coverage R` keeps only tables whose `ratio` reaches `R`; a rejected run
+does not hide a table that starts inside it. Coverage assumes strings separated
+by one terminator unit, so tables that share string suffixes score below 1.
+
+`--max-tables` accepts up to 1000. When the limit stops a scan, the result has
+`truncated: true` and `next_start_offset`; pass that value as
+`--start-offset` to continue.
+
+On Record of Lodoss War II (the `.iso` above):
+
+```sh
+node scripts/rea.mjs discover-pointer-tables lodoss2_02.iso \
+  --pointer-size 2 --encoding sjis-le16 --terminator-word 0xFFFF \
+  --newline-word 0xFFFE --min-string-length 1 --min-entries 3 \
+  --segment-align 2048 --segment-length 0x10000 --target-after-terminator \
+  --min-coverage 1 --start-offset 0 --end-offset 46649344 \
+  --max-tables 1000 --format json
+node scripts/rea.mjs scan-pointer-table lodoss2_02.iso \
+  --pointer-size 2 --encoding sjis-le16 --terminator-word 0xFFFF \
+  --newline-word 0xFFFE --table-offset 0x24c75 --count 256 \
+  --segment 0x19800:0xD800 --format json
+```
+
+The whole-disc scan took about 15 seconds in two pages and returned 1,887
+tables with `ratio` 1. They include, with the right `segment_start` and entry
+count, all 81 dialogue blocks that the project's own scanner finds by their
+header (words 2..4 = table offset, word 5 = region end). The 43 town and event
+blocks are among them, and every block is `complete` and `adjacent_to_table`.
+They also include both tables of the shared module (sector 51, 27 sectors: 16
+and 256 entries) in all 66 copies. The project's scanner had counted 15 and
+255 entries there, because it required a terminator before every target. The
+first entry of each table points at the string that follows the table. Most
+other results are item, spell and class name tables that each scene pack
+copies (for example a 129-entry item table in 13 copies). Some 3- and 4-entry
+results are coincidences. These counts describe one game; they are not general
+precision figures.
+
 Use Ghidra when the question needs decoded instructions or analyzed references:
 
 ```sh

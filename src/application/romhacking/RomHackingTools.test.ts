@@ -256,6 +256,7 @@ describe("RomHackingTools discovery and caves", () => {
       max_tables: 10,
       sample_entries: 3,
       resolve_xrefs: false,
+      target_after_terminator: false,
     });
     expect(discovered.ok).toBe(true);
     if (!discovered.ok) return;
