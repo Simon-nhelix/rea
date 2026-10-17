@@ -198,8 +198,13 @@ node scripts/rea.mjs find-code-references \
 
 Hits are `call`/`jump` (`jal`/`j`, 256 MB segment from PC+4), `address_pair`
 (`lui` with `addiu`/`ori`/load/store, tracked per register, sign extension
-applied; the exact formed address is reported) and `pointer_word` (aligned
-32-bit values). The summary states `0 references found` explicitly. Overlays
+applied; the exact formed address is reported), `gp_relative`
+(load/store/`addiu` with base `$gp`, i.e. `gp` + signed offset) and
+`pointer_word` (aligned 32-bit values). `$gp` comes from `--gp 0x...` or is
+found as the first `lui $gp` + `addiu/ori $gp` pair (the value and its address
+are reported in `result.gp`); it applies to every file unless `--no-gp-relative`
+(or `files[].use_gp: false`), and tracking stops where a function rewrites
+`$gp`. The summary states `0 references found` explicitly. Overlays
 sharing a load address cannot be resident together, so the hit's file matters
 (`overlapping_files`). This is a static scan: indirect addresses, `jr` jump
 tables, compressed or encrypted code, and absent overlays are not seen.

@@ -31,12 +31,17 @@ export const codeReferenceKindSchema = z.enum([
   "call",
   "jump",
   "address_pair",
+  "gp_relative",
   "pointer_word",
 ]);
 export type CodeReferenceKind = z.infer<typeof codeReferenceKindSchema>;
 
 export const codeReferenceFileInputSchema = z.strictObject({
   path: z.string().min(1).describe("Absolute path of a code or data file."),
+  use_gp: z
+    .boolean()
+    .default(true)
+    .describe("Apply gp-relative reference detection to this file."),
   load_address: addressSchema
     .optional()
     .describe(
@@ -73,11 +78,20 @@ export const findCodeReferencesInputSchema = z.strictObject({
     .enum(["mips-le"])
     .default("mips-le")
     .describe("Instruction set. mips-le covers PS1, and PS2/PSP basic MIPS."),
+  gp: addressSchema
+    .optional()
+    .describe(
+      "Value of $gp for gp_relative references (base 28 plus signed offset). When omitted it is found automatically from the first lui $gp + addiu/ori $gp pair in the files.",
+    ),
+  gp_relative: z
+    .boolean()
+    .default(true)
+    .describe("Set false to skip gp_relative detection entirely."),
   kinds: z
     .array(codeReferenceKindSchema)
     .min(1)
     .optional()
-    .describe("Reference kinds to report; default all four."),
+    .describe("Reference kinds to report; default all five."),
   max_references: z
     .number()
     .int()
@@ -98,6 +112,7 @@ const countsSchema = z.strictObject({
   call: z.number().int().min(0),
   jump: z.number().int().min(0),
   address_pair: z.number().int().min(0),
+  gp_relative: z.number().int().min(0),
   pointer_word: z.number().int().min(0),
 });
 
@@ -130,6 +145,13 @@ export const findCodeReferencesResultSchema = z.strictObject({
       references: z.number().int().min(0),
     }),
   ),
+  gp: z.strictObject({
+    value: z.string().nullable(),
+    source: z.enum(["caller", "auto"]).nullable(),
+    file: z.string().nullable(),
+    address: z.string().nullable(),
+    file_offset: z.number().int().min(0).nullable(),
+  }),
   overlapping_files: z.array(z.array(z.string())),
   summary: z.array(
     z.strictObject({
@@ -152,13 +174,6 @@ export type CodeReference = z.output<typeof codeReferenceSchema>;
 export type FindCodeReferencesResult = z.output<
   typeof findCodeReferencesResultSchema
 >;
-
-export const CODE_REFERENCE_LIMITATIONS: readonly string[] = [
-  "Static linear sweep of aligned 32-bit words; branch targets, delay-slot effects and real control flow are approximated. Register constants are forgotten at jr/j/unconditional branches and call-clobbered registers after jal/jalr.",
-  "Not detected: addresses computed indirectly (base plus runtime index, values loaded from memory, arithmetic beyond lui plus addiu/ori/load/store offset), jr jump-table dispatch other than the table's own pointer words, self-modifying code, compressed or encrypted code/data, and references from code or overlays that were not supplied.",
-  "pointer_word hits are aligned 32-bit values equal to a target address in any scanned byte, including data that merely looks like a pointer; address_pair and call hits can also come from data decoded as instructions.",
-  "Files with the same load address cannot be resident together at runtime; the file a hit belongs to matters, and hits are never merged across files.",
-];
 
 // ---------------------------------------------------------------- scanner
 
@@ -236,6 +251,8 @@ interface Target {
 interface RegisterValue {
   readonly value: number;
   readonly derived: boolean;
+  /** The value is the configured $gp. */
+  readonly gp: boolean;
   readonly luiAddress: number | undefined;
 }
 
@@ -246,6 +263,8 @@ export interface ScanRegion {
   readonly fileOffset: number;
   readonly length: number;
   readonly address: number;
+  /** Known $gp value, enabling gp_relative references. */
+  readonly gp?: number | undefined;
 }
 
 export interface ScanTarget {
@@ -301,6 +320,7 @@ interface Decoded {
 
 interface Scanner {
   readonly regs: (RegisterValue | undefined)[];
+  readonly gp: number | undefined;
   readonly findTarget: (address: number) => Target | undefined;
   readonly emit: Emit;
 }
@@ -340,6 +360,7 @@ const immediateEffect = (scanner: Scanner, d: Decoded): Effect => {
       value: {
         value: (d.imm << 16) >>> 0,
         derived: false,
+        gp: false,
         luiAddress: d.pc,
       },
     };
@@ -353,14 +374,24 @@ const immediateEffect = (scanner: Scanner, d: Decoded): Effect => {
   const target = scanner.findTarget(formed);
   if (target !== undefined)
     scanner.emit({
-      kind: "address_pair",
+      kind: base.gp ? "gp_relative" : "address_pair",
       instruction: text,
       register: reg(d.rs),
       formed,
       target,
       lui: base,
     });
-  return { dest: d.rt, value: { ...base, value: formed, derived: true } };
+  // Re-forming the configured $gp in $gp itself keeps gp tracking alive.
+  const restoresGp = d.rt === 28 && formed === scanner.gp;
+  return {
+    dest: d.rt,
+    value: {
+      ...base,
+      value: formed,
+      derived: !restoresGp,
+      gp: restoresGp,
+    },
+  };
 };
 
 const memoryEffect = (scanner: Scanner, d: Decoded): Effect => {
@@ -372,7 +403,7 @@ const memoryEffect = (scanner: Scanner, d: Decoded): Effect => {
     const target = scanner.findTarget(formed);
     if (target !== undefined)
       scanner.emit({
-        kind: "address_pair",
+        kind: base.gp ? "gp_relative" : "address_pair",
         instruction: `${LOAD_STORE_NAMES.get(d.op) ?? "mem"} ${reg(d.rt)}, ${signedHex(d.simm)}(${reg(d.rs)})`,
         register: reg(d.rs),
         formed,
@@ -448,6 +479,16 @@ export const scanMipsRegion = (
     region.bytes.byteLength,
   );
   const regs = Array.from<RegisterValue | undefined>({ length: 32 });
+  const gpValue: RegisterValue | undefined =
+    region.gp === undefined
+      ? undefined
+      : {
+          value: region.gp >>> 0,
+          derived: false,
+          gp: true,
+          luiAddress: undefined,
+        };
+  regs[28] = gpValue;
   let current: Decoded | undefined;
   const emit: Emit = ({ kind, instruction, register, formed, target, lui }) => {
     if (!kinds.has(kind) || current === undefined) return;
@@ -463,7 +504,7 @@ export const scanMipsRegion = (
       sourceLuiAddress: lui?.luiAddress ?? null,
     });
   };
-  const scanner: Scanner = { regs, findTarget, emit };
+  const scanner: Scanner = { regs, gp: region.gp, findTarget, emit };
 
   let pending: "call" | "reset" | undefined;
   let inDelaySlot = false;
@@ -491,7 +532,10 @@ export const scanMipsRegion = (
 
     if (inDelaySlot) {
       if (pending === "call") for (const r of CALLER_SAVED) regs[r] = undefined;
-      else regs.fill(undefined);
+      else {
+        regs.fill(undefined);
+        regs[28] = gpValue; // a new function starts with the global $gp
+      }
       pending = undefined;
       inDelaySlot = false;
     }
@@ -501,27 +545,6 @@ export const scanMipsRegion = (
     }
   }
   return results;
-};
-
-/** Region `[address, address+length)` of each file; groups of overlapping files. */
-export const overlappingRegions = (
-  regions: readonly {
-    readonly file: string;
-    readonly address: number;
-    readonly length: number;
-  }[],
-): string[][] => {
-  const groups: { start: number; end: number; files: string[] }[] = [];
-  const sorted = [...regions].sort((a, b) => a.address - b.address);
-  for (const region of sorted) {
-    const end = region.address + region.length;
-    const last = groups[groups.length - 1];
-    if (last !== undefined && region.address < last.end) {
-      last.files.push(region.file);
-      last.end = Math.max(last.end, end);
-    } else groups.push({ start: region.address, end, files: [region.file] });
-  }
-  return groups.filter((g) => g.files.length > 1).map((g) => g.files);
 };
 
 export const formatAddress32 = hex;

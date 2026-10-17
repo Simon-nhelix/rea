@@ -9,21 +9,23 @@ import {
 } from "../../domain/analysisErrorCore.js";
 import { createEvidence, type Evidence } from "../../domain/evidence.js";
 import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
-import { jsonValueSchema } from "../../domain/jsonValue.js";
+import { jsonValueSchema, type JsonValue } from "../../domain/jsonValue.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import {
-  CODE_REFERENCE_LIMITATIONS,
   findCodeReferencesInputSchema,
   findCodeReferencesResultSchema,
   formatAddress32,
-  overlappingRegions,
   parseAddress32,
   ROM_CODE_REFERENCE_PROVIDER_IDENTITY,
   scanMipsRegion,
   type CodeReference,
   type CodeReferenceKind,
+  type FindCodeReferencesInput,
   type FindCodeReferencesResult,
 } from "../../domain/romCodeReferences.js";
+import { CODE_REFERENCE_LIMITATIONS } from "../../domain/romCodeReferenceLimitations.js";
+import { overlappingRegions } from "../../domain/romCodeReferenceRegions.js";
+import { findGpInitializer } from "../../domain/romGpInitializer.js";
 
 const OPERATION = "find_code_references";
 const MAX_FILE_BYTES = 256 * 1024 * 1024;
@@ -38,6 +40,7 @@ interface LoadedRegion {
   readonly fileOffset: number;
   readonly length: number;
   readonly notes: readonly string[];
+  readonly useGp: boolean;
 }
 
 /** Locate a file's loadable region: PS-X EXE header, or caller load address. */
@@ -45,7 +48,10 @@ const locateRegion = (
   path: string,
   bytes: Uint8Array,
   explicit: number | undefined,
-): Result<Omit<LoadedRegion, "sha256" | "path" | "bytes">, AnalysisError> => {
+): Result<
+  Omit<LoadedRegion, "sha256" | "path" | "bytes" | "useGp">,
+  AnalysisError
+> => {
   if (explicit !== undefined)
     return ok({
       loadAddress: explicit,
@@ -93,10 +99,49 @@ interface Tally {
     jump: number;
     address_pair: number;
     pointer_word: number;
+    gp_relative: number;
   }[];
   readonly byFile: Map<string, number>[];
   total: number;
 }
+
+interface GpResolution {
+  readonly value: number | undefined;
+  readonly source: "caller" | "auto" | null;
+  readonly file: string | null;
+  readonly address?: number;
+  readonly fileOffset?: number;
+}
+
+/** The caller's $gp, else the first lui/addiu $gp initializer in the files. */
+const resolveGp = (
+  explicit: string | undefined,
+  enabled: boolean,
+  regions: readonly LoadedRegion[],
+): GpResolution => {
+  if (!enabled) return { value: undefined, source: null, file: null };
+  const given = explicit === undefined ? undefined : parseAddress32(explicit);
+  if (given !== undefined)
+    return { value: given, source: "caller", file: null };
+  for (const region of regions) {
+    if (!region.useGp) continue;
+    const found = findGpInitializer({
+      bytes: region.bytes,
+      fileOffset: region.fileOffset,
+      length: region.length,
+      address: region.loadAddress,
+    });
+    if (found !== undefined)
+      return {
+        value: found.value,
+        source: "auto",
+        file: region.path,
+        address: found.address,
+        fileOffset: found.fileOffset,
+      };
+  }
+  return { value: undefined, source: null, file: null };
+};
 
 interface NamedTarget {
   readonly address: number;
@@ -108,9 +153,13 @@ interface NamedTarget {
 const tallyReferences = (
   regions: readonly LoadedRegion[],
   targets: readonly NamedTarget[],
-  kinds: ReadonlySet<CodeReferenceKind>,
-  maxReferences: number,
+  options: {
+    readonly kinds: ReadonlySet<CodeReferenceKind>;
+    readonly maxReferences: number;
+    readonly gp: number | undefined;
+  },
 ): Tally => {
+  const { kinds, maxReferences, gp } = options;
   const tally: Tally = {
     references: [],
     perFile: [],
@@ -120,6 +169,7 @@ const tallyReferences = (
       jump: 0,
       address_pair: 0,
       pointer_word: 0,
+      gp_relative: 0,
     })),
     byFile: targets.map(() => new Map<string, number>()),
     total: 0,
@@ -132,6 +182,7 @@ const tallyReferences = (
         fileOffset: region.fileOffset,
         length: region.length,
         address: region.loadAddress,
+        gp: region.useGp ? gp : undefined,
       },
       targets,
       kinds,
@@ -169,13 +220,43 @@ const tallyReferences = (
   return tally;
 };
 
+const evidenceParameters = (
+  input: FindCodeReferencesInput,
+  kinds: ReadonlySet<CodeReferenceKind>,
+): Record<string, JsonValue> => ({
+  files: input.files.map((file) => ({
+    path: file.path,
+    load_address: file.load_address ?? null,
+    use_gp: file.use_gp,
+  })),
+  targets: input.targets.map((target) => ({
+    address: target.address,
+    length: target.length,
+    name: target.name ?? null,
+  })),
+  architecture: input.architecture,
+  gp: input.gp ?? null,
+  gp_relative: input.gp_relative,
+  kinds: [...kinds],
+  max_references: input.max_references,
+});
+
+const gpReport = (gp: GpResolution) => ({
+  value: gp.value === undefined ? null : formatAddress32(gp.value),
+  source: gp.source,
+  file: gp.file,
+  address: gp.address === undefined ? null : formatAddress32(gp.address),
+  file_offset: gp.fileOffset ?? null,
+});
+
 const buildResult = (
-  architecture: "mips-le",
   regions: readonly LoadedRegion[],
   targets: readonly NamedTarget[],
   tally: Tally,
+  header: { readonly architecture: "mips-le"; readonly gp: GpResolution },
 ): FindCodeReferencesResult => ({
-  architecture,
+  architecture: header.architecture,
+  gp: gpReport(header.gp),
   files: regions.map((region, index) => ({
     path: region.path,
     sha256: region.sha256,
@@ -201,6 +282,7 @@ const buildResult = (
       jump: 0,
       address_pair: 0,
       pointer_word: 0,
+      gp_relative: 0,
     };
     return {
       target: formatAddress32(target.address),
@@ -257,7 +339,11 @@ export class CodeReferenceService {
     const regions: LoadedRegion[] = [];
     for (const file of input.files) {
       if (isAborted(signal)) return err(new AnalysisCancelledError(OPERATION));
-      const loaded = await this.#load(file.path, file.load_address);
+      const loaded = await this.#load(
+        file.path,
+        file.load_address,
+        file.use_gp,
+      );
       if (!loaded.ok) return loaded;
       regions.push(loaded.value);
     }
@@ -268,33 +354,29 @@ export class CodeReferenceService {
       name: target.name ?? null,
     }));
     const kinds = new Set<CodeReferenceKind>(
-      input.kinds ?? ["call", "jump", "address_pair", "pointer_word"],
+      input.kinds ?? [
+        "call",
+        "jump",
+        "address_pair",
+        "gp_relative",
+        "pointer_word",
+      ],
     );
-    const tally = tallyReferences(
-      regions,
-      targets,
+    const gp = resolveGp(input.gp, input.gp_relative, regions);
+    const tally = tallyReferences(regions, targets, {
       kinds,
-      input.max_references,
-    );
-    const result = buildResult(input.architecture, regions, targets, tally);
+      maxReferences: input.max_references,
+      gp: gp.value,
+    });
+    const result = buildResult(regions, targets, tally, {
+      architecture: input.architecture,
+      gp,
+    });
     const validated = findCodeReferencesResultSchema.parse(result);
     return ok(
       createEvidence(undefined, ROM_CODE_REFERENCE_PROVIDER_IDENTITY, {
         operation: OPERATION,
-        parameters: {
-          files: input.files.map((file) => ({
-            path: file.path,
-            load_address: file.load_address ?? null,
-          })),
-          targets: input.targets.map((target) => ({
-            address: target.address,
-            length: target.length,
-            name: target.name ?? null,
-          })),
-          architecture: input.architecture,
-          kinds: [...kinds],
-          max_references: input.max_references,
-        },
+        parameters: evidenceParameters(input, kinds),
         result: jsonValueSchema.parse(validated),
         confidence: "derived",
         subjectUnavailableReason: `Evidence covers ${regions.length} file(s); each file's SHA-256 is in result.files.`,
@@ -305,6 +387,16 @@ export class CodeReferenceService {
         limitations: [
           ...CODE_REFERENCE_LIMITATIONS,
           ...regions.flatMap((region) => region.notes),
+          ...(gp.source === "auto"
+            ? [
+                `$gp ${formatAddress32(gp.value ?? 0)} was inferred from the lui/addiu pair at ${formatAddress32(gp.address ?? 0)} in ${gp.file ?? ""} and applied to every file with use_gp; pass gp to override.`,
+              ]
+            : []),
+          ...(input.gp_relative && gp.value === undefined
+            ? [
+                "No $gp value was given or found, so gp_relative references were skipped.",
+              ]
+            : []),
         ],
       }),
     );
@@ -313,6 +405,7 @@ export class CodeReferenceService {
   async #load(
     path: string,
     loadAddress: string | undefined,
+    useGp: boolean,
   ): Promise<Result<LoadedRegion, AnalysisError>> {
     let bytes: Uint8Array;
     try {
@@ -342,6 +435,7 @@ export class CodeReferenceService {
       path,
       bytes,
       sha256: createHash("sha256").update(bytes).digest("hex"),
+      useGp,
       ...located.value,
     });
   }

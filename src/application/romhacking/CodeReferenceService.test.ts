@@ -153,6 +153,78 @@ describe("CodeReferenceService", () => {
   });
 });
 
+describe("gp-relative references", () => {
+  const gpLui = lui(28, 0x8006);
+  const gpAddiu =
+    ((9 << 26) | (28 << 21) | (28 << 16) | (-0x3e58 & 0xffff)) >>> 0;
+  const lwGp = ((0x23 << 26) | (28 << 21) | (3 << 16) | 0x308) >>> 0;
+
+  it("infers gp from the first initializer and applies it to overlays", async () => {
+    const exe = join(directory, "MAIN.EXE");
+    const overlay = join(directory, "OVL.BIN");
+    await writeFile(exe, psxExe(0x80010000, words([gpLui, gpAddiu, 0])));
+    await writeFile(overlay, words([lwGp, 0]));
+    const service = new CodeReferenceService();
+    const run = (extra: Record<string, unknown>) =>
+      service.find({
+        files: [{ path: exe }, { path: overlay, load_address: "0x800D61D8" }],
+        targets: [{ address: "0x8005C4B0" }],
+        ...extra,
+      });
+    const auto = await run({});
+    expect(auto.ok).toBe(true);
+    if (!auto.ok) return;
+    const report = resultOf(auto.value);
+    expect(report.gp).toMatchObject({
+      value: "0x8005c1a8",
+      source: "auto",
+      address: "0x80010000",
+    });
+    expect(report.summary[0]?.counts.gp_relative).toBe(1);
+    expect(report.references[0]).toMatchObject({
+      kind: "gp_relative",
+      target_address: "0x8005c4b0",
+    });
+
+    const off = await run({ gp_relative: false });
+    if (!off.ok) throw new Error("expected ok");
+    expect(resultOf(off.value).summary[0]?.counts.total).toBe(0);
+
+    const fileOff = await service.find({
+      files: [
+        { path: exe },
+        { path: overlay, load_address: "0x800D61D8", use_gp: false },
+      ],
+      targets: [{ address: "0x8005C4B0" }],
+    });
+    if (!fileOff.ok) throw new Error("expected ok");
+    expect(resultOf(fileOff.value).summary[0]?.counts.total).toBe(0);
+
+    const given = await service.find({
+      files: [{ path: overlay, load_address: "0x800D61D8" }],
+      targets: [{ address: "0x8005C4B0" }],
+      gp: "0x8005C1A8",
+    });
+    if (!given.ok) throw new Error("expected ok");
+    expect(resultOf(given.value).gp.source).toBe("caller");
+    expect(resultOf(given.value).summary[0]?.counts.gp_relative).toBe(1);
+  });
+
+  it("states that gp_relative was skipped when no gp is known", async () => {
+    const overlay = join(directory, "OVL.BIN");
+    await writeFile(overlay, words([lwGp, 0]));
+    const result = await new CodeReferenceService().find({
+      files: [{ path: overlay, load_address: "0x800D61D8" }],
+      targets: [{ address: "0x8005C4B0" }],
+    });
+    if (!result.ok) throw new Error("expected ok");
+    expect(resultOf(result.value).gp.value).toBeNull();
+    expect(result.value.limitations.join("\n")).toContain(
+      "gp_relative references were skipped",
+    );
+  });
+});
+
 describe("CLI spec parsing", () => {
   it("splits PATH:0xADDR and ADDR+LENGTH", () => {
     expect(parseFileSpec("/g/OVL/SNMP.BIN:0x800D61D8")).toEqual({

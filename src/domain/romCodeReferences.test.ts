@@ -1,15 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
-  overlappingRegions,
   parseAddress32,
   scanMipsRegion,
   type CodeReferenceKind,
 } from "./romCodeReferences.js";
+import { overlappingRegions } from "./romCodeReferenceRegions.js";
+import { findGpInitializer } from "./romGpInitializer.js";
 
 const ALL: ReadonlySet<CodeReferenceKind> = new Set([
   "call",
   "jump",
   "address_pair",
+  "gp_relative",
   "pointer_word",
 ]);
 
@@ -223,5 +225,98 @@ describe("overlappingRegions", () => {
         { file: "c", address: 0x80200000, length: 10 },
       ]),
     ).toEqual([["a", "b"]]);
+  });
+});
+
+describe("gp-relative references", () => {
+  const GP = 0x8005c1a8;
+  const gpScan = (words: readonly number[], targets = one(0x8005c4b0)) => {
+    const bytes = bytesOf(words);
+    return scanMipsRegion(
+      {
+        file: "f",
+        bytes,
+        fileOffset: 0,
+        length: bytes.length,
+        address: 0x80010000,
+        gp: GP,
+      },
+      targets,
+      ALL,
+    );
+  };
+  const GPR = 28;
+
+  it("computes gp plus the sign-extended offset", () => {
+    const hits = gpScan([lw(R.v1, 0x308, GPR), i(0x2b, GPR, R.v0, 0x308)]);
+    expect(hits.map((h) => [h.kind, h.instruction, h.targetAddress])).toEqual([
+      ["gp_relative", "lw v1, 0x308(gp)", 0x8005c4b0],
+      ["gp_relative", "sw v0, 0x308(gp)", 0x8005c4b0],
+    ]);
+    expect(gpScan([lw(R.v1, -0x10, GPR)], one(GP - 0x10))).toHaveLength(1);
+  });
+
+  it("reports addiu from gp and follows the formed base", () => {
+    const hits = gpScan(
+      [addiu(R.a0, GPR, 0x300), lhu(R.v0, 8, R.a0)],
+      one(0x8005c4a8),
+    );
+    expect(hits.map((h) => [h.kind, h.instruction])).toEqual([
+      ["gp_relative", "addiu a0, gp, 0x300"],
+    ]);
+    const field = gpScan(
+      [addiu(R.a0, GPR, 0x300), lhu(R.v0, 8, R.a0)],
+      one(0x8005c4b0),
+    );
+    expect(field.map((h) => [h.kind, h.instruction])).toEqual([
+      ["address_pair", "lhu v0, 0x8(a0)"],
+    ]);
+  });
+
+  it("is off without a gp value", () => {
+    const bytes = bytesOf([lw(R.v1, 0x308, GPR)]);
+    expect(
+      scanMipsRegion(
+        { file: "f", bytes, fileOffset: 0, length: 4, address: 0x80010000 },
+        one(0x8005c4b0),
+        ALL,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("stops tracking when a function rewrites gp, and restores at the next function", () => {
+    const words = [
+      lui(GPR, 0x8001),
+      lw(R.v1, 0x308, GPR), // gp now 0x80010000: not the global gp
+      jr(R.ra),
+      nop,
+      lw(R.v1, 0x308, GPR), // new function: global gp again
+    ];
+    expect(gpScan(words).map((h) => h.address)).toEqual([0x80010010]);
+    const restored = [
+      lui(GPR, 0x8006),
+      addiu(GPR, GPR, -0x3e58),
+      lw(R.v1, 0x308, GPR),
+    ];
+    expect(gpScan(restored)).toHaveLength(1);
+    const clobbered = [lw(GPR, 0, R.a0), lw(R.v1, 0x308, GPR)];
+    expect(gpScan(clobbered)).toHaveLength(0);
+  });
+
+  it("finds the lui/addiu gp initializer", () => {
+    const bytes = bytesOf([
+      nop,
+      lui(GPR, 0x8006),
+      nop,
+      addiu(GPR, GPR, -0x3e58),
+    ]);
+    expect(
+      findGpInitializer({
+        bytes,
+        fileOffset: 0,
+        length: 16,
+        address: 0x80010000,
+      }),
+    ).toEqual({ value: GP, address: 0x80010004, fileOffset: 4 });
   });
 });

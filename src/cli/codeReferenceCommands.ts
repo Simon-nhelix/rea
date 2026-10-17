@@ -49,8 +49,26 @@ export const registerCodeReferenceCommands = (
         .describe(
           "Repeat per target: 0xADDRESS or 0xADDRESS+LENGTH for a range",
         ),
+      gp: z
+        .string()
+        .optional()
+        .describe(
+          "Value of $gp for gp-relative references; found automatically from lui/addiu $gp when omitted",
+        ),
+      gpRelative: z
+        .boolean()
+        .default(true)
+        .describe("Detect gp-relative references (--no-gp-relative to skip)"),
       kind: z
-        .array(z.enum(["call", "jump", "address_pair", "pointer_word"]))
+        .array(
+          z.enum([
+            "call",
+            "jump",
+            "address_pair",
+            "gp_relative",
+            "pointer_word",
+          ]),
+        )
         .optional()
         .describe("Reference kinds to report (default all)"),
       maxReferences: z
@@ -70,6 +88,8 @@ export const registerCodeReferenceCommands = (
                 {
                   files: options.file.map(parseFileSpec),
                   targets: options.target.map(parseTargetSpec),
+                  ...(options.gp === undefined ? {} : { gp: options.gp }),
+                  gp_relative: options.gpRelative,
                   ...(options.kind === undefined
                     ? {}
                     : { kinds: options.kind }),
