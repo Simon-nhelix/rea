@@ -365,3 +365,9 @@ analysis, and code cave discovery:
 - `find_code_caves` (CLI `rea find-code-caves <path>`): find contiguous padding
   regions (`0x00` / `0xFF` or `fill_byte`) sorted largest-first for VWF font
   hooks, expanded 2-byte glyph tables, and relocated dialogue blocks.
+- `find_code_references` (CLI `rea find-code-references --file PATH[:0xLOAD] --target 0xADDR[+LEN]`):
+  static MIPS-LE references (`jal`/`j`, `lui`+`addiu`/`ori`/load/store pairs,
+  `$gp`-relative accesses via `--gp` or an inferred `lui/addiu $gp`, aligned
+  pointer words) to addresses or ranges across a main EXE and overlays
+  with per-file load addresses; no opened target. Reports `0 references found`
+  explicitly; indirect addresses and `jr` tables are not seen.

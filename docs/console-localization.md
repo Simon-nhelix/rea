@@ -282,6 +282,33 @@ context must not silently acquire a guessed M/X state. PLP/RTI and XCE with
 unknown carry still limit proof of downstream instruction widths; inspect the
 returned limitations and use another observed entry when needed.
 
+## Who references this address? (MIPS overlays)
+
+`find-code-references` answers "does any code call this function or form this
+string/table address?" across the main executable and every overlay, each with
+its own load address. It needs no opened target and no Ghidra. A PS-X EXE header
+supplies its load address (text from file offset `0x800`); headerless overlays
+take `PATH:0xLOADADDR`. A target is `0xADDR` or `0xADDR+LENGTH` for a range.
+
+```sh
+node scripts/rea.mjs find-code-references \
+  --file SLPS_026.36 --file OVL/SNMP_GRP.BIN:0x800D61D8 \
+  --target 0x800CBCE8 --target 0x800D6590+0x40 --format json
+```
+
+Hits are `call`/`jump` (`jal`/`j`, 256 MB segment from PC+4), `address_pair`
+(`lui` with `addiu`/`ori`/load/store, tracked per register, sign extension
+applied; the exact formed address is reported), `gp_relative`
+(load/store/`addiu` with base `$gp`, i.e. `gp` + signed offset) and
+`pointer_word` (aligned 32-bit values). `$gp` comes from `--gp 0x...` or is
+found as the first `lui $gp` + `addiu/ori $gp` pair (the value and its address
+are reported in `result.gp`); it applies to every file unless `--no-gp-relative`
+(or `files[].use_gp: false`), and tracking stops where a function rewrites
+`$gp`. The summary states `0 references found` explicitly. Overlays
+sharing a load address cannot be resident together, so the hit's file matters
+(`overlapping_files`). This is a static scan: indirect addresses, `jr` jump
+tables, compressed or encrypted code, and absent overlays are not seen.
+
 ## Processor prerequisites
 
 These are optional source corrections for an existing, caller-owned Ghidra

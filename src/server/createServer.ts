@@ -17,6 +17,7 @@ import { evmInterfaceModule } from "../composition/evm.js";
 import { registerEvmTools } from "./registerEvmTools.js";
 import type { SqliteDatabaseService } from "../application/sqlite/SqliteDatabaseService.js";
 import { createSqliteDatabaseService } from "../composition/sqlite.js";
+import { registerCodeReferenceTools } from "./registerCodeReferenceTools.js";
 import { registerSqliteTools } from "./registerSqliteTools.js";
 import { registerRecordedCrashTools } from "./registerRecordedCrashTools.js";
 import { createRecordedCrashService } from "../composition/binaryDiagnostics.js";
@@ -722,6 +723,12 @@ const registerConfiguredAnalysisTools = (
   registerSqliteTools(
     server,
     options.sqliteDatabase ?? createSqliteDatabaseService(environment),
+    toolLogger,
+    recordEvidence,
+    withAdmittedAnalysis,
+  );
+  registerCodeReferenceTools(
+    server,
     toolLogger,
     recordEvidence,
     withAdmittedAnalysis,

@@ -1,0 +1,107 @@
+import { z } from "incur";
+import type { Logger } from "pino";
+import { CodeReferenceService } from "../application/romhacking/CodeReferenceService.js";
+import { CLI_COMMANDS } from "../cliCommandNames.js";
+import { logCliCommand } from "../cliLogging.js";
+import { absoluteCallerPath } from "../filesystem/callerPath.js";
+import { withCommandCancellation } from "./commandCancellation.js";
+import { finishAnalysisCommand } from "./finishAnalysisCommand.js";
+import type { CliInstance } from "./types.js";
+
+/** `path` or `path:0x800D61D8` (the load address follows the last colon). */
+export const parseFileSpec = (
+  spec: string,
+): { path: string; load_address?: string } => {
+  const match = /^(.+):(0[xX][0-9a-fA-F]{1,8})$/u.exec(spec);
+  return match?.[1] === undefined || match[2] === undefined
+    ? { path: absoluteCallerPath(spec) }
+    : { path: absoluteCallerPath(match[1]), load_address: match[2] };
+};
+
+/** `0x800CBCE8` or `0x800D6590+0x40` (start plus byte length). */
+export const parseTargetSpec = (
+  spec: string,
+): { address: string; length?: number } => {
+  const [address = spec, length] = spec.split("+");
+  if (length === undefined) return { address };
+  const parsed = Number(length);
+  return Number.isSafeInteger(parsed)
+    ? { address, length: parsed }
+    : { address: spec };
+};
+
+export const registerCodeReferenceCommands = (
+  cli: CliInstance,
+  logger: Logger,
+): void => {
+  const service = new CodeReferenceService();
+  cli.command(CLI_COMMANDS.findCodeReferences, {
+    description:
+      "Find jal/j, lui+addiu/load/store and pointer-word references to addresses across several MIPS code files with per-file load addresses",
+    options: z.object({
+      file: z
+        .array(z.string())
+        .describe(
+          "Repeat per code file: PATH (PS-X EXE header gives the load address) or PATH:0xLOADADDR for headerless overlays",
+        ),
+      target: z
+        .array(z.string())
+        .describe(
+          "Repeat per target: 0xADDRESS or 0xADDRESS+LENGTH for a range",
+        ),
+      gp: z
+        .string()
+        .optional()
+        .describe(
+          "Value of $gp for gp-relative references; found automatically from lui/addiu $gp when omitted",
+        ),
+      gpRelative: z
+        .boolean()
+        .default(true)
+        .describe("Detect gp-relative references (--no-gp-relative to skip)"),
+      kind: z
+        .array(
+          z.enum([
+            "call",
+            "jump",
+            "address_pair",
+            "gp_relative",
+            "pointer_word",
+          ]),
+        )
+        .optional()
+        .describe("Reference kinds to report (default all)"),
+      maxReferences: z
+        .number()
+        .int()
+        .min(1)
+        .max(20_000)
+        .default(500)
+        .describe("Maximum references listed; summary counts stay exact"),
+    }),
+    run: ({ options }) =>
+      withCommandCancellation((signal) =>
+        logCliCommand(logger, CLI_COMMANDS.findCodeReferences, () =>
+          finishAnalysisCommand(
+            () =>
+              service.find(
+                {
+                  files: options.file.map(parseFileSpec),
+                  targets: options.target.map(parseTargetSpec),
+                  ...(options.gp === undefined ? {} : { gp: options.gp }),
+                  gp_relative: options.gpRelative,
+                  ...(options.kind === undefined
+                    ? {}
+                    : { kinds: options.kind }),
+                  max_references: options.maxReferences,
+                },
+                { signal },
+              ),
+            service,
+            "rom-code-references",
+            "find_code_references",
+          ),
+        ),
+      ),
+  });
+};
