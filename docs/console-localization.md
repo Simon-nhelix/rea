@@ -182,6 +182,28 @@ pointer is absent. Raw opcode-shaped data and split immediates are not promoted
 to confirmed references. Adjacent pointer distances are allocation candidates,
 not proof that the intervening bytes are exclusively owned by that string.
 
+## Who references this address? (MIPS overlays)
+
+`find-code-references` answers "does any code call this function or form this
+string/table address?" across the main executable and every overlay, each with
+its own load address. It needs no opened target and no Ghidra. A PS-X EXE header
+supplies its load address (text from file offset `0x800`); headerless overlays
+take `PATH:0xLOADADDR`. A target is `0xADDR` or `0xADDR+LENGTH` for a range.
+
+```sh
+node scripts/rea.mjs find-code-references \
+  --file SLPS_026.36 --file OVL/SNMP_GRP.BIN:0x800D61D8 \
+  --target 0x800CBCE8 --target 0x800D6590+0x40 --format json
+```
+
+Hits are `call`/`jump` (`jal`/`j`, 256 MB segment from PC+4), `address_pair`
+(`lui` with `addiu`/`ori`/load/store, tracked per register, sign extension
+applied; the exact formed address is reported) and `pointer_word` (aligned
+32-bit values). The summary states `0 references found` explicitly. Overlays
+sharing a load address cannot be resident together, so the hit's file matters
+(`overlapping_files`). This is a static scan: indirect addresses, `jr` jump
+tables, compressed or encrypted code, and absent overlays are not seen.
+
 ## SNES addresses and instruction state
 
 Ordinary LoROM and HiROM aliases come from one admitted file mapping used by

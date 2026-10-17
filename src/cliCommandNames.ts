@@ -46,6 +46,7 @@ export const CLI_COMMANDS = Object.freeze({
   scanPointerTable: "scan-pointer-table",
   discoverPointerTables: "discover-pointer-tables",
   findCodeCaves: "find-code-caves",
+  findCodeReferences: "find-code-references",
   inspectDiscImage: "inspect-disc-image",
   traceNativeValues: "trace-native-values",
   inspectNativeInstruction: "inspect-native-instruction",
