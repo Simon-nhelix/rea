@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+
 import { z } from "incur";
 import type { Logger } from "pino";
 
@@ -11,6 +13,10 @@ import {
   ROM_WORD_PARITIES,
 } from "../domain/romHacking.js";
 import { parseSegmentSpec } from "../domain/romPointerSegments.js";
+import {
+  romControlCodeDeclarationsSchema,
+  type RomControlCodeInput,
+} from "../domain/romControlCodes.js";
 import { AnalysisInputError } from "../domain/analysisErrorCore.js";
 import { inspectDiscImage } from "../application/romhacking/LocalByteSource.js";
 import { REA_WORKFLOW_PROVIDER } from "../application/InvestigationProviders.js";
@@ -131,6 +137,58 @@ const pointerSegmentOptions = {
 };
 
 /** Map --base-mode/--segment(/--segment-align/--segment-length) to tool input. */
+/**
+ * Read declared control codes from a JSON file or an inline flag. Both state
+ * the same list, so giving two sources at once would leave which one applies
+ * unresolved and is refused.
+ */
+const readControlCodeDeclarations = async (
+  operation: string,
+  options: {
+    readonly controlCodes?: string | undefined;
+    readonly controlCodesJson?: string | undefined;
+  },
+): Promise<ReadonlyArray<RomControlCodeInput> | undefined> => {
+  const file = options.controlCodes;
+  const inline = options.controlCodesJson;
+  const fail = (message: string): never => {
+    throw new AnalysisInputError(operation, undefined, [
+      { path: ["control_codes"], reason: "invalid_value", message },
+    ]);
+  };
+  if (file === undefined && inline === undefined) return undefined;
+  if (file !== undefined && inline !== undefined)
+    fail(
+      "Declare control codes with --control-codes or --control-codes-json, not both.",
+    );
+  let source = inline;
+  if (source === undefined && file !== undefined) {
+    try {
+      source = await readFile(file, "utf8");
+    } catch (cause) {
+      fail(
+        `--control-codes could not read ${file}: ${cause instanceof Error ? cause.message : String(cause)}`,
+      );
+    }
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(source ?? "");
+  } catch (cause) {
+    fail(
+      `Control code declarations are not valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+  }
+  const parsed = romControlCodeDeclarationsSchema.safeParse(value);
+  if (!parsed.success)
+    fail(
+      `Control code declarations are invalid: ${parsed.error.issues
+        .map((issue) => `${issue.path.join(".") || "[]"}: ${issue.message}`)
+        .join("; ")}`,
+    );
+  return parsed.success ? parsed.data : undefined;
+};
+
 const pointerSegmentArguments = (
   operation: string,
   options: {
@@ -456,6 +514,18 @@ export const registerRomHackingCommands = (
         .optional()
         .describe("Inline .tbl character mapping rules"),
       tblText: z.string().min(1).optional().describe("Alias for --table-text"),
+      controlCodes: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Path to a JSON array declaring in-string control codes ({hex, name, argument_bytes, role})",
+        ),
+      controlCodesJson: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Inline JSON array declaring in-string control codes"),
       terminatorByte: z
         .number()
         .int()
@@ -504,8 +574,14 @@ export const registerRomHackingCommands = (
       const resolvedTablePath = options.tablePath ?? options.tblPath;
       const resolvedTableText = options.tableText ?? options.tblText;
       const resolvedXrefs = options.includeXrefs ?? options.resolveXrefs;
-      return logCliCommand(logger, CLI_COMMANDS.scanPointerTable, () =>
-        runDirectAnalysis(
+      // Declarations are read inside the logged command so a bad file or an
+      // ambiguous pair of flags is reported like any other input error.
+      return logCliCommand(logger, CLI_COMMANDS.scanPointerTable, async () => {
+        const controlCodes = await readControlCodeDeclarations(
+          CLI_COMMANDS.scanPointerTable,
+          options,
+        );
+        return runDirectAnalysis(
           args.path,
           "scan_pointer_table",
           {
@@ -535,11 +611,14 @@ export const registerRomHackingCommands = (
             include_manuscript: options.includeManuscript,
             include_hex: options.includeHex,
             manuscript_only: options.manuscriptOnly,
+            ...(controlCodes === undefined
+              ? {}
+              : { control_codes: controlCodes.map((code) => ({ ...code })) }),
             ...romWordFormatArguments(options),
           },
           romAnalysisOptionsFromCli(logger, options),
-        ),
-      );
+        );
+      });
     },
   });
 

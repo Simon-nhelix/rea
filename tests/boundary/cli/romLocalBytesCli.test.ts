@@ -244,3 +244,121 @@ cliTest(
     expect(JSON.stringify(conflicting.json)).toContain("--segment-align");
   },
 );
+
+/**
+ * あ 1B 00 い 0A う 00 at 0x10, か 00 at 0x20, pointers to both at 0x00.
+ * The {COLOR} argument is the terminator byte, so only a declared argument
+ * count keeps the string whole.
+ */
+const CODED_DIALOGUE = (): Buffer => {
+  const bytes = Buffer.alloc(0x30);
+  Buffer.from("10002000", "hex").copy(bytes, 0x00);
+  Buffer.from("82a01b0082a20a82a400", "hex").copy(bytes, 0x10);
+  Buffer.from("82a900", "hex").copy(bytes, 0x20);
+  return bytes;
+};
+
+cliTest(
+  "declares in-string control codes from a file or inline, and refuses both at once",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-rom-codes-cli-");
+    const environment = {
+      HOME: root,
+      XDG_CONFIG_HOME: root,
+      XDG_CACHE_HOME: root,
+    };
+    const path = join(root, "dialogue.bin");
+    await writeFile(path, CODED_DIALOGUE());
+    const codesPath = join(root, "codes.json");
+    await writeFile(
+      codesPath,
+      JSON.stringify([
+        { hex: "1B", name: "COLOR", argument_bytes: 1 },
+        { hex: "0A", name: "LINE", role: "line-break" },
+      ]),
+    );
+    const base = [
+      "scan-pointer-table",
+      path,
+      "--table-offset",
+      "0",
+      "--count",
+      "2",
+      "--pointer-size",
+      "2",
+      "--manuscript-only",
+      "--json",
+    ];
+
+    const plain = await cli.run({ arguments: base, environment });
+    expect(plain.exitCode).toBe(0);
+    expect(plain.json).toMatchObject({
+      normalized_result: {
+        manuscript_records: [
+          { index: 0, byte_length: 4 },
+          { index: 1, jp: "か" },
+        ],
+      },
+    });
+
+    const declared = await cli.run({
+      arguments: [...base, "--control-codes", codesPath],
+      environment,
+    });
+    expect(declared.exitCode).toBe(0);
+    expect(declared.json).toMatchObject({
+      normalized_result: {
+        manuscript_records: [
+          {
+            index: 0,
+            jp: "あ{COLOR}い{LINE}う",
+            byte_length: 10,
+            max_bytes: 16,
+            lines: ["あ{COLOR}い", "う"],
+            character_length: 3,
+            longest_line_characters: 2,
+          },
+          { index: 1, jp: "か", lines: ["か"] },
+        ],
+      },
+    });
+
+    const inline = await cli.run({
+      arguments: [
+        ...base,
+        "--control-codes-json",
+        '[{"hex":"0A","name":"LINE","role":"line-break"}]',
+      ],
+      environment,
+    });
+    expect(inline.exitCode).toBe(0);
+    expect(inline.json).toMatchObject({
+      normalized_result: {
+        manuscript_records: [
+          { index: 0, byte_length: 4 },
+          { index: 1, jp: "か" },
+        ],
+      },
+    });
+
+    const both = await cli.run({
+      arguments: [
+        ...base,
+        "--control-codes",
+        codesPath,
+        "--control-codes-json",
+        "[]",
+      ],
+      environment,
+    });
+    expect(both.exitCode).not.toBe(0);
+    expect(JSON.stringify(both.json)).toContain("not both");
+
+    const missing = await cli.run({
+      arguments: [...base, "--control-codes", join(root, "absent.json")],
+      environment,
+    });
+    expect(missing.exitCode).not.toBe(0);
+    expect(JSON.stringify(missing.json)).toContain("could not read");
+  },
+);

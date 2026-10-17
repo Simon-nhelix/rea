@@ -352,6 +352,16 @@ analysis, and code cave discovery:
   manuscript is needed; shared targets collapse into one record with
   `also_referenced_by`. `segment_start`/`segment_length` read values as
   offsets from an overlay segment, and local results report `coverage`.
+  `control_codes` declares in-string codes (`hex` as stored, `name`,
+  `argument_bytes`, `role` `plain`/`line-break`/`page-break`/`end`), so
+  argument bytes are skipped rather than decoded as glyphs — an argument equal
+  to the terminator no longer cuts the string short — and each manuscript
+  record adds `lines`, `character_length` (code points, no codes counted),
+  `longest_line_characters` and each occurrence's offset, length and
+  `arguments_hex`. CLI `--control-codes <file.json>` or
+  `--control-codes-json '[...]'`. Byte encodings only: the 16-bit word
+  encodings already own string ends and line breaks through `terminator_word`
+  and `newline_word`. `character_length` is not a pixel width.
 - `find_code_caves` (CLI `rea find-code-caves <path>`): find contiguous padding
   regions (`0x00` / `0xFF` or `fill_byte`) sorted largest-first for VWF font
   hooks, expanded 2-byte glyph tables, and relocated dialogue blocks.

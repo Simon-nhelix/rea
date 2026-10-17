@@ -20,6 +20,8 @@ import {
 import {
   computePointerSlotBudgets,
   decodeRomStringFromBytes,
+  decodeRomStringWithControlCodes,
+  type RomTextWithControlCodes,
   encodeRomQueryString,
   extractRomStringsFromBuffer,
   findCodeCavesInSliceTopK,
@@ -44,6 +46,11 @@ import {
   type ScanPointerTableInput,
   type SearchRomStringsInput,
 } from "../../domain/romHacking.js";
+import {
+  parseRomControlCodes,
+  type RomControlCodeInput,
+  type RomControlCodeTable,
+} from "../../domain/romControlCodes.js";
 import type { RomTextFilters } from "../../domain/romTextQuality.js";
 import {
   isTerminatorAt,
@@ -483,6 +490,98 @@ const resolvePointerBase = (
 
 const SEGMENT_NEEDS_LOCAL_BYTES =
   "base_mode segment reads pointer targets as file offsets and needs local file bytes (a console ROM, raw binary, or data file).";
+
+/**
+ * Parse declared control codes once per request, so every scan path reads one
+ * owner's view of where codes begin and end.
+ */
+const loadControlCodes = (
+  operation: string,
+  input: {
+    readonly control_codes?: ReadonlyArray<RomControlCodeInput> | undefined;
+  },
+  words: RomWordFormat | undefined,
+): Result<RomControlCodeTable | undefined, AnalysisError> => {
+  const declared = input.control_codes;
+  if (declared === undefined || declared.length === 0) return ok(undefined);
+  if (words !== undefined)
+    return err(
+      new AnalysisInputError(operation, {
+        userMessage:
+          "control_codes apply to the byte encodings; the 16-bit word encodings already end strings with terminator_word and break lines with newline_word.",
+      }),
+    );
+  const parsed = parseRomControlCodes(declared);
+  return parsed.ok
+    ? ok(parsed.value)
+    : err(new AnalysisInputError(operation, { userMessage: parsed.error }));
+};
+
+/** One decoded target string, with its display view when codes were declared. */
+interface DecodedScanText {
+  readonly text: string;
+  readonly byteLength: number;
+  readonly rawHex: string;
+  readonly display: RomTextWithControlCodes | undefined;
+}
+
+/** Decode one target string the same way on the local and provider paths. */
+const decodeScanText = (
+  buffer: Uint8Array,
+  options: {
+    readonly encoding: RomTextEncoding;
+    readonly terminatorByte: number | null;
+    readonly customTable: CustomCharTable | undefined;
+    readonly words: RomWordFormat | undefined;
+    readonly controlCodes: RomControlCodeTable | undefined;
+  },
+): DecodedScanText => {
+  if (options.controlCodes !== undefined) {
+    const display = decodeRomStringWithControlCodes(
+      buffer,
+      options.encoding,
+      options.terminatorByte,
+      options.customTable,
+      options.controlCodes,
+    );
+    return {
+      text: display.text,
+      byteLength: display.byte_length,
+      rawHex: formatHexPattern(buffer.subarray(0, display.byte_length)),
+      display,
+    };
+  }
+  const decoded = decodeRomStringFromBytes(
+    buffer,
+    options.encoding,
+    options.terminatorByte,
+    options.customTable,
+    options.words,
+  );
+  return {
+    text: decoded.decoded,
+    byteLength: decoded.byteLength,
+    rawHex: decoded.rawHex,
+    display: undefined,
+  };
+};
+
+/** Lines and character counts a translator writes against, when declared. */
+const manuscriptDisplayFields = (
+  display: RomTextWithControlCodes | undefined,
+): Record<string, unknown> =>
+  display === undefined
+    ? {}
+    : {
+        lines: [...display.lines],
+        character_length: display.character_length,
+        longest_line_characters: display.longest_line_characters,
+        ...(display.control_codes.length === 0
+          ? {}
+          : {
+              control_codes: display.control_codes.map((use) => ({ ...use })),
+            }),
+      };
 
 /** Manuscript strings are decoded to their terminator within this bound. */
 const MANUSCRIPT_MAX_BYTES = 4096;
@@ -1407,6 +1506,13 @@ export const executeScanPointerTable = async (
   );
   if (!wordsResult.ok) return wordsResult;
   const words = wordsResult.value;
+  const controlCodesResult = loadControlCodes(
+    "scan_pointer_table",
+    input,
+    words,
+  );
+  if (!controlCodesResult.ok) return controlCodesResult;
+  const controlCodes = controlCodesResult.value;
   const localRom = await loadLocalRomContext(target);
   if (segment !== undefined && localRom === undefined)
     return err(
@@ -1526,14 +1632,14 @@ export const executeScanPointerTable = async (
             ),
           );
           if (targetBuf.length > 0) {
-            const decoded = decodeRomStringFromBytes(
-              targetBuf,
-              input.encoding,
+            const decoded = decodeScanText(targetBuf, {
+              encoding: input.encoding,
               terminatorByte,
               customTable,
               words,
-            );
-            previewText = decoded.decoded;
+              controlCodes,
+            });
+            previewText = decoded.text;
             previewTruncated = decodeWindowTruncated(
               targetBuf,
               decoded.byteLength,
@@ -1583,7 +1689,12 @@ export const executeScanPointerTable = async (
       // once per unique target.
       const fullByTarget = new Map<
         string,
-        { text: string; byteLength: number; truncated: boolean }
+        {
+          text: string;
+          byteLength: number;
+          truncated: boolean;
+          display: RomTextWithControlCodes | undefined;
+        }
       >();
       if (wantsManuscript) {
         for (const entry of enrichedEntries) {
@@ -1600,16 +1711,17 @@ export const executeScanPointerTable = async (
             off,
             Math.min(localRom.romBytes.length, off + MANUSCRIPT_MAX_BYTES),
           );
-          const decoded = decodeRomStringFromBytes(
-            buf,
-            input.encoding,
+          const decoded = decodeScanText(buf, {
+            encoding: input.encoding,
             terminatorByte,
             customTable,
             words,
-          );
+            controlCodes,
+          });
           fullByTarget.set(key, {
-            text: decoded.decoded,
+            text: decoded.text,
             byteLength: decoded.byteLength,
+            display: decoded.display,
             truncated: decodeWindowTruncated(
               buf,
               decoded.byteLength,
@@ -1638,6 +1750,7 @@ export const executeScanPointerTable = async (
                 max_bytes: entry.allocated_budget_bytes,
                 jp: full?.text ?? entry.preview_text ?? "",
                 ...(full?.truncated ? { truncated: true } : {}),
+                ...manuscriptDisplayFields(full?.display),
                 ko: "",
               };
             }),
@@ -1844,7 +1957,12 @@ export const executeScanPointerTable = async (
   // with one batched read per unique target.
   const fullByTarget = new Map<
     string,
-    { text: string; byteLength: number; truncated: boolean }
+    {
+      text: string;
+      byteLength: number;
+      truncated: boolean;
+      display: RomTextWithControlCodes | undefined;
+    }
   >();
   if (wantsManuscript) {
     const readFull = async (
@@ -1853,6 +1971,7 @@ export const executeScanPointerTable = async (
       text: string;
       byteLength: number;
       truncated: boolean;
+      display: RomTextWithControlCodes | undefined;
     } | null> => {
       const fullRead = await callOperation(
         analysis,
@@ -1866,16 +1985,17 @@ export const executeScanPointerTable = async (
         return null;
       }
       const buf = Buffer.from(parsedFull.data.bytes_hex, "hex");
-      const decoded = decodeRomStringFromBytes(
-        buf,
-        input.encoding,
+      const decoded = decodeScanText(buf, {
+        encoding: input.encoding,
         terminatorByte,
         customTable,
         words,
-      );
+        controlCodes,
+      });
       return {
-        text: decoded.decoded,
+        text: decoded.text,
         byteLength: decoded.byteLength,
+        display: decoded.display,
         truncated: decodeWindowTruncated(
           buf,
           decoded.byteLength,
@@ -1907,6 +2027,7 @@ export const executeScanPointerTable = async (
             max_bytes: entry.allocated_budget_bytes,
             jp: full?.text ?? entry.preview_text ?? "",
             ...(full?.truncated ? { truncated: true } : {}),
+            ...manuscriptDisplayFields(full?.display),
             ko: "",
           };
         }),

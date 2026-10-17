@@ -2858,6 +2858,8 @@ it("commits PCE mapping scope into profile identity without changing other conso
   expect(nonPce.value.profile?.parameters).not.toHaveProperty(
     "console_mapping_scope",
   );
+});
+
 const output = (text: string) => ({
   text,
   bytes: Buffer.byteLength(text),

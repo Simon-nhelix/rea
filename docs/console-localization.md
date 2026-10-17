@@ -182,6 +182,59 @@ pointer is absent. Raw opcode-shaped data and split immediates are not promoted
 to confirmed references. Adjacent pointer distances are allocation candidates,
 not proof that the intervening bytes are exclusively owned by that string.
 
+### In-string control codes
+
+Console dialogue mixes glyph bytes with codes that break the line, pause, pick
+a colour or name a speaker, and many of those codes carry argument bytes. Those
+arguments are raw values, not glyphs. Without a declared argument count a
+decoder reads them as text, and an argument that happens to equal the
+terminator ends the string early, so the manuscript text, its `byte_length` and
+its budget are all wrong.
+
+`scan-pointer-table` accepts `control_codes`, a list the caller declares.
+Nothing is inferred from the bytes, because the same byte means different
+things in different games.
+
+| Field            | Meaning                                                                                                                                       |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `hex`            | The code's own bytes as stored, e.g. `0A` or `FFFE`. The longest declared match at an offset wins.                                            |
+| `name`           | Written into the text as `{NAME}`, so a translator keeps the code in place.                                                                   |
+| `argument_bytes` | Raw bytes that follow and are skipped, never decoded. Default 0.                                                                              |
+| `role`           | `plain` keeps the code in the line; `line-break` and `page-break` start a new line (and a new page); `end` stops the string. Default `plain`. |
+
+With declarations, each manuscript record adds the units a translator writes
+against: `lines`, `pages` through the line list, `character_length` (code
+points, counting no code and no argument byte), `longest_line_characters`, and
+`control_codes` with each occurrence's `offset`, `byte_length` and
+`arguments_hex`. A code whose arguments run past the read window is reported
+with `arguments_truncated`. The string terminator ends the string without
+appearing in the text or in the occurrence list; a declared code of the same
+byte takes precedence, because the declaration states what that byte means
+here.
+
+```sh
+cat > codes.json <<'JSON'
+[
+  { "hex": "1B", "name": "COLOR", "argument_bytes": 1 },
+  { "hex": "0A", "name": "LINE", "role": "line-break" },
+  { "hex": "0C", "name": "PAGE", "role": "page-break" }
+]
+JSON
+node scripts/rea.mjs scan-pointer-table /path/game.bin \
+  --table-offset 0x1000 --count 256 --pointer-size 2 \
+  --control-codes codes.json --manuscript-only --format json
+```
+
+`--control-codes-json '[...]'` declares the same list inline. Giving both flags
+at once is refused rather than resolved by precedence. The 16-bit word
+encodings (`sjis-le16`, `tile-le16`, `tile-be16`) refuse `control_codes`:
+there, `terminator_word` already ends strings and `newline_word` already breaks
+lines, and a byte-declared code could land on half a word.
+
+`character_length` counts what the glyph decoder produced. It is not a pixel
+width: a proportional font still needs its own width table, and that table is
+not read here.
+
 ## SNES addresses and instruction state
 
 Ordinary LoROM and HiROM aliases come from one admitted file mapping used by

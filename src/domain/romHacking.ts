@@ -1,6 +1,14 @@
 import { z } from "zod";
 import { err, ok, type Result } from "./result.js";
 import {
+  decodeRomTextWithControlCodes,
+  romControlCodeFields,
+  type RomControlCodeTable,
+  type RomControlCodeUse,
+  type RomTextWithControlCodes,
+  withTerminatorAsEndCode,
+} from "./romControlCodes.js";
+import {
   getSjisDoubleByteDecodeTable,
   getSjisEncodeMap,
 } from "./shiftJisTables.js";
@@ -691,6 +699,31 @@ export const decodeRomStringFromBytes = (
     rawHex: formatHexPattern(consumed),
   };
 };
+
+/**
+ * Decode one ROM string with declared control codes held apart from the glyph
+ * runs, so argument bytes are never read as text and line breaks are visible.
+ *
+ * Only byte encodings are decoded here. In the 16-bit word encodings
+ * terminator_word and newline_word already own string ends and line breaks,
+ * and a byte-declared code could land on half a word.
+ */
+export const decodeRomStringWithControlCodes = (
+  bytes: Uint8Array,
+  encoding: RomTextEncoding,
+  terminatorByte: number | null,
+  customTable: CustomCharTable | undefined,
+  codes: RomControlCodeTable,
+): RomTextWithControlCodes =>
+  decodeRomTextWithControlCodes(
+    bytes,
+    withTerminatorAsEndCode(codes, terminatorByte),
+    // Each run already ends at a code or the buffer, so no terminator applies.
+    (run) => decodeRomStringFromBytes(run, encoding, null, customTable).decoded,
+  );
+
+/** Re-export so result builders need one import for a code occurrence. */
+export type { RomControlCodeUse, RomTextWithControlCodes };
 
 /** Which word alignments a 16-bit word scan examines, by absolute offset. */
 export const ROM_WORD_PARITIES = ["both", "even", "odd"] as const;
@@ -1662,6 +1695,7 @@ export const scanPointerTableInputSchema = z.strictObject({
     .describe(
       "Emit manuscript records and suppress pointer entries (entries is empty, entries_scanned still reports the scanned count). Implies include_manuscript.",
     ),
+  ...romControlCodeFields,
 });
 
 export type ScanPointerTableInput = z.output<
@@ -1696,6 +1730,20 @@ export const manuscriptRecordSchema = z.strictObject({
   jp: z.string(),
   truncated: z.boolean().optional(),
   also_referenced_by: z.array(z.number().int().min(0)).optional(),
+  lines: z.array(z.string()).optional(),
+  character_length: z.number().int().min(0).optional(),
+  longest_line_characters: z.number().int().min(0).optional(),
+  control_codes: z
+    .array(
+      z.strictObject({
+        name: z.string(),
+        offset: z.number().int().min(0),
+        byte_length: z.number().int().min(0),
+        arguments_hex: z.string(),
+        arguments_truncated: z.boolean().optional(),
+      }),
+    )
+    .optional(),
   ko: z.string(),
 });
 
