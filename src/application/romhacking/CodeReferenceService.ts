@@ -36,14 +36,18 @@ interface LoadedRegion {
   readonly bytes: Uint8Array;
   readonly sha256: string;
   readonly loadAddress: number;
-  readonly loadAddressSource: "ps-x-exe-header" | "caller";
+  readonly loadAddressSource:
+    | "ps-x-exe-header"
+    | "elf32-le-header"
+    | "mwo3-header"
+    | "caller";
   readonly fileOffset: number;
   readonly length: number;
   readonly notes: readonly string[];
   readonly useGp: boolean;
 }
 
-/** Locate a file's loadable region: PS-X EXE header, or caller load address. */
+/** Locate a file's loadable region: PS-X EXE, ELF32-LE, MWo3, or caller load address. */
 const locateRegion = (
   path: string,
   bytes: Uint8Array,
@@ -60,30 +64,99 @@ const locateRegion = (
       length: bytes.length,
       notes: [],
     });
-  const magic = Buffer.from(bytes.subarray(0, 8)).toString("latin1");
-  if (magic !== "PS-X EXE" || bytes.length < PSX_HEADER_BYTES)
-    return err(
-      new AnalysisInputError(OPERATION, {
-        userMessage: `${path} has no PS-X EXE header; give its load address as files[].load_address (CLI: --file ${path}:0x800D61D8).`,
-      }),
-    );
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const textAddress = view.getUint32(0x18, true);
-  const declared = view.getUint32(0x1c, true);
-  const available = bytes.length - PSX_HEADER_BYTES;
-  const length = Math.min(declared, available);
-  return ok({
-    loadAddress: textAddress,
-    loadAddressSource: "ps-x-exe-header",
-    fileOffset: PSX_HEADER_BYTES,
-    length,
-    notes:
-      declared > available
-        ? [
-            `${path}: PS-X EXE header declares ${declared} text bytes but only ${available} follow the header; scanned ${available}.`,
-          ]
-        : [],
-  });
+  const magic = Buffer.from(bytes.subarray(0, 8)).toString("latin1");
+  if (magic === "PS-X EXE" && bytes.length >= PSX_HEADER_BYTES) {
+    const textAddress = view.getUint32(0x18, true);
+    const declared = view.getUint32(0x1c, true);
+    const available = bytes.length - PSX_HEADER_BYTES;
+    const length = Math.min(declared, available);
+    return ok({
+      loadAddress: textAddress,
+      loadAddressSource: "ps-x-exe-header",
+      fileOffset: PSX_HEADER_BYTES,
+      length,
+      notes:
+        declared > available
+          ? [
+              `${path}: PS-X EXE header declares ${declared} text bytes but only ${available} follow the header; scanned ${available}.`,
+            ]
+          : [],
+    });
+  }
+  // 32-bit little-endian MIPS ELF (PS2/PSP)
+  if (
+    bytes.length >= 0x34 &&
+    bytes[0] === 0x7f &&
+    bytes[1] === 0x45 &&
+    bytes[2] === 0x4c &&
+    bytes[3] === 0x46 &&
+    bytes[4] === 1 &&
+    bytes[5] === 1 &&
+    view.getUint16(0x12, true) === 8
+  ) {
+    const phOff = view.getUint32(0x1c, true);
+    const phEntSize = view.getUint16(0x2a, true);
+    const phNum = view.getUint16(0x2c, true);
+    if (phOff > 0 && phEntSize >= 32 && phNum > 0 && phNum <= 1024) {
+      for (let i = 0; i < phNum; i++) {
+        const off = phOff + i * phEntSize;
+        if (off + 32 > bytes.length) break;
+        const pType = view.getUint32(off, true);
+        if (pType !== 1) continue; // PT_LOAD
+        const pOffset = view.getUint32(off + 0x04, true);
+        const pVaddr = view.getUint32(off + 0x08, true);
+        const pFilesz = view.getUint32(off + 0x10, true);
+        if (pFilesz === 0 || pOffset >= bytes.length) continue;
+        const available = bytes.length - pOffset;
+        const length = Math.min(pFilesz, available);
+        return ok({
+          loadAddress: pVaddr,
+          loadAddressSource: "elf32-le-header",
+          fileOffset: pOffset,
+          length,
+          notes:
+            pFilesz > available
+              ? [
+                  `${path}: ELF PT_LOAD declares ${pFilesz} bytes at 0x${pOffset.toString(16)} but only ${available} are available; scanned ${available}.`,
+                ]
+              : [],
+        });
+      }
+    }
+  }
+  // CodeWarrior PS2 'MWo3' overlay (0x40-byte header placed at base loadAddress)
+  if (
+    bytes.length >= 0x40 &&
+    bytes[0] === 0x4d &&
+    bytes[1] === 0x57 &&
+    bytes[2] === 0x6f &&
+    bytes[3] === 0x33
+  ) {
+    const baseAddress = view.getUint32(0x08, true);
+    const textSize = view.getUint32(0x0c, true);
+    const dataSize = view.getUint32(0x10, true);
+    const declared = textSize + dataSize;
+    const available = bytes.length - 0x40;
+    const length = Math.min(declared, available);
+    return ok({
+      loadAddress: (baseAddress + 0x40) >>> 0,
+      loadAddressSource: "mwo3-header",
+      fileOffset: 0x40,
+      length,
+      notes:
+        declared > available
+          ? [
+              `${path}: MWo3 header declares ${declared} payload bytes but only ${available} follow the 0x40-byte header; scanned ${available}.`,
+            ]
+          : [],
+    });
+  }
+  return err(
+    new AnalysisInputError(OPERATION, {
+      userMessage: `${path} has no PS-X EXE, ELF32-LE, or MWo3 header; give its load address as files[].load_address (CLI: --file ${path}:0x800D61D8).`,
+    }),
+  );
 };
 
 /** Abort state read through a function so narrowing never outlives an await. */

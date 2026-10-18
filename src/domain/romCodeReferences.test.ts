@@ -303,7 +303,9 @@ describe("gp-relative references", () => {
     expect(gpScan(clobbered)).toHaveLength(0);
   });
 
-  it("finds the lui/addiu gp initializer", () => {
+  it("finds the lui/addiu or lui/daddiu gp initializer", () => {
+    const daddiu = (rt: number, rs: number, imm: number) =>
+      i(0x19, rs, rt, imm);
     const bytes = bytesOf([
       nop,
       lui(GPR, 0x8006),
@@ -318,5 +320,65 @@ describe("gp-relative references", () => {
         address: 0x80010000,
       }),
     ).toEqual({ value: GP, address: 0x80010004, fileOffset: 4 });
+
+    const r5900Bytes = bytesOf([lui(GPR, 0x0052), daddiu(GPR, GPR, -0x1200)]);
+    expect(
+      findGpInitializer({
+        bytes: r5900Bytes,
+        fileOffset: 0,
+        length: 8,
+        address: 0x00100100,
+      }),
+    ).toEqual({ value: 0x0051ee00, address: 0x00100100, fileOffset: 0 });
+  });
+
+  it("pairs lui with R5900 daddiu, daddu move, and ld/sd/lq/sq accesses", () => {
+    const daddiu = (rt: number, rs: number, imm: number) =>
+      i(0x19, rs, rt, imm);
+    const dadduMove = (rd: number, rs: number) =>
+      ((rs << 21) | (rd << 11) | 0x2d) >>> 0;
+    const ld = (rt: number, off: number, rs: number) => i(0x37, rs, rt, off);
+    const sq = (rt: number, off: number, rs: number) => i(0x1f, rs, rt, off);
+    const hits = scan(
+      [
+        lui(R.v0, 0x0045),
+        dadduMove(R.a0, R.v0),
+        daddiu(R.a0, R.a0, 0x1234),
+        ld(R.v1, 0x10, R.a0),
+        sq(R.v1, 0x20, R.a0),
+      ],
+      0x00100000,
+      [
+        { address: 0x00451234, length: 1 },
+        { address: 0x00451244, length: 1 },
+        { address: 0x00451254, length: 1 },
+      ],
+    );
+    expect(hits.map((h) => [h.targetIndex, h.instruction])).toEqual([
+      [0, "daddiu a0, a0, 0x1234"],
+      [1, "ld v1, 0x10(a0)"],
+      [2, "sq v1, 0x20(a0)"],
+    ]);
+  });
+
+  it("tracks indexed array base across lui + addu/daddu + load/store", () => {
+    const addu = (rd: number, rs: number, rt: number) =>
+      ((rs << 21) | (rt << 16) | (rd << 11) | 0x21) >>> 0;
+    const hits = scan(
+      [
+        lui(R.at, 0x004b),
+        addu(R.at, R.at, R.v0), // $at = 0x004b0000 + index ($v0)
+        lw(R.v0, 0x5430, R.at), // loads from 0x004b5430 + index
+      ],
+      0x00100000,
+      one(0x004b5430),
+    );
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({
+      kind: "address_pair",
+      instruction: "lw v0, 0x5430(at)",
+      targetAddress: 0x004b5430,
+      sourceLuiAddress: 0x00100000,
+    });
   });
 });

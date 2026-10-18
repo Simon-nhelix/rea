@@ -18,16 +18,20 @@ export const parseFileSpec = (
     : { path: absoluteCallerPath(match[1]), load_address: match[2] };
 };
 
-/** `0x800CBCE8` or `0x800D6590+0x40` (start plus byte length). */
+/** `0x800CBCE8[:name]` or `0x800D6590+0x40[:name]` (start, optional byte length, optional label). */
 export const parseTargetSpec = (
   spec: string,
-): { address: string; length?: number } => {
-  const [address = spec, length] = spec.split("+");
-  if (length === undefined) return { address };
+): { address: string; length?: number; name?: string } => {
+  const colonIdx = spec.indexOf(":");
+  const core = colonIdx >= 0 ? spec.slice(0, colonIdx) : spec;
+  const rawName = colonIdx >= 0 ? spec.slice(colonIdx + 1).trim() : "";
+  const namePart = rawName.length > 0 ? { name: rawName } : {};
+  const [address = core, length] = core.split("+");
+  if (length === undefined) return { address, ...namePart };
   const parsed = Number(length);
   return Number.isSafeInteger(parsed)
-    ? { address, length: parsed }
-    : { address: spec };
+    ? { address, length: parsed, ...namePart }
+    : { address: core, ...namePart };
 };
 
 export const registerCodeReferenceCommands = (

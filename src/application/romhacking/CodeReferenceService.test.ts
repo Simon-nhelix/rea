@@ -238,4 +238,54 @@ describe("CLI spec parsing", () => {
     });
     expect(parseTargetSpec("0x800CBCE8")).toEqual({ address: "0x800CBCE8" });
   });
+
+  it("auto-detects MIPS ELF32-LE PT_LOAD and CodeWarrior MWo3 overlay headers", async () => {
+    const elfPath = join(directory, "SLPS_255.37");
+    const mwo3Path = join(directory, "STG_000.BIN");
+    const daddiu = (rt: number, rs: number, imm: number) =>
+      ((0x19 << 26) | (rs << 21) | (rt << 16) | (imm & 0xffff)) >>> 0;
+
+    // Build minimal ELF32-LE MIPS executable with PT_LOAD at offset 0x80 -> vaddr 0x00100000
+    const elfHeader = Buffer.alloc(0x80, 0);
+    elfHeader.set([0x7f, 0x45, 0x4c, 0x46, 1, 1, 1]);
+    elfHeader.writeUInt16LE(2, 0x10);
+    elfHeader.writeUInt16LE(8, 0x12);
+    elfHeader.writeUInt32LE(0x34, 0x1c);
+    elfHeader.writeUInt16LE(32, 0x2a);
+    elfHeader.writeUInt16LE(1, 0x2c);
+    elfHeader.writeUInt32LE(1, 0x34); // PT_LOAD
+    elfHeader.writeUInt32LE(0x80, 0x38); // p_offset
+    elfHeader.writeUInt32LE(0x00100000, 0x3c); // p_vaddr
+    elfHeader.writeUInt32LE(8, 0x44); // p_filesz
+    await writeFile(
+      elfPath,
+      Buffer.concat([elfHeader, words([lui(4, 0x0045), daddiu(4, 4, 0x1234)])]),
+    );
+
+    // Build minimal MWo3 overlay loaded at 0x00814e00 (code starts at +0x40 -> 0x00814e40)
+    const mwo3Header = Buffer.alloc(0x40, 0);
+    mwo3Header.write("MWo3", 0, "ascii");
+    mwo3Header.writeUInt32LE(0x00814e00, 0x08);
+    mwo3Header.writeUInt32LE(8, 0x0c); // textSize = 8
+    mwo3Header.writeUInt32LE(4, 0x10); // dataSize = 4
+    await writeFile(
+      mwo3Path,
+      Buffer.concat([mwo3Header, words([jal(0x00100000), 0, 0x00451234])]),
+    );
+
+    const res = await new CodeReferenceService().find({
+      files: [{ path: elfPath }, { path: mwo3Path }],
+      targets: [{ address: "0x00451234" }, { address: "0x00100000" }],
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    const report = resultOf(res.value);
+    expect(
+      report.files.map((f) => [f.load_address, f.load_address_source]),
+    ).toEqual([
+      ["0x00100000", "elf32-le-header"],
+      ["0x00814e40", "mwo3-header"],
+    ]);
+    expect(report.total_references).toBe(3);
+  });
 });

@@ -159,7 +159,19 @@ export const detectConsoleFormatFromHeader = (
     return "ps3";
   }
 
-  // 6. PS2 Emotion Engine ELF32 or PSP PRX / Commercial Allegrex ELF32
+  // 6. PS2 Emotion Engine ELF32, CodeWarrior MWo3 overlay, or PSP PRX / Commercial Allegrex ELF32
+  if (
+    bytes.length >= 0x40 &&
+    bytes[0] === 0x4d && // 'M'
+    bytes[1] === 0x57 && // 'W'
+    bytes[2] === 0x6f && // 'o'
+    bytes[3] === 0x33 // '3'
+  ) {
+    const loadAddr = bytes.readUInt32LE(0x08);
+    if (loadAddr >= 0x00100000 && loadAddr < 0x02000000) {
+      return "ps2-elf";
+    }
+  }
   if (
     bytes.length >= 0x34 &&
     bytes[0] === 0x7f &&
@@ -580,7 +592,7 @@ const parseElf32LeLoadMappings = (
   const phOff = elfBytes.readUInt32LE(0x1c);
   const phEntSize = elfBytes.readUInt16LE(0x2a);
   const phNum = elfBytes.readUInt16LE(0x2c);
-  if (phOff === 0 || phEntSize < 32 || phNum === 0 || phNum > 64) return [];
+  if (phOff === 0 || phEntSize < 32 || phNum === 0 || phNum > 1024) return [];
   const mappings: ConsoleFileMapping[] = [];
   for (let i = 0; i < phNum; i++) {
     const off = phOff + i * phEntSize;
@@ -613,6 +625,80 @@ const admitPs2Elf = (
   fileBytes: number,
   explicitEntry?: { canonical: string; source: string },
 ): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
+  const ps2MemoryRegions: readonly ConsoleMemoryRegion[] = [
+    {
+      name: "EE_MAIN_RAM",
+      virtualAddress: "0x100000",
+      byteLength: 0x1f00000,
+      kind: "ram",
+    },
+    {
+      name: "EE_SCRATCHPAD",
+      virtualAddress: "0x70000000",
+      byteLength: 0x4000,
+      kind: "scratchpad",
+    },
+    {
+      name: "GS_PRIVILEGED",
+      virtualAddress: "0x12000000",
+      byteLength: 0x2000,
+      kind: "mmio",
+    },
+  ];
+
+  // CodeWarrior PS2 overlay ('MWo3' 0x40-byte header)
+  if (
+    headerBytes.length >= 0x40 &&
+    headerBytes[0] === 0x4d &&
+    headerBytes[1] === 0x57 &&
+    headerBytes[2] === 0x6f &&
+    headerBytes[3] === 0x33
+  ) {
+    const phIndex = headerBytes.readUInt32LE(0x04);
+    const loadAddr = headerBytes.readUInt32LE(0x08);
+    const textSize = headerBytes.readUInt32LE(0x0c);
+    const dataSize = headerBytes.readUInt32LE(0x10);
+    const bssSize = headerBytes.readUInt32LE(0x14);
+    const overlayName = headerBytes
+      .subarray(0x20, 0x40)
+      .toString("ascii")
+      .split("\0")[0];
+    const declaredBytes = 0x40 + textSize + dataSize;
+    const mappedBytes = Math.min(fileBytes, declaredBytes);
+    const entryPoint =
+      explicitEntry?.canonical ?? hex32((loadAddr + 0x40) >>> 0);
+    return ok({
+      format: "ps2-elf",
+      architecture: "r5900",
+      ghidraLanguageId: "MIPS:LE:64:64-32addr",
+      compilerSpecId: "default",
+      loader: "BinaryLoader",
+      loadBase: hex32(loadAddr),
+      entryPoint,
+      entryPointSource: explicitEntry?.source ?? entryPoint,
+      fileMappings: [
+        {
+          name: "MWO3_OVERLAY",
+          virtualAddress: hex32(loadAddr),
+          fileOffset: 0,
+          byteLength: mappedBytes,
+          executable: true,
+          writable: true,
+        },
+      ],
+      memoryRegions: ps2MemoryRegions,
+      romMetadata: {
+        container: "MWo3",
+        overlay_name: overlayName ?? "",
+        ph_index: phIndex,
+        load_address: hex32(loadAddr),
+        text_size: textSize,
+        data_size: dataSize,
+        bss_size: bssSize,
+      },
+    });
+  }
+
   if (
     headerBytes.length < 0x34 ||
     headerBytes[0] !== 0x7f ||
@@ -643,26 +729,7 @@ const admitPs2Elf = (
     entryPoint,
     entryPointSource: explicitEntry?.source ?? entryPoint,
     fileMappings: mappings,
-    memoryRegions: [
-      {
-        name: "EE_MAIN_RAM",
-        virtualAddress: "0x100000",
-        byteLength: 0x1f00000,
-        kind: "ram",
-      },
-      {
-        name: "EE_SCRATCHPAD",
-        virtualAddress: "0x70000000",
-        byteLength: 0x4000,
-        kind: "scratchpad",
-      },
-      {
-        name: "GS_PRIVILEGED",
-        virtualAddress: "0x12000000",
-        byteLength: 0x2000,
-        kind: "mmio",
-      },
-    ],
+    memoryRegions: ps2MemoryRegions,
     romMetadata: {
       elf_entry: hex32(entry),
       elf_flags: hex32(flags),

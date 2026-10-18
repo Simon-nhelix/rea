@@ -138,7 +138,12 @@ export const findCodeReferencesResultSchema = z.strictObject({
       sha256: z.string(),
       size: z.number().int().min(0),
       load_address: z.string(),
-      load_address_source: z.enum(["ps-x-exe-header", "caller"]),
+      load_address_source: z.enum([
+        "ps-x-exe-header",
+        "elf32-le-header",
+        "mwo3-header",
+        "caller",
+      ]),
       scanned_file_offset: z.number().int().min(0),
       scanned_bytes: z.number().int().min(0),
       region_end_address: z.string(),
@@ -214,6 +219,8 @@ const REGISTERS = [
 ] as const;
 
 const LOAD_STORE_NAMES: ReadonlyMap<number, string> = new Map([
+  [0x1e, "lq"],
+  [0x1f, "sq"],
   [0x20, "lb"],
   [0x21, "lh"],
   [0x22, "lwl"],
@@ -221,17 +228,22 @@ const LOAD_STORE_NAMES: ReadonlyMap<number, string> = new Map([
   [0x24, "lbu"],
   [0x25, "lhu"],
   [0x26, "lwr"],
+  [0x27, "lwu"],
   [0x28, "sb"],
   [0x29, "sh"],
   [0x2a, "swl"],
   [0x2b, "sw"],
   [0x2e, "swr"],
+  [0x31, "lwc1"],
   [0x32, "lwc2"],
+  [0x37, "ld"],
+  [0x39, "swc1"],
   [0x3a, "swc2"],
+  [0x3f, "sd"],
 ]);
 /** Loads that write the GPR in rt. */
 const GPR_LOADS: ReadonlySet<number> = new Set([
-  0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26,
+  0x1e, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x37,
 ]);
 
 const hex = (value: number): string =>
@@ -353,6 +365,13 @@ const jumpEffect = (scanner: Scanner, d: Decoded): Effect => {
   return isCall ? { next: "call", dest: 31 } : { next: "reset" };
 };
 
+const IMMEDIATE_ADD_NAMES: ReadonlyMap<number, string> = new Map([
+  [8, "addi"],
+  [9, "addiu"],
+  [0x18, "daddi"],
+  [0x19, "daddiu"],
+]);
+
 const immediateEffect = (scanner: Scanner, d: Decoded): Effect => {
   if (d.op === 0x0f)
     return {
@@ -370,7 +389,7 @@ const immediateEffect = (scanner: Scanner, d: Decoded): Effect => {
   const formed = (isOri ? base.value | d.imm : base.value + d.simm) >>> 0;
   const text = isOri
     ? `ori ${reg(d.rt)}, ${reg(d.rs)}, 0x${d.imm.toString(16)}`
-    : `${d.op === 9 ? "addiu" : "addi"} ${reg(d.rt)}, ${reg(d.rs)}, ${signedHex(d.simm)}`;
+    : `${IMMEDIATE_ADD_NAMES.get(d.op) ?? "addiu"} ${reg(d.rt)}, ${reg(d.rs)}, ${signedHex(d.simm)}`;
   const target = scanner.findTarget(formed);
   if (target !== undefined)
     scanner.emit({
@@ -424,9 +443,27 @@ const specialEffect = (scanner: Scanner, d: Decoded): Effect => {
   if (funct === 8) return { next: "reset" }; // jr
   if (funct === 9) return { next: "call", dest: d.rd }; // jalr
   if (NO_RESULT_FUNCT.has(funct)) return {};
-  const isMove = (funct === 0x21 || funct === 0x25) && d.rt === 0;
-  const moved = isMove ? scanner.regs[d.rs] : undefined;
-  return moved === undefined ? { dest: d.rd } : { dest: d.rd, value: moved };
+  const isMove =
+    (funct === 0x21 || funct === 0x25 || funct === 0x2d) && d.rt === 0;
+  if (isMove) {
+    const moved = scanner.regs[d.rs];
+    return moved === undefined ? { dest: d.rd } : { dest: d.rd, value: moved };
+  }
+  // Indexed array base: `lui $at, hi` + `addu/daddu $at, $at, $idx` + `lw $v0, lo($at)`
+  const isAdd =
+    funct === 0x20 || funct === 0x21 || funct === 0x2c || funct === 0x2d;
+  if (isAdd && d.rs !== 0 && d.rt !== 0) {
+    const lhs = scanner.regs[d.rs];
+    const rhs = scanner.regs[d.rt];
+    const base =
+      lhs !== undefined && !lhs.derived && !lhs.gp && rhs === undefined
+        ? lhs
+        : rhs !== undefined && !rhs.derived && !rhs.gp && lhs === undefined
+          ? rhs
+          : undefined;
+    if (base !== undefined) return { dest: d.rd, value: base };
+  }
+  return { dest: d.rd };
 };
 
 const otherEffect = (d: Decoded): Effect => {
@@ -441,7 +478,14 @@ const otherEffect = (d: Decoded): Effect => {
 
 const effectOf = (scanner: Scanner, d: Decoded): Effect => {
   if (d.op === 2 || d.op === 3) return jumpEffect(scanner, d);
-  if (d.op === 0x0f || d.op === 8 || d.op === 9 || d.op === 0x0d)
+  if (
+    d.op === 0x0f ||
+    d.op === 8 ||
+    d.op === 9 ||
+    d.op === 0x18 ||
+    d.op === 0x19 ||
+    d.op === 0x0d
+  )
     return immediateEffect(scanner, d);
   if (LOAD_STORE_NAMES.has(d.op)) return memoryEffect(scanner, d);
   if (d.op === 0) return specialEffect(scanner, d);

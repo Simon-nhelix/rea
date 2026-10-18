@@ -613,4 +613,54 @@ describe("PCE reset mapping provenance", () => {
     expect(admitted.value.entryPoint).toBe("0x4100");
     expect(resolveConsoleFileOffset(admitted.value, 0x4100)).toBeNull();
   });
+
+  it("maps PS2 ELF with >64 CodeWarrior overlay program headers and admits MWo3 overlays", () => {
+    const phNum = 245;
+    const header = Buffer.alloc(0x34 + phNum * 32, 0);
+    header.set([0x7f, 0x45, 0x4c, 0x46, 1, 1, 1]);
+    header.writeUInt16LE(2, 0x10); // ET_EXEC
+    header.writeUInt16LE(8, 0x12); // EM_MIPS
+    header.writeUInt32LE(0x00100108, 0x18); // entry
+    header.writeUInt32LE(0x34, 0x1c); // phoff
+    header.writeUInt32LE(0x20924001, 0x24); // R5900 flags
+    header.writeUInt16LE(32, 0x2a); // phentsize
+    header.writeUInt16LE(phNum, 0x2c); // phnum = 245 (> 64)
+    // PH[0]: PT_LOAD
+    header.writeUInt32LE(1, 0x34);
+    header.writeUInt32LE(0x1f00, 0x38); // p_offset
+    header.writeUInt32LE(0x00100000, 0x3c); // p_vaddr
+    header.writeUInt32LE(0x40b500, 0x44); // p_filesz
+    header.writeUInt32LE(7, 0x4c); // PF_R | PF_W | PF_X
+
+    const admitted = admitConsoleTarget({
+      format: "ps2-elf",
+      headerBytes: header,
+      fileBytes: 0x40d400,
+    });
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    expect(admitted.value.fileMappings).toHaveLength(1);
+    expect(resolveConsoleFileOffset(admitted.value, 0x00100108)).toBe(0x2008);
+
+    // CodeWarrior MWo3 overlay
+    const mwo3 = Buffer.alloc(0x80, 0);
+    mwo3.write("MWo3", 0, "ascii");
+    mwo3.writeUInt32LE(1, 0x04); // ph index
+    mwo3.writeUInt32LE(0x00814e00, 0x08); // loadAddr
+    mwo3.writeUInt32LE(0x1000, 0x0c); // textSize
+    mwo3.writeUInt32LE(0x2000, 0x10); // dataSize
+    mwo3.write("stg_000.bin\0", 0x20, "ascii");
+    expect(
+      detectConsoleFormatFromHeader(mwo3, 0x3040, "/roms/stg_000.bin"),
+    ).toBe("ps2-elf");
+    const ovAdmitted = admitConsoleTarget({
+      format: "ps2-elf",
+      headerBytes: mwo3,
+      fileBytes: 0x3040,
+    });
+    expect(ovAdmitted.ok).toBe(true);
+    if (!ovAdmitted.ok) return;
+    expect(ovAdmitted.value.entryPoint).toBe("0x814e40");
+    expect(resolveConsoleFileOffset(ovAdmitted.value, 0x00815e40)).toBe(0x1040);
+  });
 });
