@@ -93,7 +93,7 @@ export const ENHANCED_TOOL_CONTRACTS = [
   ),
   enhanced(
     "scan_pointer_table",
-    "Scan a 16-bit, 24-bit, or 32-bit pointer table in console ROM or executable memory with configurable endianness, bank base_address, and entry stride. Resolves each slot's target virtual address, ROM file offset, in-place byte budget, decoded string preview (Shift-JIS/EUC-JP/UTF/ASCII/.tbl), optional locbatch.py manuscript records, and incoming cross-references.",
+    "Scan a 16-bit, 24-bit, or 32-bit pointer table with configurable endianness, base_address and stride. Returns target addresses, file offsets, candidate byte spans, decoded previews and optional manuscript records / cross-references. include_orphan_strings finds unreferenced strings between targets, cuts overlapping spans and includes orphan manuscript records with null pointer fields. Spans do not prove exclusive ownership or safe overwrite.",
     enhancedInputSchemas.scan_pointer_table,
   ),
   enhanced(

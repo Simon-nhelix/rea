@@ -25,9 +25,10 @@ import {
   type FindCodeReferencesResult,
   type LoadAddressSource,
 } from "../../domain/romCodeReferences.js";
-import { CODE_REFERENCE_LIMITATIONS } from "../../domain/romCodeReferenceLimitations.js";
+import { codeReferenceLimitations } from "../../domain/romCodeReferenceLimitations.js";
 import { overlappingRegions } from "../../domain/romCodeReferenceRegions.js";
 import { findGpInitializer } from "../../domain/romGpInitializer.js";
+import { admitConsoleTarget } from "../../domain/consoleRom.js";
 
 const OPERATION = "find_code_references";
 const MAX_FILE_BYTES = 256 * 1024 * 1024;
@@ -184,15 +185,34 @@ const locateRegions = (
     bytes[2] === 0x53 &&
     bytes[3] === 0x1a
   ) {
-    return ok([
-      {
-        loadAddress: 0x8000,
-        loadAddressSource: "ines-header",
-        fileOffset: 16,
-        length: bytes.length - 16,
-        notes: [],
-      },
-    ]);
+    const admitted = admitConsoleTarget({
+      format: "nes",
+      headerBytes: Buffer.from(
+        bytes.buffer,
+        bytes.byteOffset,
+        bytes.byteLength,
+      ),
+      fileBytes: bytes.length,
+    });
+    if (!admitted.ok)
+      return err(
+        new AnalysisInputError(OPERATION, {
+          userMessage: admitted.error.reason,
+        }),
+      );
+    return ok(
+      admitted.value.fileMappings
+        .filter((mapping) => mapping.executable)
+        .map((mapping) => ({
+          loadAddress: Number(BigInt(mapping.virtualAddress)),
+          loadAddressSource: "ines-header" as const,
+          fileOffset: mapping.fileOffset,
+          length: mapping.byteLength,
+          notes: [
+            `${path}: NES scan uses admitted PRG bank windows and mirrors; runtime mapper changes and unmapped banks are not resolved.`,
+          ],
+        })),
+    );
   }
   // GBA ROM (0x08000000) when arm-le / thumb-le or .gba
   if (
@@ -552,7 +572,7 @@ export class CodeReferenceService {
           path: file.path,
         })),
         limitations: [
-          ...CODE_REFERENCE_LIMITATIONS,
+          ...codeReferenceLimitations(input.architecture),
           ...regions.flatMap((region) => region.notes),
           ...(gp.source === "auto"
             ? [

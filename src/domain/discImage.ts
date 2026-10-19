@@ -429,12 +429,17 @@ export const parseGdiSheet = (text: string): Result<GdiSheet, string> => {
     const offset = Number(tokens[5]);
     if (
       !Number.isInteger(number) ||
+      number < 1 ||
+      number > 99 ||
+      tracks.some((t) => t.number === number) ||
       !Number.isInteger(startLba) ||
-      !Number.isInteger(trackType) ||
+      startLba < 0 ||
+      (trackType !== 0 && trackType !== 4) ||
       (sectorSize !== CD_USER_DATA_BYTES &&
         sectorSize !== RAW_CD_SECTOR_BYTES) ||
       fileName.length === 0 ||
-      !Number.isInteger(offset)
+      !Number.isSafeInteger(offset) ||
+      offset < 0
     )
       return err(`Invalid GDI track fields at line ${i + 1}`);
     tracks.push({
@@ -446,8 +451,8 @@ export const parseGdiSheet = (text: string): Result<GdiSheet, string> => {
       offset,
     });
   }
-  return tracks.length === 0
-    ? err("GDI sheet declares no tracks")
+  return tracks.length !== declaredCount
+    ? err("GDI track count does not match the declared track entries")
     : ok({ tracks });
 };
 
@@ -463,9 +468,15 @@ export const resolveGdiDataTrack = (
   const size = fileBytes.get(selected.fileName);
   if (size === undefined)
     return err(`Size of GDI track file "${selected.fileName}" is unknown`);
-  if (size % selected.sectorSize !== 0)
+  if (selected.offset % selected.sectorSize !== 0)
+    return err("GDI track file offsets must be sector-aligned for this reader");
+  if (selected.offset >= size)
     return err(
-      `GDI track file "${selected.fileName}" size ${size} is not a multiple of ${selected.sectorSize}-byte sectors`,
+      `GDI track file "${selected.fileName}" has no data after offset ${selected.offset}`,
+    );
+  if ((size - selected.offset) % selected.sectorSize !== 0)
+    return err(
+      `GDI track file "${selected.fileName}" data after offset ${selected.offset} is not a multiple of ${selected.sectorSize}-byte sectors`,
     );
   const mode: DataTrackMode =
     selected.sectorSize === RAW_CD_SECTOR_BYTES ? "MODE1/2352" : "MODE1/2048";
@@ -475,8 +486,8 @@ export const resolveGdiDataTrack = (
     fileName: selected.fileName,
     rawSectorBytes: selected.sectorSize,
     userDataOffset: selected.sectorSize === RAW_CD_SECTOR_BYTES ? 16 : 0,
-    firstSectorInFile: 0,
-    sectorCount: size / selected.sectorSize,
+    firstSectorInFile: selected.offset / selected.sectorSize,
+    sectorCount: (size - selected.offset) / selected.sectorSize,
     firstLba: selected.startLba,
     otherDataTracks: dataTracks
       .filter((t) => t.number !== selected.number)

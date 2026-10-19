@@ -260,7 +260,12 @@ export const readGdiDataTrack = async (
   const imagePath = filePath(layout.value.fileName);
   const image = await readWholeFile(operation, imagePath);
   if (!image.ok) return image;
-  const userData = extractDataTrackUserData(image.value, layout.value);
+  const userData = extractDataTrackUserData(
+    image.value.subarray(
+      layout.value.firstSectorInFile * layout.value.rawSectorBytes,
+    ),
+    layout.value,
+  );
   return ok({
     cuePath: gdiPath,
     cueSha256: sha256(gdiBytes),

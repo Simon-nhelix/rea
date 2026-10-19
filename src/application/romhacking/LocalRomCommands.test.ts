@@ -82,6 +82,83 @@ afterAll(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
+describe("mapped raw and disc reads", () => {
+  it("reads GDI data after its declared file offset", async () => {
+    const track = join(root, "offset-track.bin");
+    const user = new Uint8Array(USER * 2);
+    user.set(DOU, USER + 0x10);
+    await writeFile(track, modeOneTrack(0, user));
+    const descriptor = join(root, "offset.gdi");
+    await writeFile(descriptor, `1\n3 45000 4 2352 offset-track.bin 2352\n`);
+    const result = await runLocalRomTool({
+      path: descriptor,
+      tool: "search_rom_strings",
+      arguments: { ...searchArguments, length: USER },
+      signal,
+      localBytes: true,
+    });
+    expect(result?.ok).toBe(true);
+    if (!result?.ok) return;
+    expect(result.value.result).toMatchObject({
+      matches: [{ file_offset: 0x10, lba: 45000, text: "どう" }],
+      source: {
+        disc: {
+          sectors: 1,
+          first_sector_in_image: 1,
+          header_mismatched_sectors: 0,
+        },
+      },
+    });
+  });
+
+  it.each([
+    { base: "0x0", raw: 0x20, width: 2 },
+    { base: "0x08000000", raw: 0x20, width: 2 },
+    { base: "0x0", raw: 0x08000020, width: 4 },
+  ])(
+    "preserves pointer base $base with raw pointer $raw separately from the image load address",
+    async ({ base, raw, width }) => {
+      const bytes = Buffer.alloc(128);
+      bytes.writeUInt32LE(raw);
+      bytes.write("OK\0", 0x20, "ascii");
+      const path = join(root, `raw-${base}-${raw}.bin`);
+      await writeFile(path, bytes);
+      const result = await runLocalRomTool({
+        path,
+        tool: "scan_pointer_table",
+        arguments: {
+          table_offset: 0,
+          count: 1,
+          pointer_size: width,
+          base_address: base,
+          encoding: "ascii",
+          resolve_xrefs: false,
+        },
+        signal,
+        localBytes: false,
+        formatHint: "raw-binary",
+        architecture: "arm",
+        loadAddress: "0x08000000",
+        entryPoint: "0x08000000",
+      });
+      expect(result?.ok).toBe(true);
+      if (!result?.ok) return;
+      expect(result.value.result).toMatchObject({
+        base_address: `0x${BigInt(base).toString(16)}`,
+        table_address: "0x8000000",
+        entries: [
+          {
+            entry_address: "0x8000000",
+            target_address: "0x8000020",
+            target_file_offset: 0x20,
+            preview_text: "OK",
+          },
+        ],
+      });
+    },
+  );
+});
+
 describe("local byte sources for ROM text tools", () => {
   it("falls back to plain bytes when the format is not recognized", async () => {
     const run = await runLocalRomTool({

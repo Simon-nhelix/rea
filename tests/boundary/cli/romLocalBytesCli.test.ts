@@ -5,6 +5,139 @@ import { expect } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { cliTest } from "../../support/cli/cliFixture.js";
+import { iso9660Fixture } from "../../fixtures/iso9660.js";
+
+cliTest(
+  "exports orphan manuscript text without overlapping budgets and preserves neighboring text on readback",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-rom-orphan-cli-");
+    const environment = {
+      HOME: root,
+      XDG_CONFIG_HOME: root,
+      XDG_CACHE_HOME: root,
+    };
+    const path = join(root, "dialogue.dat");
+    const bytes = Buffer.alloc(128);
+    bytes.writeUInt16LE(0x20, 0);
+    bytes.writeUInt16LE(0x40, 2);
+    bytes.write("AA\0BB\0", 0x20, "ascii");
+    bytes.write("CC\0", 0x40, "ascii");
+    await writeFile(path, bytes);
+    const args = [
+      "scan-pointer-table",
+      path,
+      "--target-format",
+      "data",
+      "--table-offset",
+      "0",
+      "--count",
+      "2",
+      "--pointer-size",
+      "2",
+      "--encoding",
+      "ascii",
+      "--include-manuscript",
+      "--include-orphan-strings",
+      "--no-resolve-xrefs",
+    ];
+    const output = join(root, "manuscript.jsonl");
+    const exported = await cli.run({
+      arguments: [...args, "--output", output, "--json"],
+      environment,
+    });
+    expect(exported.exitCode).toBe(0);
+    expect(exported.json).toMatchObject({
+      normalized_result: { entries_scanned: 2, output: { records: 3 } },
+    });
+    const records = (await readFile(output, "utf8"))
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            id: string;
+            jp: string;
+            max_bytes: number;
+            target_file_offset: number;
+          },
+      );
+    expect(records.map((r) => r.jp)).toEqual(["AA", "CC", "BB"]);
+    expect(records[0]?.max_bytes).toBe(3);
+    expect(records[2]).toMatchObject({
+      id: "orphan_00000023",
+      origin: "orphan",
+      pointer_address: null,
+      pointer_file_offset: null,
+      after_entry_index: 0,
+      target_file_offset: 0x23,
+    });
+    // A fixture-local insertion consumes only the reported first slot, preserving the orphan bytes.
+    Buffer.from("KO\0", "ascii").copy(bytes, records[0]!.target_file_offset);
+    await writeFile(path, bytes);
+    const readback = await cli.run({
+      arguments: [...args, "--json"],
+      environment,
+    });
+    expect(readback.exitCode).toBe(0);
+    expect(readback.json).toMatchObject({
+      normalized_result: {
+        manuscript_records: [
+          { jp: "KO", max_bytes: 3 },
+          { jp: "CC" },
+          { id: "orphan_00000023", jp: "BB" },
+        ],
+      },
+    });
+  },
+);
+
+cliTest(
+  "resolves ISO metadata and absolute LBAs through a data track after audio",
+  async ({ cli }) => {
+    const root = await createTestTempDirectory("rea-disc-metadata-cli-");
+    const environment = {
+      HOME: root,
+      XDG_CONFIG_HOME: root,
+      XDG_CACHE_HOME: root,
+    };
+    await writeFile(join(root, "audio.bin"), Buffer.alloc(100 * 2352));
+    await writeFile(join(root, "data.iso"), iso9660Fixture({ nested: true }));
+    const path = join(root, "disc.cue");
+    await writeFile(
+      path,
+      'FILE "audio.bin" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nFILE "data.iso" BINARY\nTRACK 02 MODE1/2048\nINDEX 01 00:00:00\n',
+    );
+    const result = await cli.run({
+      arguments: [
+        "inspect-disc-image",
+        path,
+        "--resolve-lba",
+        "120",
+        "--resolve-lba",
+        "122",
+        "--resolve-lba",
+        "127",
+        "--resolve-lba",
+        "20",
+        "--json",
+      ],
+      environment,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.json).toMatchObject({
+      normalized_result: {
+        iso9660: { allocation_coverage: "complete" },
+        system_cnf: { boot_path: "/MAIN.EXE" },
+        resolved_locations: [
+          { lba: 120, file_path: "/SYSTEM.CNF" },
+          { lba: 122, region: "iso9660_metadata" },
+          { lba: 127, region: "unallocated_gap" },
+          { region: "out_of_range" },
+        ],
+      },
+    });
+  },
+);
 
 /** sjis-le16 「どう」 + FFFF, then 「かな」 FFFE 「よ」 FFFF at an odd offset. */
 const DISC_TEXT = Buffer.from("c782a482ffff00a982c882feffe682ffff", "hex");

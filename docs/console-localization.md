@@ -35,7 +35,19 @@ first LBA, other data tracks, and sectors whose sync or mode byte did not
 match. A `.iso` whose size is a multiple of 2048 reports `sector` and
 `offset_in_sector` only. Writing patched sectors back (EDC/ECC) is out of scope.
 
-`inspect-disc-image` reports the cue layout and, when sector 1 carries the
+`inspect-disc-image` reads CUE, GDI, ISO and raw 2352-byte BIN images. GDI reads
+the selected track after its declared file offset; non-sector-aligned offsets
+are rejected explicitly. It reports ISO9660 files, metadata extents and allocation
+coverage, Sega boot headers and PlayStation SYSTEM.CNF. `--resolve-lba` always
+means an absolute disc LBA; `--resolve-offset` means a byte offset in the selected
+track's 2048-byte user data. ISO extent addresses retain their separate `base_lba`.
+Directory and path-table sectors are reserved. Malformed, unavailable or limited
+directory/descriptor reads set `allocation_coverage: "partial"` and suppress
+`unallocated_gaps`; unresolved locations remain `unknown`. Even complete ISO
+allocation coverage does not establish that a game never loads raw sectors from
+a gap, or that a font atlas cell is unused by backgrounds, cursors or decorations.
+
+When sector 1 carries the
 `PC Engine CD-ROM SYSTEM` ID, the PC Engine CD IPL boot record (IPLBLK,
 IPLBLN, IPLSTA, IPLJMP, MPR2..6, opening graphics/ADPCM fields, program name):
 
@@ -103,6 +115,25 @@ Segment options select `--base-mode segment`; `--base-mode address` (the
 default otherwise) keeps `base_address + value` through the target's address
 mapping. In segment mode `--base-address` must stay 0, and the tools need local
 file bytes.
+
+For admitted raw binaries, `--load-address` defines the image mapping; it does
+not replace `--base-address`. Raw reads accept mapped addresses and legacy file
+offset aliases, with mapped addresses taking precedence if ranges overlap.
+Use `--segment 0:<length>` to state explicitly that pointers are offsets within
+the whole raw file. `--infer-base-address` returns ranked overlay candidates;
+the inferred address remains a heuristic requiring independent confirmation.
+
+`scan-pointer-table --include-orphan-strings --include-manuscript` also extracts
+terminated strings between successive pointer targets. Known orphan starts cut
+the preceding pointer's `allocated_budget_bytes` and manuscript `max_bytes`, so
+the reported slots do not overlap. Orphan records have `origin: "orphan"`, an
+offset-based stable `id`, null pointer fields and `after_entry_index` / `gap_index`
+links. They preserve text, control-code arguments and display metrics, and are
+included by `--output manuscript.jsonl`. Without manuscript output, file exports
+retain the discovered `orphan_strings` in their summary. Detection examines gaps
+of at most 4096 bytes, requires at least two glyphs and stops at undecodable data;
+it does not prove that all script text has been extracted. The last target has no
+following boundary, so this gap scan does not search beyond it.
 
 `discover-pointer-tables --segment-align <bytes> --segment-length <bytes>`
 tries every multiple of `segment-align` as the start of a segment that still
@@ -191,7 +222,7 @@ decoder reads them as text, and an argument that happens to equal the
 terminator ends the string early, so the manuscript text, its `byte_length` and
 its budget are all wrong.
 
-`scan-pointer-table` accepts `control_codes`, a list the caller declares.
+`scan-pointer-table` and `search-rom-strings` accept `control_codes`, a list the caller declares.
 Nothing is inferred from the bytes, because the same byte means different
 things in different games.
 
@@ -226,10 +257,11 @@ node scripts/rea.mjs scan-pointer-table /path/game.bin \
 ```
 
 `--control-codes-json '[...]'` declares the same list inline. Giving both flags
-at once is refused rather than resolved by precedence. The 16-bit word
-encodings (`sjis-le16`, `tile-le16`, `tile-be16`) refuse `control_codes`:
-there, `terminator_word` already ends strings and `newline_word` already breaks
-lines, and a byte-declared code could land on half a word.
+at once is refused rather than resolved by precedence. In the 16-bit word
+encodings (`sjis-le16` / `sjis-swap16`, `tile-le16`, `tile-be16`), code sequences
+and their argument lengths must contain an even number of bytes. Codes match
+only at word boundaries. `terminator_word` and `newline_word` share this token
+processing, so native newlines split `lines` and do not count as glyphs.
 
 `character_length` counts what the glyph decoder produced. It is not a pixel
 width: a proportional font still needs its own width table, and that table is

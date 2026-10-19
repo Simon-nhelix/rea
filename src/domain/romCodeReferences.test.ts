@@ -415,6 +415,122 @@ describe("R5900, indexed base, and call argument resolution", () => {
   });
 });
 
+describe("call argument provenance", () => {
+  it.each([{ slot: [] }, { slot: [lw(R.a0, 0, R.zero)] }])(
+    "does not retain pre-delay MIPS arguments when the slot is absent or overwrites them",
+    ({ slot }) => {
+      const bytes = bytesOf([addiu(R.a0, R.zero, 1), jal(0x800cba44), ...slot]);
+      const hits = scanMipsRegion(
+        {
+          file: "f",
+          bytes,
+          fileOffset: 0,
+          length: bytes.length,
+          address: 0x80010000,
+        },
+        one(0x800cba44),
+        ALL,
+        { resolveCallArguments: true },
+      );
+      expect(
+        hits.find((h) => h.kind === "call")?.callArguments,
+      ).toBeUndefined();
+    },
+  );
+  it.each([
+    ["e401b001e40200090009", "0x00000002"],
+    ["e401b001644200090009", undefined],
+    ["e401b001", undefined],
+  ])(
+    "snapshots SuperH arguments after an available delay slot (%s)",
+    (hex, value) => {
+      const bytes = Buffer.from(hex, "hex");
+      const hits = scanCodeRegion(
+        "sh2-be",
+        {
+          file: "f",
+          bytes,
+          fileOffset: 0,
+          length: bytes.length,
+          address: 0x1000,
+        },
+        [{ address: 0x1008, length: 1 }],
+        ALL,
+        { resolveCallArguments: true },
+      );
+      expect(hits.find((h) => h.kind === "call")?.callArguments?.r4).toBe(
+        value,
+      );
+    },
+  );
+
+  it.each([
+    ["0120013000f000f800bf", "0x00000002"],
+    ["0120086800f000f800bf", undefined],
+  ])(
+    "updates or forgets overwritten Thumb argument constants (%s)",
+    (hex, value) => {
+      const bytes = Buffer.from(hex, "hex");
+      const hits = scanCodeRegion(
+        "thumb-le",
+        {
+          file: "f",
+          bytes,
+          fileOffset: 0,
+          length: bytes.length,
+          address: 0x1000,
+        },
+        [{ address: 0x1008, length: 1 }],
+        ALL,
+        { resolveCallArguments: true },
+      );
+      expect(hits.find((h) => h.kind === "call")?.callArguments?.r0).toBe(
+        value,
+      );
+    },
+  );
+
+  it.each([0xe0810002, 0x13a00002])(
+    "forgets ARM constants after an unmodelled or conditional write (%i)",
+    (write) => {
+      const bytes = bytesOf([0xe3a00001, write, 0xeb000000]);
+      const hits = scanCodeRegion(
+        "arm-le",
+        {
+          file: "f",
+          bytes,
+          fileOffset: 0,
+          length: bytes.length,
+          address: 0x1000,
+        },
+        [{ address: 0x1010, length: 1 }],
+        ALL,
+        { resolveCallArguments: true },
+      );
+      expect(
+        hits.find((h) => h.kind === "call")?.callArguments,
+      ).toBeUndefined();
+    },
+  );
+
+  it("forgets a SuperH indirect callee overwritten by an unknown memory load", () => {
+    const bytes = Buffer.from("d0026002400b00090000000000002000", "hex");
+    const hits = scanCodeRegion(
+      "sh2-be",
+      {
+        file: "f",
+        bytes,
+        fileOffset: 0,
+        length: bytes.length,
+        address: 0x1000,
+      },
+      [{ address: 0x2000, length: 1 }],
+      ALL,
+    );
+    expect(hits.some((h) => h.kind === "call")).toBe(false);
+  });
+});
+
 describe("multi-architecture scanCodeRegion", () => {
   it("scans SuperH sh2-be mov.l @(disp,PC) literal pool loads, jsr @Rn, and bsr", () => {
     // PC at 0x06004000:

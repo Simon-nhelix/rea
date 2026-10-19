@@ -348,8 +348,11 @@ analysis, and code cave discovery:
   "format_not_recognized"`), or on request with `--target-format data`;
   addresses are then file offsets. A `.cue` sheet becomes its first data
   track's 2048-byte user data, and matches add `sector`, `offset_in_sector`
-  and absolute `lba`. `rea inspect-disc-image <cue|iso>` reports the track
-  layout and the PC Engine CD IPL record. See
+  and absolute `lba`. `rea inspect-disc-image <cue|gdi|iso|bin>` reports the track
+  layout, boot headers, ISO files and metadata allocations. Partial allocation
+  coverage suppresses free-gap claims; even complete ISO coverage does not prove
+  raw sectors or font/graphics space unused. `--resolve-lba` always uses absolute
+  disc LBAs, independently of the ISO extent origin. See
   [console localization](https://github.com/morluto/rea/blob/main/docs/console-localization.md#disc-images-and-unrecognized-files).
 - `discover_pointer_tables` (CLI `rea discover-pointer-tables <path>`): scan ROM
   regions to automatically discover candidate 16/24/32-bit string pointer tables
@@ -373,6 +376,11 @@ analysis, and code cave discovery:
   manuscript is needed; shared targets collapse into one record with
   `also_referenced_by`. `segment_start`/`segment_length` read values as
   offsets from an overlay segment, and local results report `coverage`.
+  For manuscript extraction, include `include_orphan_strings: true`: discovered
+  follow-up strings cut preceding budgets and join the manuscript / CLI JSONL
+  export as `origin: "orphan"` records with stable offset IDs, null pointer
+  fields and `after_entry_index` links. Gaps beyond 4096 bytes, undecodable
+  continuations and text after the last pointer remain unexamined by this scan.
   `control_codes` declares in-string codes (`hex` as stored, `name`,
   `argument_bytes`, `role` `plain`/`line-break`/`page-break`/`end`), so
   argument bytes are skipped rather than decoded as glyphs — an argument equal
@@ -380,9 +388,9 @@ analysis, and code cave discovery:
   record adds `lines`, `character_length` (code points, no codes counted),
   `longest_line_characters` and each occurrence's offset, length and
   `arguments_hex`. CLI `--control-codes <file.json>` or
-  `--control-codes-json '[...]'`. Byte encodings only: the 16-bit word
-  encodings already own string ends and line breaks through `terminator_word`
-  and `newline_word`. `character_length` is not a pixel width.
+  `--control-codes-json '[...]'`. The same declarations apply to string searches.
+  Word encodings require even code and argument lengths; native `terminator_word`
+  and `newline_word` share that tokenization. `character_length` is not a pixel width.
 - `find_code_caves` (CLI `rea find-code-caves <path>`): find contiguous padding
   regions (`0x00` / `0xFF` or `fill_byte`) sorted largest-first for VWF font
   hooks, expanded 2-byte glyph tables, and relocated dialogue blocks.

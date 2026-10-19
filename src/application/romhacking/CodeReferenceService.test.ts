@@ -43,6 +43,36 @@ const resultOf = (evidence: {
   findCodeReferencesResultSchema.parse(evidence.normalized_result);
 
 describe("CodeReferenceService", () => {
+  it("reuses NES admission for trainer offsets, PRG boundaries, and mirrored addresses", async () => {
+    const path = join(directory, "trainer.nes");
+    const bytes = Buffer.alloc(16 + 512 + 16384 + 8192);
+    bytes.write("NES\x1a", 0, "latin1");
+    bytes[4] = 1;
+    bytes[5] = 1;
+    bytes[6] = 4;
+    bytes.set([0x20, 0x00, 0x90], 528);
+    bytes.set([0x20, 0x00, 0x90], 528 + 16384); // CHR graphics are not CPU code.
+    await writeFile(path, bytes);
+    const result = await new CodeReferenceService().find({
+      files: [{ path }],
+      architecture: "6502",
+      targets: [{ address: "0x9000" }],
+      kinds: ["call"],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const report = resultOf(result.value);
+    expect(
+      report.files.every(
+        (f) => f.scanned_file_offset === 528 && f.scanned_bytes === 16384,
+      ),
+    ).toBe(true);
+    expect(report.references.map((r) => [r.file_offset, r.address])).toEqual([
+      [528, "0x00008000"],
+      [528, "0x0000c000"],
+    ]);
+    expect(result.value.limitations.join(" ")).toContain("runtime mapper");
+  });
   it("scans a PS-X EXE and a headerless overlay with their own load addresses", async () => {
     const exe = join(directory, "MAIN.EXE");
     const overlay = join(directory, "OVL.BIN");

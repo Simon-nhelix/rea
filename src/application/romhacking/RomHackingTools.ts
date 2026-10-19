@@ -41,6 +41,7 @@ import {
   type DiscoverPointerTablesInput,
   type FindCodeCavesInput,
   type InferredBaseCandidate,
+  type ManuscriptRecord,
   type RomScanResume,
   type RomStringScanInput,
   type RomTextEncoding,
@@ -70,7 +71,7 @@ import {
   type LocalByteSource,
   type RomByteSourceDescription,
 } from "./LocalByteSource.js";
-import type { JsonValue } from "../../domain/jsonValue.js";
+import { jsonValueSchema, type JsonValue } from "../../domain/jsonValue.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 
@@ -102,6 +103,11 @@ interface LocalRomContext {
     tableFileOffset?: number,
   ) => number | null;
   readonly toVirtualAddress: (fileOffset: number) => string | null;
+  /** Mapping-owned conversion of file-offset aliases; banked CPU aliases stay intact. */
+  readonly normalizePointerAddress?: (
+    address: bigint,
+    fileOffset: number,
+  ) => string;
   /** How a plain local byte source was read; absent for admitted targets. */
   readonly source?: RomByteSourceDescription;
   /** Sector coordinates for byte sources that have sectors. */
@@ -143,19 +149,34 @@ const readRomBytesCached = async (
   return romBytes;
 };
 
-const identityMapping = (
+const localFileMapping = (
   length: number,
-): Pick<LocalRomContext, "toFileOffset" | "toVirtualAddress"> => ({
+  loadAddress = 0n,
+): Pick<
+  LocalRomContext,
+  "toFileOffset" | "toVirtualAddress" | "normalizePointerAddress"
+> => ({
   toFileOffset: (virtualAddress) => {
-    const offset = Number(virtualAddress);
-    return Number.isSafeInteger(offset) && offset >= 0 && offset < length
-      ? offset
+    const offset = Number(virtualAddress - loadAddress);
+    if (Number.isSafeInteger(offset) && offset >= 0 && offset < length)
+      return offset;
+    // Raw-file callers may supply file offsets as well as mapped RAM addresses.
+    // Resolve mapped addresses first; retain the original file-coordinate alias.
+    const fileOffset = Number(virtualAddress);
+    return Number.isSafeInteger(fileOffset) &&
+      fileOffset >= 0 &&
+      fileOffset < length
+      ? fileOffset
       : null;
   },
   toVirtualAddress: (fileOffset) =>
     fileOffset >= 0 && fileOffset < length
-      ? `0x${fileOffset.toString(16)}`
+      ? `0x${(loadAddress + BigInt(fileOffset)).toString(16)}`
       : null,
+  normalizePointerAddress: (address, fileOffset) => {
+    const mappedOffset = address - loadAddress;
+    return `0x${(mappedOffset >= 0n && mappedOffset < BigInt(length) ? address : loadAddress + BigInt(fileOffset)).toString(16)}`;
+  },
 });
 
 const loadLocalRomContext = async (
@@ -165,7 +186,7 @@ const loadLocalRomContext = async (
   if (isLocalByteSource(target)) {
     return {
       romBytes: target.bytes,
-      ...identityMapping(target.bytes.length),
+      ...localFileMapping(target.bytes.length),
       source: target.description,
       ...(target.description.sector_size === undefined
         ? {}
@@ -196,7 +217,10 @@ const loadLocalRomContext = async (
         resolveConsoleVirtualAddress(admission, fileOffset),
     };
   }
-  return { romBytes, ...identityMapping(romBytes.length) };
+  return {
+    romBytes,
+    ...localFileMapping(romBytes.length, BigInt(target.loadAddress)),
+  };
 };
 
 /** `source` result field for plain byte sources. */
@@ -1472,6 +1496,7 @@ const resolvePointerTargetInFile = (
   romLength: number,
   toFileOffset: (vaddr: bigint, entryFileOffset?: number) => number | null,
   entryFileOffset?: number,
+  normalizePointerAddress?: LocalRomContext["normalizePointerAddress"],
 ): {
   readonly targetAddress: string;
   readonly targetFileOffset: number | null;
@@ -1480,7 +1505,9 @@ const resolvePointerTargetInFile = (
   const additiveOffset = toFileOffset(additiveAddr, entryFileOffset);
   if (additiveOffset !== null) {
     return {
-      targetAddress: `0x${additiveAddr.toString(16)}`,
+      targetAddress:
+        normalizePointerAddress?.(additiveAddr, additiveOffset) ??
+        `0x${additiveAddr.toString(16)}`,
       targetFileOffset: additiveOffset,
     };
   }
@@ -1662,6 +1689,7 @@ export const executeScanPointerTable = async (
             localRom.romBytes.length,
             localRom.toFileOffset,
             entryFileOffset,
+            localRom.normalizePointerAddress,
           );
           targetAddress = resolvedTarget.targetAddress;
           targetFileOffset = resolvedTarget.targetFileOffset;
@@ -1746,7 +1774,71 @@ export const executeScanPointerTable = async (
         });
       }
 
-      const budgets = computePointerSlotBudgets(entries);
+      const unit = resolveTerminatorUnit(input.encoding, terminatorByte, words);
+      const orphanStrings = input.include_orphan_strings
+        ? findOrphanStringsInPointerGaps({
+            bytes: localRom.romBytes,
+            entries,
+            unitSize: unit?.size ?? (words !== undefined ? 2 : 1),
+            isPaddingAt: (offset: number) =>
+              unit !== undefined
+                ? isTerminatorAt(localRom.romBytes, offset, unit)
+                : false,
+            decodeAt: (slice: Uint8Array) => {
+              const valid = isLikelyValidDecodedTarget(
+                slice,
+                input.encoding,
+                terminatorByte,
+                2,
+                customTable,
+                words,
+                controlCodes,
+              );
+              if (!valid.valid) return null;
+              const dec = decodeScanText(slice, {
+                encoding: input.encoding,
+                terminatorByte,
+                customTable,
+                words,
+                controlCodes,
+              });
+              const terminated =
+                dec.display?.stop === "end-code" ||
+                (unit !== undefined &&
+                  dec.byteLength >= unit.size &&
+                  isTerminatorAt(slice, dec.byteLength - unit.size, unit));
+              return {
+                text: dec.text,
+                byteLength: dec.byteLength,
+                rawHex: dec.rawHex,
+                terminated,
+                ...(dec.display === undefined
+                  ? {}
+                  : {
+                      controlCodes: dec.display.control_codes,
+                      lines: dec.display.lines,
+                      characterLength: dec.display.character_length,
+                      longestLineCharacters:
+                        dec.display.longest_line_characters,
+                    }),
+              };
+            },
+            toVirtualAddress: (fo: number) =>
+              baseAddrResult.value > 0n && localRom.source !== undefined
+                ? `0x${(baseAddrResult.value + BigInt(fo)).toString(16)}`
+                : localRom.toVirtualAddress(fo),
+            includeHex: input.include_hex,
+          })
+        : undefined;
+      const budgetEntries = [
+        ...entries,
+        ...(orphanStrings ?? []).map((orphan) => ({
+          target_file_offset: orphan.file_offset,
+          target_address: orphan.address,
+          preview_byte_length: orphan.byte_length,
+        })),
+      ];
+      const budgets = computePointerSlotBudgets(budgetEntries);
       const enrichedEntries = entries.map((entry, idx) => ({
         ...entry,
         allocated_budget_bytes: budgets[idx] ?? null,
@@ -1798,7 +1890,7 @@ export const executeScanPointerTable = async (
           });
         }
       }
-      const manuscriptRecords = wantsManuscript
+      const manuscriptRecords: ManuscriptRecord[] | undefined = wantsManuscript
         ? dedupManuscriptRecords(
             enrichedEntries.map((entry) => {
               const key =
@@ -1823,60 +1915,39 @@ export const executeScanPointerTable = async (
             }),
           )
         : undefined;
+      if (manuscriptRecords !== undefined) {
+        for (const orphan of orphanStrings ?? []) {
+          manuscriptRecords.push({
+            origin: "orphan",
+            id: `orphan_${orphan.file_offset.toString(16).padStart(8, "0")}`,
+            pointer_address: null,
+            pointer_file_offset: null,
+            after_entry_index: orphan.after_entry_index,
+            gap_index: orphan.gap_index,
+            target_address: orphan.address,
+            target_file_offset: orphan.file_offset,
+            byte_length: orphan.byte_length,
+            max_bytes: orphan.allocated_budget_bytes,
+            jp: orphan.text,
+            ko: "",
+            ...(orphan.lines === undefined ? {} : { lines: orphan.lines }),
+            ...(orphan.character_length === undefined
+              ? {}
+              : { character_length: orphan.character_length }),
+            ...(orphan.longest_line_characters === undefined
+              ? {}
+              : { longest_line_characters: orphan.longest_line_characters }),
+            ...(orphan.control_codes === undefined
+              ? {}
+              : {
+                  control_codes: orphan.control_codes.map((code) => ({
+                    ...code,
+                  })),
+                }),
+          });
+        }
+      }
 
-      const unit = resolveTerminatorUnit(input.encoding, terminatorByte, words);
-      const orphanStrings = input.include_orphan_strings
-        ? findOrphanStringsInPointerGaps({
-            bytes: localRom.romBytes,
-            entries: enrichedEntries,
-            unitSize: unit?.size ?? (words !== undefined ? 2 : 1),
-            isPaddingAt: (offset: number) =>
-              unit !== undefined
-                ? isTerminatorAt(localRom.romBytes, offset, unit)
-                : false,
-            decodeAt: (slice: Uint8Array) => {
-              const valid = isLikelyValidDecodedTarget(
-                slice,
-                input.encoding,
-                terminatorByte,
-                2,
-                customTable,
-                words,
-              );
-              if (!valid.valid) return null;
-              const dec = decodeScanText(slice, {
-                encoding: input.encoding,
-                terminatorByte,
-                customTable,
-                words,
-                controlCodes,
-              });
-              const terminated =
-                unit !== undefined && dec.byteLength >= unit.size
-                  ? isTerminatorAt(slice, dec.byteLength - unit.size, unit)
-                  : dec.display?.stop === "end-code";
-              return {
-                text: dec.text,
-                byteLength: dec.byteLength,
-                rawHex: dec.rawHex,
-                terminated,
-                ...(dec.display === undefined
-                  ? {}
-                  : {
-                      lines: dec.display.lines,
-                      characterLength: dec.display.character_length,
-                      longestLineCharacters:
-                        dec.display.longest_line_characters,
-                    }),
-              };
-            },
-            toVirtualAddress: (fo: number) =>
-              baseAddrResult.value > 0n && localRom.source !== undefined
-                ? `0x${(baseAddrResult.value + BigInt(fo)).toString(16)}`
-                : localRom.toVirtualAddress(fo),
-            includeHex: input.include_hex,
-          })
-        : undefined;
       const coverage =
         unit === undefined
           ? null
@@ -1911,10 +1982,10 @@ export const executeScanPointerTable = async (
         next_start_index: input.start_index + enrichedEntries.length,
         ...(manuscriptRecords === undefined
           ? {}
-          : { manuscript_records: manuscriptRecords }),
+          : { manuscript_records: jsonValueSchema.parse(manuscriptRecords) }),
         ...(orphanStrings === undefined
           ? {}
-          : { orphan_strings: [...orphanStrings] }),
+          : { orphan_strings: jsonValueSchema.parse(orphanStrings) }),
         coverage,
         ...sourceField(localRom),
       });
@@ -2184,6 +2255,7 @@ export type ScanPointerTableExportSummary = {
   readonly encoding: RomTextEncoding;
   readonly entries_scanned: number;
   readonly record_kind: "entry" | "manuscript";
+  readonly orphan_strings?: JsonValue;
   readonly coverage?: PointerTableCoverage | null;
   readonly source?: RomByteSourceDescription;
 };
@@ -2254,6 +2326,9 @@ export const exportScanPointerTable = async (
     entries_scanned:
       typeof data.entries_scanned === "number" ? data.entries_scanned : 0,
     record_kind: wantsManuscript ? "manuscript" : "entry",
+    ...(!wantsManuscript && data.orphan_strings !== undefined
+      ? { orphan_strings: data.orphan_strings }
+      : {}),
     ...(data.coverage !== undefined
       ? { coverage: data.coverage as PointerTableCoverage | null }
       : {}),
@@ -2270,6 +2345,7 @@ const isLikelyValidDecodedTarget = (
   minStringLength: number,
   customTable: CustomCharTable | undefined,
   words: RomWordFormat | undefined,
+  controlCodes?: RomControlCodeTable,
 ): {
   readonly valid: boolean;
   readonly text: string;
@@ -2300,6 +2376,7 @@ const isLikelyValidDecodedTarget = (
     terminatorByte,
     customTable,
     words,
+    controlCodes,
     // A pointer target is a string start, so only the even word parity
     // relative to the target is meaningful.
     wordParity: "even",
@@ -2592,6 +2669,7 @@ export const executeDiscoverPointerTables = async (
         romBuffer.length,
         toFileOffset,
         entryOffset,
+        localRom?.normalizePointerAddress,
       ).targetFileOffset;
     }
     const raw = readPointerNumber(romBuffer, entryOffset, pointerWidth, endian);
@@ -2751,6 +2829,7 @@ export const executeDiscoverPointerTables = async (
                 romBuffer.length,
                 toFileOffset,
                 entryFileOffset,
+                localRom?.normalizePointerAddress,
               ).targetAddress
             : (toVirtualAddress(targetOffset) ??
               `0x${targetOffset.toString(16)}`),

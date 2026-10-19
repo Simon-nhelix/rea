@@ -1002,13 +1002,13 @@ export const registerDiscImageCommand = (
     }),
     options: z.object({
       resolveLba: z
-        .array(z.number().int().min(0))
+        .array(z.coerce.number().int().min(0))
         .optional()
         .describe(
           "Resolve one or more LBAs to their containing ISO9660 file or disc region",
         ),
       resolveOffset: z
-        .array(z.number().int().min(0))
+        .array(z.coerce.number().int().min(0))
         .optional()
         .describe(
           "Resolve one or more 2048-byte user-data offsets to their containing ISO9660 file or disc region",

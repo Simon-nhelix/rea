@@ -53,9 +53,19 @@ export type Iso9660FileSystem = {
   readonly data_preparer_id: string;
   readonly application_id: string;
   readonly volume_space_sectors: number;
-  readonly base_lba: number;
+  readonly base_lba: number | null;
+  readonly extent_base_candidates: number[];
   readonly files: Iso9660FileEntry[];
+  readonly metadata_extents: Iso9660MetadataExtent[];
+  readonly allocation_coverage: "complete" | "partial";
+  readonly limitations: string[];
   readonly unallocated_gaps: Iso9660UnallocatedGap[];
+};
+
+export type Iso9660MetadataExtent = {
+  readonly kind: "volume-descriptor" | "path-table" | "directory";
+  readonly start_sector: number;
+  readonly sectors: number;
 };
 
 export type DiscResolvedLocation = {
@@ -70,6 +80,7 @@ export type DiscResolvedLocation = {
     | "iso9660_metadata"
     | "file"
     | "unallocated_gap"
+    | "unknown"
     | "out_of_range";
   readonly file_path: string | null;
   readonly offset_in_file: number | null;
@@ -216,8 +227,14 @@ const walkIsoDirectories = (
   baseLba: number,
   rootLba: number,
   rootSize: number,
-): Iso9660FileEntry[] => {
+): {
+  files: Iso9660FileEntry[];
+  metadata: Iso9660MetadataExtent[];
+  limitations: string[];
+} => {
   const files: Iso9660FileEntry[] = [];
+  const metadata: Iso9660MetadataExtent[] = [];
+  const problems = new Set<string>();
   const visitedDirs = new Set<number>([rootLba]);
   const queue: DirQueueItem[] = [
     { path: "", extentLba: rootLba, byteLength: rootSize },
@@ -226,7 +243,28 @@ const walkIsoDirectories = (
     const current = queue.shift()!;
     const startSector = current.extentLba - baseLba;
     const sectorCount = Math.ceil(current.byteLength / CD_USER_DATA_BYTES);
-    if (startSector < 0 || startSector + sectorCount > totalSectors) continue;
+    if (
+      startSector < 0 ||
+      sectorCount < 1 ||
+      startSector + sectorCount > totalSectors
+    ) {
+      problems.add("A directory extent is outside the available volume.");
+      continue;
+    }
+    metadata.push({
+      kind: "directory",
+      start_sector: startSector,
+      sectors: sectorCount,
+    });
+    const self = startSector * CD_USER_DATA_BYTES;
+    if (
+      (userData[self] ?? 0) < 34 ||
+      userData[self + 32] !== 1 ||
+      userData[self + 33] !== 0 ||
+      readLe32(userData, self + 2) !== current.extentLba
+    ) {
+      problems.add("A directory is missing a valid self record.");
+    }
     for (let s = 0; s < sectorCount; s++) {
       const sectorOffset = (startSector + s) * CD_USER_DATA_BYTES;
       const sectorEnd = Math.min(
@@ -237,11 +275,25 @@ const walkIsoDirectories = (
       while (pos < sectorEnd && files.length < MAX_ISO_FILES) {
         const recLen = userData[pos] ?? 0;
         if (recLen === 0) break;
-        if (pos + recLen > sectorEnd || recLen < 34) break;
+        if (pos + recLen > sectorEnd || recLen < 34) {
+          problems.add("A directory record is malformed or truncated.");
+          break;
+        }
         const extentLba = readLe32(userData, pos + 2);
         const dataLen = readLe32(userData, pos + 10);
         const flags = userData[pos + 25] ?? 0;
         const nameLen = userData[pos + 32] ?? 0;
+        if (
+          (userData[pos + 1] ?? 0) !== 0 ||
+          (userData[pos + 26] ?? 0) !== 0 ||
+          (userData[pos + 27] ?? 0) !== 0
+        ) {
+          problems.add(
+            "Extended attributes or interleaved extents require additional allocation interpretation.",
+          );
+          pos += recLen;
+          continue;
+        }
         if (pos + 33 + nameLen <= pos + recLen && nameLen > 0) {
           const firstByte = userData[pos + 33] ?? 0;
           const isDotOrDotDot =
@@ -265,6 +317,10 @@ const walkIsoDirectories = (
                   extentLba,
                   byteLength: dataLen,
                 });
+              } else if (!visitedDirs.has(extentLba)) {
+                problems.add(
+                  "Directory traversal reached its directory limit.",
+                );
               }
             } else {
               const trackSector = extentLba - baseLba;
@@ -272,7 +328,7 @@ const walkIsoDirectories = (
                 0,
                 Math.ceil(dataLen / CD_USER_DATA_BYTES),
               );
-              if (trackSector >= 0 && trackSector <= totalSectors) {
+              if (trackSector >= 0 && trackSector + sectors <= totalSectors) {
                 files.push({
                   path: fullPath,
                   extent_lba: extentLba,
@@ -281,56 +337,74 @@ const walkIsoDirectories = (
                   size: dataLen,
                   sectors,
                 });
-              }
+              } else
+                problems.add("A file extent is outside the available volume.");
             }
           }
-        }
+        } else problems.add("A directory record has an invalid name length.");
         pos += recLen;
       }
     }
   }
-  return files.sort(
-    (a, b) => a.extent_lba - b.extent_lba || a.path.localeCompare(b.path),
-  );
+  if (files.length >= MAX_ISO_FILES)
+    problems.add("Directory traversal reached its file limit.");
+  return {
+    files: files.sort(
+      (a, b) => a.extent_lba - b.extent_lba || a.path.localeCompare(b.path),
+    ),
+    metadata,
+    limitations: [...problems],
+  };
 };
 
 const computeUnallocatedGaps = (
   files: readonly Iso9660FileEntry[],
-  baseLba: number,
+  metadata: readonly Iso9660MetadataExtent[],
+  firstLba: number,
   totalSectors: number,
 ): Iso9660UnallocatedGap[] => {
   const gaps: Iso9660UnallocatedGap[] = [];
   if (files.length === 0) return gaps;
-  const trackEndLba = baseLba + totalSectors;
-  let cursorLba = files[0]!.extent_lba;
+  let cursor = files[0]!.track_sector;
   let lastFilePath: string | null = null;
-  for (const file of files) {
-    if (file.extent_lba > cursorLba) {
-      const startSector = cursorLba - baseLba;
-      const sectors = file.extent_lba - cursorLba;
+  const occupied = [
+    ...files.map((file) => ({
+      start: file.track_sector,
+      end: file.track_sector + Math.max(1, file.sectors),
+      path: file.path,
+    })),
+    ...metadata.map((extent) => ({
+      start: extent.start_sector,
+      end: extent.start_sector + extent.sectors,
+      path: null,
+    })),
+  ].sort((a, b) => a.start - b.start || a.end - b.end);
+  for (const extent of occupied) {
+    if (extent.start > cursor) {
+      const startSector = cursor;
+      const sectors = extent.start - cursor;
       gaps.push({
-        start_lba: cursorLba,
-        end_lba: file.extent_lba - 1,
+        start_lba: firstLba + cursor,
+        end_lba: firstLba + extent.start - 1,
         start_sector: startSector,
         sectors,
         byte_length: sectors * CD_USER_DATA_BYTES,
         user_data_offset: startSector * CD_USER_DATA_BYTES,
         after_file: lastFilePath,
-        before_file: file.path,
+        before_file: extent.path,
       });
     }
-    const fileEnd = file.extent_lba + Math.max(1, file.sectors);
-    if (fileEnd > cursorLba) {
-      cursorLba = fileEnd;
-      lastFilePath = file.path;
+    if (extent.end > cursor) {
+      cursor = extent.end;
+      if (extent.path !== null) lastFilePath = extent.path;
     }
   }
-  if (cursorLba < trackEndLba) {
-    const startSector = cursorLba - baseLba;
-    const sectors = trackEndLba - cursorLba;
+  if (cursor < totalSectors) {
+    const startSector = cursor;
+    const sectors = totalSectors - cursor;
     gaps.push({
-      start_lba: cursorLba,
-      end_lba: trackEndLba - 1,
+      start_lba: firstLba + cursor,
+      end_lba: firstLba + totalSectors - 1,
       start_sector: startSector,
       sectors,
       byte_length: sectors * CD_USER_DATA_BYTES,
@@ -359,21 +433,88 @@ export const parseIso9660FileSystem = (
   const rootRecordOffset = pvdOffset + 156;
   const rootExtentLba = readLe32(userData, rootRecordOffset + 2);
   const rootSizeBytes = readLe32(userData, rootRecordOffset + 10);
-  // Determine whether directory extent LBAs are 0-based relative to the image
-  // or offset by the track's absolute firstLba (e.g. Dreamcast LBA 45000).
-  const baseLba =
-    firstLba > 0 &&
-    rootExtentLba >= firstLba &&
-    rootExtentLba - firstLba < totalSectors
-      ? firstLba
-      : 0;
-  const files = walkIsoDirectories(
-    userData,
-    totalSectors,
-    baseLba,
-    rootExtentLba,
-    rootSizeBytes,
+  // Establish the extent origin from the root's self record, rather than
+  // choosing an origin merely because both candidate offsets fit the track.
+  const boundedBases = [...new Set([0, firstLba])].filter(
+    (base) =>
+      rootExtentLba >= base &&
+      rootExtentLba - base + Math.ceil(rootSizeBytes / CD_USER_DATA_BYTES) <=
+        totalSectors,
   );
+  const selfRecordBases = boundedBases.filter((base) => {
+    const at = (rootExtentLba - base) * CD_USER_DATA_BYTES;
+    return (
+      (userData[at] ?? 0) >= 34 &&
+      userData[at + 32] === 1 &&
+      userData[at + 33] === 0 &&
+      ((userData[at + 25] ?? 0) & 2) !== 0 &&
+      readLe32(userData, at + 2) === rootExtentLba &&
+      readLe32(userData, at + 10) === rootSizeBytes
+    );
+  });
+  const candidates =
+    selfRecordBases.length > 0 ? selfRecordBases : boundedBases;
+  const baseLba = candidates.length === 1 ? candidates[0]! : null;
+  const volumeSectors = Math.min(totalSectors, volumeSpaceSectors);
+  const walked =
+    baseLba === null
+      ? {
+          files: [],
+          metadata: [],
+          limitations: [
+            "The ISO extent origin could not be established unambiguously.",
+          ],
+        }
+      : walkIsoDirectories(
+          userData,
+          volumeSectors,
+          baseLba,
+          rootExtentLba,
+          rootSizeBytes,
+        );
+  const metadata: Iso9660MetadataExtent[] = [...walked.metadata];
+  const limitations = [...walked.limitations];
+  let terminatedDescriptors = false;
+  for (let sector = 16; sector < volumeSectors; sector++) {
+    const off = sector * CD_USER_DATA_BYTES;
+    if (asciiField(userData, off + 1, off + 6) !== "CD001") break;
+    metadata.push({
+      kind: "volume-descriptor",
+      start_sector: sector,
+      sectors: 1,
+    });
+    const type = userData[off];
+    if (type === 255) {
+      terminatedDescriptors = true;
+      break;
+    }
+    if (type !== 1)
+      limitations.push(
+        "Additional volume descriptors may describe allocations outside the primary tree.",
+      );
+  }
+  if (!terminatedDescriptors)
+    limitations.push("The volume descriptor sequence is incomplete.");
+  if (volumeSpaceSectors > totalSectors)
+    limitations.push(
+      "The declared volume extends beyond the available data track.",
+    );
+  const pathTableBytes = readLe32(userData, pvdOffset + 132);
+  for (const [offset, bigEndian] of [
+    [140, false],
+    [144, false],
+    [148, true],
+    [152, true],
+  ] as const) {
+    const lba = (bigEndian ? readBe32 : readLe32)(userData, pvdOffset + offset);
+    if (lba === 0) continue;
+    if (baseLba === null) continue;
+    const start = lba - baseLba;
+    const sectors = Math.ceil(pathTableBytes / CD_USER_DATA_BYTES);
+    if (start < 0 || sectors < 1 || start + sectors > volumeSectors)
+      limitations.push("A path table extent is outside the available volume.");
+    else metadata.push({ kind: "path-table", start_sector: start, sectors });
+  }
   return {
     system_id: asciiField(userData, pvdOffset + 8, pvdOffset + 40),
     volume_id: asciiField(userData, pvdOffset + 40, pvdOffset + 72),
@@ -382,8 +523,23 @@ export const parseIso9660FileSystem = (
     application_id: asciiField(userData, pvdOffset + 574, pvdOffset + 702),
     volume_space_sectors: volumeSpaceSectors,
     base_lba: baseLba,
-    files,
-    unallocated_gaps: computeUnallocatedGaps(files, baseLba, totalSectors),
+    extent_base_candidates: candidates,
+    files: walked.files,
+    metadata_extents: metadata,
+    allocation_coverage: limitations.length === 0 ? "complete" : "partial",
+    limitations: [
+      ...limitations,
+      "Unallocated gaps describe only examined ISO9660 allocations; they do not prove that a game does not load raw sectors there.",
+    ],
+    unallocated_gaps:
+      limitations.length === 0
+        ? computeUnallocatedGaps(
+            walked.files,
+            metadata,
+            firstLba,
+            volumeSectors,
+          )
+        : [],
   };
 };
 
@@ -396,7 +552,7 @@ export const resolveDiscLocations = (options: {
   readonly offsets?: readonly number[];
 }): DiscResolvedLocation[] => {
   const totalSectors = Math.floor(options.userDataLength / CD_USER_DATA_BYTES);
-  const baseLba = options.iso9660?.base_lba ?? options.firstLba;
+  const baseLba = options.firstLba;
   const classify = (
     queryKind: "lba" | "user_data_offset",
     queryValue: number,
@@ -468,7 +624,15 @@ export const resolveDiscLocations = (options: {
       track_sector: trackSector,
       offset_in_sector: offsetInSector,
       user_data_offset: userDataOffset,
-      region: inGap ? "unallocated_gap" : "iso9660_metadata",
+      region: inGap
+        ? "unallocated_gap"
+        : options.iso9660?.metadata_extents.some(
+              (extent) =>
+                trackSector >= extent.start_sector &&
+                trackSector < extent.start_sector + extent.sectors,
+            )
+          ? "iso9660_metadata"
+          : "unknown",
       file_path: null,
       offset_in_file: null,
       file_extent_lba: null,
@@ -477,8 +641,7 @@ export const resolveDiscLocations = (options: {
   };
   const results: DiscResolvedLocation[] = [];
   for (const lba of options.lbas ?? []) {
-    const trackSector =
-      lba >= baseLba && lba - baseLba < totalSectors ? lba - baseLba : lba;
+    const trackSector = lba - baseLba;
     results.push(classify("lba", lba, trackSector, 0));
   }
   for (const offset of options.offsets ?? []) {

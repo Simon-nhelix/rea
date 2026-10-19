@@ -1,5 +1,9 @@
 import { z } from "zod";
 import { readPointerNumber } from "./romPointerSegments.js";
+import {
+  romControlCodeUseSchema,
+  type RomControlCodeUse,
+} from "./romControlCodes.js";
 
 export const inferredBaseCandidateSchema = z.strictObject({
   base_address: z.string(),
@@ -31,6 +35,7 @@ export const orphanStringEntrySchema = z.strictObject({
   lines: z.array(z.string()).optional(),
   character_length: z.number().int().min(0).optional(),
   longest_line_characters: z.number().int().min(0).optional(),
+  control_codes: z.array(romControlCodeUseSchema).optional(),
 });
 
 export type OrphanStringEntry = {
@@ -45,6 +50,7 @@ export type OrphanStringEntry = {
   readonly lines?: string[];
   readonly character_length?: number;
   readonly longest_line_characters?: number;
+  readonly control_codes?: readonly RomControlCodeUse[];
 };
 
 const alignmentOf = (base: number): number => {
@@ -243,6 +249,7 @@ export const findOrphanStringsInPointerGaps = (input: {
     readonly lines?: readonly string[];
     readonly characterLength?: number;
     readonly longestLineCharacters?: number;
+    readonly controlCodes?: readonly RomControlCodeUse[];
   } | null;
   readonly toVirtualAddress: (fileOffset: number) => string | null;
   readonly includeHex: boolean;
@@ -289,6 +296,7 @@ export const findOrphanStringsInPointerGaps = (input: {
       readonly lines?: readonly string[];
       readonly characterLength?: number;
       readonly longestLineCharacters?: number;
+      readonly controlCodes?: readonly RomControlCodeUse[];
     }[] = [];
 
     while (cursor < nextTarget) {
@@ -310,6 +318,9 @@ export const findOrphanStringsInPointerGaps = (input: {
         byteLength: candidate.byteLength,
         text: candidate.text,
         rawHex: candidate.rawHex,
+        ...(candidate.controlCodes === undefined
+          ? {}
+          : { controlCodes: candidate.controlCodes }),
         ...(candidate.lines === undefined ? {} : { lines: candidate.lines }),
         ...(candidate.characterLength === undefined
           ? {}
@@ -325,7 +336,7 @@ export const findOrphanStringsInPointerGaps = (input: {
     for (let g = 0; g < gapOrphans.length; g++) {
       const item = gapOrphans[g]!;
       const nextStop =
-        g + 1 < gapOrphans.length ? gapOrphans[g + 1]!.fileOffset : nextTarget;
+        g + 1 < gapOrphans.length ? gapOrphans[g + 1]!.fileOffset : cursor;
       const address =
         toVirtualAddress(item.fileOffset) ??
         `0x${item.fileOffset.toString(16)}`;
@@ -340,6 +351,9 @@ export const findOrphanStringsInPointerGaps = (input: {
           nextStop - item.fileOffset,
         ),
         text: item.text,
+        ...(item.controlCodes === undefined
+          ? {}
+          : { control_codes: item.controlCodes }),
         ...(includeHex
           ? { bytes_hex: item.rawHex.replace(/\s+/gu, "").toLowerCase() }
           : {}),

@@ -629,8 +629,6 @@ export const scanMipsRegion = (
     options?.includeCallerSignatures ?? region.includeCallerSignatures;
   const emit: Emit = ({ kind, instruction, register, formed, target, lui }) => {
     if (!kinds.has(kind) || current === undefined) return;
-    const callArgs =
-      kind === "call" && resolveArgs ? snapshotMipsArgs(regs) : undefined;
     results.push({
       kind,
       fileOffset: current.fileOffset,
@@ -641,7 +639,6 @@ export const scanMipsRegion = (
       targetAddress: formed >>> 0,
       targetIndex: target.index,
       sourceLuiAddress: lui?.luiAddress ?? null,
-      ...(callArgs === undefined ? {} : { callArguments: callArgs }),
       ...(includeSignatures
         ? {
             callerSignature: callerSignatureAt(
@@ -691,7 +688,7 @@ export const scanMipsRegion = (
       ) {
         const afterSlotArgs = snapshotMipsArgs(regs);
         const hit = results[pendingCallHitIndex];
-        if (hit !== undefined && afterSlotArgs !== undefined) {
+        if (hit !== undefined) {
           results[pendingCallHitIndex] = {
             ...hit,
             callArguments: afterSlotArgs,

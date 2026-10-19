@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { iso9660Fixture } from "../../tests/fixtures/iso9660.js";
 import {
   CD_USER_DATA_BYTES,
   detectRawSectorLayout,
@@ -206,6 +207,28 @@ describe("PC Engine CD IPL record", () => {
 });
 
 describe("Dreamcast GDI, raw sector detection, IP.BIN, SYSTEM.CNF, and ISO9660", () => {
+  it("honors a GDI track file offset and rejects ambiguous or malformed placement", () => {
+    const parsed = parseGdiSheet("1\n3 45000 4 2352 track.bin 2352");
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(
+      resolveGdiDataTrack(parsed.value, new Map([["track.bin", 3 * 2352]])),
+    ).toMatchObject({
+      ok: true,
+      value: { firstSectorInFile: 1, sectorCount: 2 },
+    });
+    expect(
+      resolveGdiDataTrack(parsed.value, new Map([["track.bin", 2352]])).ok,
+    ).toBe(false);
+    expect(parseGdiSheet("2\n3 45000 4 2352 track.bin 0").ok).toBe(false);
+    expect(parseGdiSheet("1\n3 45000 4 2352 track.bin -1").ok).toBe(false);
+    const unaligned = parseGdiSheet("1\n3 45000 4 2352 track.bin 1");
+    if (unaligned.ok)
+      expect(
+        resolveGdiDataTrack(unaligned.value, new Map([["track.bin", 3 * 2352]]))
+          .ok,
+      ).toBe(false);
+  });
   it("parses Dreamcast .gdi sheets and selects the high-density data track", () => {
     const gdiText = [
       "3",
@@ -315,49 +338,83 @@ describe("Dreamcast GDI, raw sector detection, IP.BIN, SYSTEM.CNF, and ISO9660",
 });
 
 describe("ISO9660 file system and LBA/offset resolution", () => {
-  it("parses ISO9660 PVD, directory records, unallocated gaps, and LBA/offset locations", () => {
-    const image = new Uint8Array(30 * CD_USER_DATA_BYTES);
-    const writeLe32 = (offset: number, value: number) => {
-      image[offset] = value & 0xff;
-      image[offset + 1] = (value >>> 8) & 0xff;
-      image[offset + 2] = (value >>> 16) & 0xff;
-      image[offset + 3] = (value >>> 24) & 0xff;
-    };
-    const pvd = 16 * CD_USER_DATA_BYTES;
-    image[pvd] = 1;
-    image.set(new TextEncoder().encode("CD001"), pvd + 1);
-    image.set(new TextEncoder().encode("PLAYSTATION"), pvd + 8);
-    image.set(new TextEncoder().encode("TEST_DISC"), pvd + 40);
-    writeLe32(pvd + 80, 30);
-    // Root directory record at sector 18 (1 sector)
-    image[pvd + 156] = 34;
-    writeLe32(pvd + 156 + 2, 18);
-    writeLe32(pvd + 156 + 10, CD_USER_DATA_BYTES);
+  it("reserves directory and both path table extents between files", () => {
+    const image = iso9660Fixture({ nested: true });
+    const iso = parseIso9660FileSystem(image)!;
+    expect(iso.allocation_coverage).toBe("complete");
+    expect(iso.files.map((f) => f.path)).toContain("/TEXT/DIALOG.BIN");
+    const locations = resolveDiscLocations({
+      userDataLength: image.length,
+      firstLba: 0,
+      iso9660: iso,
+      lbas: [21, 22, 23, 27],
+    });
+    expect(locations.map((l) => l.region)).toEqual([
+      "iso9660_metadata",
+      "iso9660_metadata",
+      "iso9660_metadata",
+      "unallocated_gap",
+    ]);
+  });
 
-    // Populate root directory at sector 18 with two files and a gap between them
-    const writeDirEntry = (
-      pos: number,
-      lba: number,
-      size: number,
-      flags: number,
-      name: string,
-    ): number => {
-      const nameBytes = new TextEncoder().encode(name);
-      const recLen =
-        33 + nameBytes.length + (nameBytes.length % 2 === 0 ? 1 : 0);
-      image[pos] = recLen;
-      writeLe32(pos + 2, lba);
-      writeLe32(pos + 10, size);
-      image[pos + 25] = flags;
-      image[pos + 32] = nameBytes.length;
-      image.set(nameBytes, pos + 33);
-      return pos + recLen;
-    };
-    let cursor = 18 * CD_USER_DATA_BYTES;
-    cursor = writeDirEntry(cursor, 18, CD_USER_DATA_BYTES, 2, "\u0000");
-    cursor = writeDirEntry(cursor, 18, CD_USER_DATA_BYTES, 2, "\u0001");
-    cursor = writeDirEntry(cursor, 20, 42, 0, "SYSTEM.CNF;1");
-    writeDirEntry(cursor, 24, 3000, 0, "MAIN.EXE;1");
+  it.each(["directory", "descriptor", "file extent"])(
+    "retains partial facts without reporting free space after an invalid %s",
+    (failure) => {
+      const image = iso9660Fixture();
+      if (failure === "directory") image[18 * 2048] = 1;
+      else if (failure === "descriptor") image[17 * 2048] = 0;
+      else image.writeUInt32LE(29, 18 * 2048 + 68 + 46 + 2); // MAIN.EXE extends beyond the volume.
+      const iso = parseIso9660FileSystem(image)!;
+      expect(iso.allocation_coverage).toBe("partial");
+      expect(iso.unallocated_gaps).toEqual([]);
+      expect(iso.limitations.length).toBeGreaterThan(1);
+    },
+  );
+
+  it.each([
+    [0, 12],
+    [0, 100],
+    [45000, 45000],
+  ])(
+    "separates ISO extent base %i from absolute disc origin %i",
+    (extentBase, firstLba) => {
+      const image = iso9660Fixture({ extentBase });
+      const iso = parseIso9660FileSystem(image, firstLba)!;
+      const locations = resolveDiscLocations({
+        userDataLength: image.length,
+        firstLba,
+        iso9660: iso,
+        lbas: [firstLba + 20, 20],
+        offsets: [20 * 2048],
+      });
+      expect(locations[0]).toMatchObject({
+        lba: firstLba + 20,
+        track_sector: 20,
+        file_path: "/SYSTEM.CNF",
+      });
+      expect(locations[1]?.file_path).toBeNull();
+      expect(locations[2]).toMatchObject({
+        lba: firstLba + 20,
+        file_path: "/SYSTEM.CNF",
+      });
+      expect(iso.unallocated_gaps[0]?.start_lba).toBe(firstLba + 22);
+    },
+  );
+
+  it("retains an ambiguous ISO extent origin as unknown", () => {
+    const image = iso9660Fixture();
+    image.copy(image, 6 * 2048, 18 * 2048, 19 * 2048);
+    const iso = parseIso9660FileSystem(image, 12)!;
+    expect(iso).toMatchObject({
+      base_lba: null,
+      extent_base_candidates: [0, 12],
+      allocation_coverage: "partial",
+      files: [],
+      unallocated_gaps: [],
+    });
+  });
+  it("parses ISO9660 PVD, directory records, unallocated gaps, and LBA/offset locations", () => {
+    const image = iso9660Fixture();
 
     const iso = parseIso9660FileSystem(image, 0);
     expect(iso).toMatchObject({
@@ -382,9 +439,9 @@ describe("ISO9660 file system and LBA/offset resolution", () => {
       ],
       unallocated_gaps: [
         {
-          start_lba: 21,
+          start_lba: 22,
           end_lba: 23,
-          sectors: 3,
+          sectors: 2,
           after_file: "/SYSTEM.CNF",
           before_file: "/MAIN.EXE",
         },

@@ -123,8 +123,10 @@ export const scanSuperHRegion = (
           }
         : {}),
     });
+    return results.length - 1;
   };
   let pendingDelay: "call" | "reset" | undefined;
+  let pendingCallIndex: number | undefined;
   const skip = region.address % 2;
   for (let rel = skip; rel + 2 <= region.length; rel += 2) {
     const fileOffset = region.fileOffset + rel;
@@ -223,11 +225,7 @@ export const scanSuperHRegion = (
       const dest = (pc + 4 + signExtend12(insn & 0xfff) * 2) >>> 0;
       const t = findTarget(dest);
       if (t !== undefined) {
-        const callArguments =
-          isCall && options?.resolveCallArguments
-            ? snapshotArgs(regs, [4, 5, 6, 7], "r")
-            : undefined;
-        pushHit({
+        const hitIndex = pushHit({
           kind: isCall ? "call" : "jump",
           fileOffset,
           address: pc,
@@ -237,8 +235,8 @@ export const scanSuperHRegion = (
           targetAddress: dest,
           targetIndex: t.index,
           sourceLuiAddress: null,
-          ...(callArguments === undefined ? {} : { callArguments }),
         });
+        if (isCall) pendingCallIndex = hitIndex;
       }
       nextDelay = isCall ? "call" : "reset";
     } else if (
@@ -251,11 +249,7 @@ export const scanSuperHRegion = (
       if (targetReg !== undefined) {
         const t = findTarget(targetReg.value);
         if (t !== undefined) {
-          const callArguments =
-            isCall && options?.resolveCallArguments
-              ? snapshotArgs(regs, [4, 5, 6, 7], "r")
-              : undefined;
-          pushHit({
+          const hitIndex = pushHit({
             kind: isCall ? "call" : "jump",
             fileOffset,
             address: pc,
@@ -265,23 +259,41 @@ export const scanSuperHRegion = (
             targetAddress: targetReg.value,
             targetIndex: t.index,
             sourceLuiAddress: targetReg.poolAddress,
-            ...(callArguments === undefined ? {} : { callArguments }),
           });
+          if (isCall) pendingCallIndex = hitIndex;
         }
       }
       nextDelay = isCall ? "call" : "reset";
     } else if (insn === 0x000b) {
       // rts
       nextDelay = "reset";
+    } else if (top4 === 0x6) {
+      // Unmodelled loads/ALU operations write Rn; postincrement loads also write Rm.
+      regs[rn] = undefined;
+      if ([4, 5, 6].includes(insn & 0xf)) regs[rm] = undefined;
+    } else if (top4 === 0x4) {
+      regs[rn] = undefined;
+    } else if (insn !== 0x0009) {
+      // Do not carry constants through instructions or control flow we cannot model.
+      regs.fill(undefined);
     }
 
     if (pendingDelay !== undefined) {
       if (pendingDelay === "call") {
+        if (pendingCallIndex !== undefined && options?.resolveCallArguments) {
+          const hit = results[pendingCallIndex];
+          if (hit !== undefined)
+            results[pendingCallIndex] = {
+              ...hit,
+              callArguments: snapshotArgs(regs, [4, 5, 6, 7], "r"),
+            };
+        }
         for (let r = 0; r <= 7; r++) regs[r] = undefined;
       } else {
         regs.fill(undefined);
       }
       pendingDelay = undefined;
+      pendingCallIndex = undefined;
     }
     if (nextDelay !== undefined) pendingDelay = nextDelay;
   }
@@ -614,7 +626,10 @@ export const scanArmOrThumbRegion = (
         });
       }
       const cond = (word >>> 28) & 0xf;
-      if (cond === 0xf) continue;
+      if (cond === 0xf) {
+        regs.fill(undefined);
+        continue;
+      }
       if (((word >>> 25) & 0x7) === 0b101) {
         const isLink = ((word >>> 24) & 1) === 1;
         const dest = (pc + 8 + (signExtend24(word & 0xffffff) << 2)) >>> 0;
@@ -639,7 +654,9 @@ export const scanArmOrThumbRegion = (
         }
         if (isLink) {
           for (let r = 0; r <= 3; r++) regs[r] = undefined;
-        }
+          regs[12] = undefined;
+          regs[14] = undefined;
+        } else regs.fill(undefined);
       } else if ((word & 0x0f7f0000) === 0x051f0000) {
         // LDR Rd, [PC, #±imm12]
         const up = ((word >>> 23) & 1) === 1;
@@ -649,7 +666,8 @@ export const scanArmOrThumbRegion = (
         const poolRel = poolPc - region.address;
         if (poolRel >= 0 && poolRel + 4 <= region.length) {
           const lit = view.getUint32(region.fileOffset + poolRel, true);
-          regs[rd] = { value: lit, poolAddress: poolPc };
+          regs[rd] =
+            cond === 0xe ? { value: lit, poolAddress: poolPc } : undefined;
           const t = findTarget(lit);
           if (t !== undefined) {
             pushHit({
@@ -664,8 +682,21 @@ export const scanArmOrThumbRegion = (
               sourceLuiAddress: poolPc,
             });
           }
-        }
-      }
+        } else regs[rd] = undefined;
+      } else if ((word & 0x0fe00000) === 0x03a00000) {
+        // MOV Rd, #rotated immediate. Conditional writes have an unknown outcome.
+        const rd = (word >>> 12) & 0xf;
+        const imm = word & 0xff;
+        const rotate = ((word >>> 8) & 0xf) * 2;
+        regs[rd] =
+          cond === 0xe
+            ? {
+                value: ((imm >>> rotate) | (imm << ((32 - rotate) % 32))) >>> 0,
+                poolAddress: null,
+              }
+            : undefined;
+      } else if (word !== 0xe1a00000 && word !== 0xe320f000)
+        regs.fill(undefined);
     }
     return results;
   }
@@ -718,7 +749,8 @@ export const scanArmOrThumbRegion = (
           });
         }
         for (let r = 0; r <= 3; r++) regs[r] = undefined;
-      }
+        rel += 2; // Consume both halfwords of BL/BLX exactly once.
+      } else regs.fill(undefined);
     } else if ((hw1 & 0xf800) === 0x4800) {
       // LDR Rd, [PC, #imm8*4]
       const rd = (hw1 >>> 8) & 7;
@@ -742,12 +774,23 @@ export const scanArmOrThumbRegion = (
             sourceLuiAddress: poolPc,
           });
         }
-      }
+      } else regs[rd] = undefined;
     } else if ((hw1 & 0xf800) === 0x2000) {
       // MOV Rd, #imm8
       const rd = (hw1 >>> 8) & 7;
       regs[rd] = { value: hw1 & 0xff, poolAddress: null };
-    }
+    } else if ((hw1 & 0xf000) === 0x3000) {
+      // ADD/SUB Rd, #imm8.
+      const rd = (hw1 >>> 8) & 7;
+      const old = regs[rd];
+      if (old !== undefined)
+        regs[rd] = {
+          value:
+            (old.value + ((hw1 & 0x0800) === 0 ? 1 : -1) * (hw1 & 0xff)) >>> 0,
+          poolAddress: old.poolAddress,
+        };
+    } else if ((hw1 & 0xf800) !== 0x2800 && hw1 !== 0xbf00 && hw1 !== 0x46c0)
+      regs.fill(undefined);
   }
   return results;
 };

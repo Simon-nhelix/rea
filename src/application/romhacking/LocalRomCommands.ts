@@ -188,23 +188,12 @@ export const runLocalRomTool = async (input: {
   const subject =
     target.kind === "local-bytes" ? localByteSourceSubject(target) : target;
 
-  const effectiveArguments: Readonly<Record<string, JsonValue>> =
-    input.loadAddress !== undefined &&
-    (input.tool === "scan_pointer_table" ||
-      input.tool === "discover_pointer_tables") &&
-    (input.arguments.base_address === undefined ||
-      input.arguments.base_address === "0x0") &&
-    input.arguments.base_mode !== "segment" &&
-    input.arguments.segment_start === undefined &&
-    input.arguments.segment_align === undefined
-      ? { ...input.arguments, base_address: input.loadAddress }
-      : input.arguments;
-
   if (input.exportTo !== undefined) {
     const exportTarget = target;
     if (input.tool === "search_rom_strings") {
-      const parsed =
-        enhancedInputSchemas.search_rom_strings.safeParse(effectiveArguments);
+      const parsed = enhancedInputSchemas.search_rom_strings.safeParse(
+        input.arguments,
+      );
       if (!parsed.success) return invalidInput(input.tool, parsed.error);
       const written = await writeJsonLinesFile(input.exportTo, (write) =>
         exportSearchRomStrings(parsed.data, exportTarget, write, input.signal),
@@ -217,8 +206,9 @@ export const runLocalRomTool = async (input: {
       });
     }
     if (input.tool === "scan_pointer_table") {
-      const parsed =
-        enhancedInputSchemas.scan_pointer_table.safeParse(effectiveArguments);
+      const parsed = enhancedInputSchemas.scan_pointer_table.safeParse(
+        input.arguments,
+      );
       if (!parsed.success) return invalidInput(input.tool, parsed.error);
       const written = await writeJsonLinesFile(input.exportTo, (write) =>
         exportScanPointerTable(parsed.data, exportTarget, write, input.signal),
@@ -240,7 +230,7 @@ export const runLocalRomTool = async (input: {
 
   const result = await executeOnLocalTarget(
     input.tool,
-    effectiveArguments,
+    input.arguments,
     target,
     input.signal,
   );

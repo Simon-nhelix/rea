@@ -7,8 +7,9 @@ import {
   type RomControlCodeTable,
   type RomControlCodeUse,
   type RomTextWithControlCodes,
+  romControlCodeUseSchema,
   withTerminatorAsEndCode,
-  withWordTerminatorAsEndCode,
+  withWordFormatControlCodes,
 } from "./romControlCodes.js";
 import {
   findOrphanStringsInPointerGaps,
@@ -740,13 +741,7 @@ export const decodeRomStringWithControlCodes = (
         return res.ok ? res.value : undefined;
       })();
     const effectiveCodes =
-      format !== undefined
-        ? withWordTerminatorAsEndCode(
-            codes,
-            format.terminatorWord,
-            format.littleEndian,
-          )
-        : codes;
+      format !== undefined ? withWordFormatControlCodes(codes, format) : codes;
     return decodeRomTextWithControlCodes(
       bytes,
       effectiveCodes,
@@ -1748,17 +1743,7 @@ export const romStringMatchSchema = z.strictObject({
   lines: z.array(z.string()).optional(),
   character_length: z.number().int().min(0).optional(),
   longest_line_characters: z.number().int().min(0).optional(),
-  control_codes: z
-    .array(
-      z.strictObject({
-        name: z.string(),
-        offset: z.number().int().min(0),
-        byte_length: z.number().int().min(0),
-        arguments_hex: z.string(),
-        arguments_truncated: z.boolean().optional(),
-      }),
-    )
-    .optional(),
+  control_codes: z.array(romControlCodeUseSchema).optional(),
   bytes_hex: z.string().optional(),
   byte_length: z.number().int().min(0),
   terminated: z.boolean(),
@@ -1927,7 +1912,7 @@ export const scanPointerTableInputSchema = z.strictObject({
     .boolean()
     .optional()
     .describe(
-      "Scan gaps between sorted pointer targets for valid unreferenced strings (e.g. follow-up dialogue pages or inline choice text advancing past a terminator without a dedicated pointer slot).",
+      "Scan gaps between sorted pointer targets for unreferenced strings. Discovered starts cut preceding slot budgets; include_manuscript also emits origin: orphan records with null pointer fields. Examines gaps up to 4096 bytes and stops at undecodable data; not exhaustive script coverage.",
     ),
   ...romControlCodeFields,
 });
@@ -1967,19 +1952,29 @@ export const manuscriptRecordSchema = z.strictObject({
   lines: z.array(z.string()).optional(),
   character_length: z.number().int().min(0).optional(),
   longest_line_characters: z.number().int().min(0).optional(),
-  control_codes: z
-    .array(
-      z.strictObject({
-        name: z.string(),
-        offset: z.number().int().min(0),
-        byte_length: z.number().int().min(0),
-        arguments_hex: z.string(),
-        arguments_truncated: z.boolean().optional(),
-      }),
-    )
-    .optional(),
+  control_codes: z.array(romControlCodeUseSchema).optional(),
   ko: z.string(),
 });
+
+const orphanManuscriptRecordSchema = manuscriptRecordSchema
+  .omit({
+    index: true,
+    pointer_address: true,
+    pointer_file_offset: true,
+    also_referenced_by: true,
+  })
+  .extend({
+    origin: z.literal("orphan"),
+    pointer_address: z.null(),
+    pointer_file_offset: z.null(),
+    after_entry_index: z.number().int().min(0),
+    gap_index: z.number().int().min(0),
+  });
+const extractedManuscriptRecordSchema = z.union([
+  manuscriptRecordSchema,
+  orphanManuscriptRecordSchema,
+]);
+export type ManuscriptRecord = z.output<typeof extractedManuscriptRecordSchema>;
 
 export const scanPointerTableResultSchema = z.strictObject({
   table_address: z.string(),
@@ -1996,7 +1991,7 @@ export const scanPointerTableResultSchema = z.strictObject({
   entries_scanned: z.number().int().min(0),
   start_index: z.number().int().min(0).optional(),
   next_start_index: z.number().int().min(0).optional(),
-  manuscript_records: z.array(manuscriptRecordSchema).optional(),
+  manuscript_records: z.array(extractedManuscriptRecordSchema).optional(),
   /** Unreferenced strings discovered in gaps between sorted pointer targets when include_orphan_strings is true. */
   orphan_strings: z.array(orphanStringEntrySchema).optional(),
   /** Whether the scanned entries cover their string region (local bytes with a terminator). */

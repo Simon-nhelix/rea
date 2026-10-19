@@ -250,6 +250,15 @@ export const segmentRomTextByControlCodes = (
   return { segments, byteLength: bytes.length, stop: "buffer-end" };
 };
 
+/** Serialized occurrence contract shared by search, pointer and orphan results. */
+export const romControlCodeUseSchema = z.strictObject({
+  name: z.string(),
+  offset: z.number().int().min(0),
+  byte_length: z.number().int().min(0),
+  arguments_hex: z.string(),
+  arguments_truncated: z.boolean().optional(),
+});
+
 /** One code occurrence, reported so a reinsertion keeps it byte-for-byte. */
 export interface RomControlCodeUse {
   readonly name: string;
@@ -329,8 +338,10 @@ export const decodeRomTextWithControlCodes = (
         ...(segment.argumentsTruncated ? { arguments_truncated: true } : {}),
       });
     }
-    if (segment.code.role === "line-break") endLine(false);
-    else if (segment.code.role === "page-break") endLine(true);
+    if (segment.code.role === "line-break") {
+      if (!segment.code.reported) parts.push("\n");
+      endLine(false);
+    } else if (segment.code.role === "page-break") endLine(true);
     else if (segment.code.reported) line += label;
   }
   endLine(false);
@@ -387,19 +398,16 @@ export const withTerminatorAsEndCode = (
  * Treat a 16-bit terminator_word as an unreported end code when scanning
  * 16-bit word encodings (sjis-le16, tile-le16, tile-be16).
  */
-export const withWordTerminatorAsEndCode = (
+const withWordCode = (
   table: RomControlCodeTable,
-  terminatorWord: number | null,
+  word: number | null,
   littleEndian: boolean,
-  name = "terminator",
+  name: string,
+  role: RomControlCodeRole,
 ): RomControlCodeTable => {
-  if (terminatorWord === null) return table;
-  const b0 = littleEndian
-    ? terminatorWord & 0xff
-    : (terminatorWord >>> 8) & 0xff;
-  const b1 = littleEndian
-    ? (terminatorWord >>> 8) & 0xff
-    : terminatorWord & 0xff;
+  if (word === null) return table;
+  const b0 = littleEndian ? word & 0xff : (word >>> 8) & 0xff;
+  const b1 = littleEndian ? (word >>> 8) & 0xff : word & 0xff;
   const existing = table.byFirstByte.get(b0);
   if (
     existing?.some(
@@ -412,7 +420,7 @@ export const withWordTerminatorAsEndCode = (
     bytes: Uint8Array.of(b0, b1),
     name,
     argumentBytes: 0,
-    role: "end",
+    role,
     reported: false,
   };
   const byFirstByte = new Map<number, ReadonlyArray<RomControlCode>>(
@@ -428,3 +436,26 @@ export const withWordTerminatorAsEndCode = (
     maxByteLength: Math.max(table.maxByteLength, 2),
   };
 };
+
+/** Word terminators and newlines share the same token boundaries as declared codes. */
+export const withWordFormatControlCodes = (
+  table: RomControlCodeTable,
+  format: {
+    readonly terminatorWord: number | null;
+    readonly newlineWord: number | null;
+    readonly littleEndian: boolean;
+  },
+): RomControlCodeTable =>
+  withWordCode(
+    withWordCode(
+      table,
+      format.terminatorWord,
+      format.littleEndian,
+      "terminator",
+      "end",
+    ),
+    format.newlineWord,
+    format.littleEndian,
+    "newline",
+    "line-break",
+  );

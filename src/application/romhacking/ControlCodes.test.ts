@@ -135,7 +135,7 @@ describe("scan_pointer_table with declared control codes", () => {
     const swapBuf = new Uint8Array(0x30);
     swapBuf.set([0x10, 0x00, 0x20, 0x00], 0x00);
     swapBuf.set(
-      [0xa0, 0x82, 0xff, 0x01, 0x00, 0x00, 0xa2, 0x82, 0xff, 0xff],
+      [0xa0, 0x82, 0xff, 0x01, 0x00, 0x00, 0xfe, 0xff, 0xa2, 0x82, 0xff, 0xff],
       0x10,
     );
     swapBuf.set([0xa9, 0x82, 0xff, 0xff], 0x20);
@@ -145,13 +145,18 @@ describe("scan_pointer_table with declared control codes", () => {
       ...BASE,
       encoding: "sjis-swap16",
       terminator_word: 0xffff,
+      newline_word: 0xfffe,
       control_codes: [{ hex: "FF 01", name: "WAIT", argument_bytes: 2 }],
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const records = manuscripts(result.value.result);
-    expect(records[0]?.jp).toBe("あ{WAIT}い");
-    expect(records[0]?.byte_length).toBe(10);
+    expect(records[0]?.jp).toBe("あ{WAIT}\nい");
+    expect(records[0]?.byte_length).toBe(12);
+    expect(records[0]).toMatchObject({
+      lines: ["あ{WAIT}", "い"],
+      longest_line_characters: 1,
+    });
     expect(records[0]?.character_length).toBe(2);
     expect(records[0]?.control_codes).toEqual([
       { name: "WAIT", offset: 2, byte_length: 4, arguments_hex: "0000" },
