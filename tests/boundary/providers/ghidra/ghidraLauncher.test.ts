@@ -392,6 +392,50 @@ describe("Ghidra configured import language and seeds", () => {
     },
   );
 
+  it.each(["darwin", "win32"] as const)(
+    "lets console preparation apply seeds before entry decoding on %s",
+    (platform) => {
+      const path = platform === "win32" ? win32 : posix;
+      const bridgeDirectory = path.join("/package", "bridge");
+      const seedPath = path.join("/tmp/runtime/seeds", "seeds.tsv");
+      const specPath = path.join("/tmp/runtime", "console.tsv");
+      const consoleRom = {
+        loader: "BinaryLoader" as const,
+        languageId: "65816:LE:16:default",
+        compilerSpecId: "default",
+        baseAddr: "0x8000",
+        specPath,
+      };
+      const common = {
+        ...base,
+        platform,
+        consoleRom,
+        bridgeScriptPath: path.join(bridgeDirectory, "ReaGhidraBridge.java"),
+      };
+      const args = ghidraHeadlessArguments({ ...common, seedPath });
+      const prepare = args.indexOf(
+        path.join(bridgeDirectory, "ReaGhidraPrepareConsole.java"),
+      );
+      expect(args.slice(prepare - 1, prepare + 3)).toEqual([
+        "-preScript",
+        path.join(bridgeDirectory, "ReaGhidraPrepareConsole.java"),
+        specPath,
+        seedPath,
+      ]);
+      expect(args).not.toContain(
+        path.join(bridgeDirectory, "ReaGhidraApplySeeds.java"),
+      );
+      const unseeded = ghidraHeadlessArguments(common);
+      const unseededPrepare = unseeded.indexOf(
+        path.join(bridgeDirectory, "ReaGhidraPrepareConsole.java"),
+      );
+      expect(unseeded[unseededPrepare + 1]).toBe(specPath);
+      expect(unseeded[unseededPrepare + 2]).toMatch(
+        /^-preScript$|^-postScript$/u,
+      );
+    },
+  );
+
   it("adds no seed script without a seed snapshot", () => {
     expect(ghidraHeadlessArguments(base)).not.toContain(
       posix.join("/package/bridge", "ReaGhidraApplySeeds.java"),

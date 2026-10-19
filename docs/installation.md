@@ -988,6 +988,13 @@ export REA_GHIDRA_SEED_FILE=/absolute/path/to/seeds.tsv
 
 Each line is `address<TAB>kind[<TAB>name]`, where kind is `function`, `code`, `label` or `context` (a label needs a name; context takes a `register=0xvalue` assignment). Addresses are `0x` hex in the default space; `#` lines are comments. A pre-script applies seeds before auto-analysis: processor context first, functions from the highest address down, then code, then labels. The seed digest is part of the analysis profile, and the session fails if the applied seeds differ. Result limitations report the outcome counts; a seed fails when it overlaps an instruction Ghidra already decoded.
 
+Console imports first prepare their memory mappings and platform reset-context
+defaults, then apply caller seeds, then decode the reset and interrupt entries.
+Explicit context seeds at the reset address override those platform defaults.
+Conflicting caller assertions for overlapping processor-context bits still fail
+closed. Without a seed file, console entry preparation follows the same default
+reset/vector flow as an unseeded import.
+
 For processors whose instruction widths depend on status flags, context seeds
 supply explicit caller assertions before function/code seeds are decoded. For
 example, a SNES entry observed in native mode with 16-bit accumulator and index

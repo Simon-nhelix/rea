@@ -764,9 +764,11 @@ export const ghidraHeadlessArguments = (
           "-preScript",
           scriptPath.join(bridgeDirectory, "ReaGhidraPrepareConsole.java"),
           consoleRom.specPath,
+          ...(options.seedPath === undefined ? [] : [options.seedPath]),
         ]),
-    // Seeds follow any loader preparation and precede default auto-analysis.
-    ...(options.seedPath === undefined
+    // Console preparation owns map/default-context -> seeds -> entry decode.
+    // Other loaders apply their seeds here before default auto-analysis.
+    ...(options.seedPath === undefined || consoleRom !== undefined
       ? []
       : [
           "-preScript",

@@ -109,9 +109,9 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
     @Override
     public void run() throws Exception {
         String[] args = getScriptArgs();
-        if (args.length != 1) {
+        if (args.length < 1 || args.length > 2) {
             throw new IllegalArgumentException(
-                "REA console preparation script requires one spec file path"
+                "REA console preparation script requires a spec path and optional seed snapshot path"
             );
         }
         Path specPath = Path.of(args[0]);
@@ -307,6 +307,14 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
             rawEntryOffset = alignedOffset;
         }
 
+        // Set platform defaults before caller assertions, and apply assertions
+        // before any reset/vector flow creates instructions. Otherwise changing
+        // 65816 E/M/X at a reset-reachable address raises ContextChangeException.
+        prepareEntryContext(space, memory, rawEntryOffset);
+        if (args.length == 2) {
+            runScript("ReaGhidraApplySeeds.java", new String[] { args[1] });
+        }
+
         seedEntryAddress(space, memory, maxOffset, rawEntryOffset, "entry");
         seedConsoleVectors(format, space, memory, maxOffset, rawEntryOffset);
 
@@ -315,6 +323,25 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
             String.format("0x%x", rawEntryOffset)
         );
         currentProgram.getOptions(Program.PROGRAM_INFO).setBoolean("REA console prepared", true);
+    }
+
+    /** Platform reset defaults only; caller context seeds may override them. */
+    private void prepareEntryContext(AddressSpace space, Memory memory, long rawOffset)
+            throws Exception {
+        if (!currentProgram.getLanguageID().getIdAsString().equals("65816:LE:16:default")) return;
+        Address resetVector = space.getAddress(0xfffcL);
+        if (!memory.contains(resetVector) ||
+            (memory.getShort(resetVector) & 0xffff) != rawOffset) return;
+        if (Long.compareUnsigned(rawOffset, space.getMaxAddress().getUnsignedOffset()) > 0) return;
+        Address address = space.getAddress(rawOffset);
+        MemoryBlock block = memory.getBlock(address);
+        if (block == null || !block.isInitialized()) return;
+        for (String name : new String[] { "ctx_EF", "ctx_MF", "ctx_XF" }) {
+            Register register = currentProgram.getRegister(name);
+            if (register != null) currentProgram.getProgramContext().setValue(
+                register, address, address, BigInteger.ONE
+            );
+        }
     }
 
     private void seedEntryAddress(
@@ -338,20 +365,6 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
             Address resetVector = space.getAddress(0xfffcL);
             if (!memory.contains(resetVector) ||
                 (memory.getShort(resetVector) & 0xffff) != rawOffset) return;
-            if ("entry".equals(name)) {
-                Register efReg = currentProgram.getRegister("ctx_EF");
-                if (efReg != null) {
-                    currentProgram.getProgramContext().setValue(efReg, address, address, BigInteger.ONE);
-                }
-                Register mfReg = currentProgram.getRegister("ctx_MF");
-                Register xfReg = currentProgram.getRegister("ctx_XF");
-                if (mfReg != null) {
-                    currentProgram.getProgramContext().setValue(mfReg, address, address, BigInteger.ONE);
-                }
-                if (xfReg != null) {
-                    currentProgram.getProgramContext().setValue(xfReg, address, address, BigInteger.ONE);
-                }
-            }
         }
         if ("entry".equals(name)) addEntryPoint(address);
         disassemble(address);
