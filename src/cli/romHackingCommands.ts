@@ -370,6 +370,18 @@ export const registerRomHackingCommands = (
         .describe(
           "Range scan: one record per distinct byte string with every offset in occurrences",
         ),
+      controlCodes: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Path to a JSON array declaring in-string control codes ({hex, name, argument_bytes, role})",
+        ),
+      controlCodesJson: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Inline JSON array declaring in-string control codes"),
       output: z
         .string()
         .min(1)
@@ -387,8 +399,12 @@ export const registerRomHackingCommands = (
       const resolvedTablePath = options.tablePath ?? options.tblPath;
       const resolvedTableText = options.tableText ?? options.tblText;
       const resolvedXrefs = options.includeXrefs ?? options.resolveXrefs;
-      return logCliCommand(logger, CLI_COMMANDS.searchRomStrings, () =>
-        runDirectAnalysis(
+      return logCliCommand(logger, CLI_COMMANDS.searchRomStrings, async () => {
+        const controlCodes = await readControlCodeDeclarations(
+          CLI_COMMANDS.searchRomStrings,
+          options,
+        );
+        return runDirectAnalysis(
           args.path,
           "search_rom_strings",
           {
@@ -431,6 +447,9 @@ export const registerRomHackingCommands = (
             include_score: options.includeScore,
             require_terminator: options.requireTerminator,
             dedupe: options.dedupe,
+            ...(controlCodes === undefined
+              ? {}
+              : { control_codes: controlCodes.map((code) => ({ ...code })) }),
           },
           romAnalysisOptionsFromCli(
             logger,
@@ -439,8 +458,8 @@ export const registerRomHackingCommands = (
               ? undefined
               : { path: options.output, overwrite: options.overwrite },
           ),
-        ),
-      );
+        );
+      });
     },
   });
 
@@ -467,7 +486,7 @@ export const registerRomHackingCommands = (
         .number()
         .int()
         .min(1)
-        .max(512)
+        .max(16_384)
         .default(32)
         .describe("Number of pointer table entries to read"),
       startIndex: z
@@ -566,6 +585,23 @@ export const registerRomHackingCommands = (
         .describe(
           "Emit manuscript records and suppress pointer entries (implies --include-manuscript)",
         ),
+      includeOrphanStrings: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Scan gaps between sorted pointer targets for valid unreferenced strings (e.g. follow-up dialogue pages or inline choice text)",
+        ),
+      output: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Write every scanned pointer entry (or manuscript record when --include-manuscript/--manuscript-only is set) as JSON Lines to this file",
+        ),
+      overwrite: z
+        .boolean()
+        .default(false)
+        .describe("Replace an existing --output file"),
       ...pointerSegmentOptions,
       ...romWordFormatOptions,
       ...romOpenOptionFields,
@@ -611,12 +647,19 @@ export const registerRomHackingCommands = (
             include_manuscript: options.includeManuscript,
             include_hex: options.includeHex,
             manuscript_only: options.manuscriptOnly,
+            include_orphan_strings: options.includeOrphanStrings,
             ...(controlCodes === undefined
               ? {}
               : { control_codes: controlCodes.map((code) => ({ ...code })) }),
             ...romWordFormatArguments(options),
           },
-          romAnalysisOptionsFromCli(logger, options),
+          romAnalysisOptionsFromCli(
+            logger,
+            options,
+            options.output === undefined
+              ? undefined
+              : { path: options.output, overwrite: options.overwrite },
+          ),
         );
       });
     },
@@ -668,6 +711,16 @@ export const registerRomHackingCommands = (
         .string()
         .default("0x0")
         .describe("Base address added to each raw pointer value"),
+      inferBaseAddress: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Automatically infer candidate RAM load base addresses for headerless overlays/binaries from pointer-to-string deltas",
+        ),
+      inferLoadAddress: z
+        .boolean()
+        .optional()
+        .describe("Alias for --infer-base-address"),
       stride: z
         .number()
         .int()
@@ -774,6 +827,8 @@ export const registerRomHackingCommands = (
       const resolvedTablePath = options.tablePath ?? options.tblPath;
       const resolvedTableText = options.tableText ?? options.tblText;
       const resolvedXrefs = options.includeXrefs ?? options.resolveXrefs;
+      const resolvedInferBase =
+        options.inferLoadAddress ?? options.inferBaseAddress;
       return logCliCommand(logger, CLI_COMMANDS.discoverPointerTables, () =>
         runDirectAnalysis(
           args.path,
@@ -797,6 +852,7 @@ export const registerRomHackingCommands = (
             pointer_size: options.pointerSize as 2 | 3 | 4,
             endian: options.endian,
             base_address: options.baseAddress,
+            infer_base_address: resolvedInferBase,
             ...(options.stride === undefined ? {} : { stride: options.stride }),
             min_entries: options.minEntries,
             encoding: options.encoding,

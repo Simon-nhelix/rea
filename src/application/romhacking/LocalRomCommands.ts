@@ -26,6 +26,7 @@ import {
   executeFindCodeCaves,
   executeScanPointerTable,
   executeSearchRomStrings,
+  exportScanPointerTable,
   exportSearchRomStrings,
 } from "./RomHackingTools.js";
 import type { LocalRomToolName } from "./LocalRomToolNames.js";
@@ -187,32 +188,59 @@ export const runLocalRomTool = async (input: {
   const subject =
     target.kind === "local-bytes" ? localByteSourceSubject(target) : target;
 
+  const effectiveArguments: Readonly<Record<string, JsonValue>> =
+    input.loadAddress !== undefined &&
+    (input.tool === "scan_pointer_table" ||
+      input.tool === "discover_pointer_tables") &&
+    (input.arguments.base_address === undefined ||
+      input.arguments.base_address === "0x0") &&
+    input.arguments.base_mode !== "segment" &&
+    input.arguments.segment_start === undefined &&
+    input.arguments.segment_align === undefined
+      ? { ...input.arguments, base_address: input.loadAddress }
+      : input.arguments;
+
   if (input.exportTo !== undefined) {
-    if (input.tool !== "search_rom_strings")
-      return err(
-        new AnalysisInputError(input.tool, {
-          userMessage: "File export is available for search_rom_strings only.",
-        }),
-      );
-    const parsed = enhancedInputSchemas.search_rom_strings.safeParse(
-      input.arguments,
-    );
-    if (!parsed.success) return invalidInput(input.tool, parsed.error);
     const exportTarget = target;
-    const written = await writeJsonLinesFile(input.exportTo, (write) =>
-      exportSearchRomStrings(parsed.data, exportTarget, write, input.signal),
+    if (input.tool === "search_rom_strings") {
+      const parsed =
+        enhancedInputSchemas.search_rom_strings.safeParse(effectiveArguments);
+      if (!parsed.success) return invalidInput(input.tool, parsed.error);
+      const written = await writeJsonLinesFile(input.exportTo, (write) =>
+        exportSearchRomStrings(parsed.data, exportTarget, write, input.signal),
+      );
+      if (!written.ok) return written;
+      return ok({
+        subject,
+        result: { ...written.value.summary, output: written.value.output },
+        limitations,
+      });
+    }
+    if (input.tool === "scan_pointer_table") {
+      const parsed =
+        enhancedInputSchemas.scan_pointer_table.safeParse(effectiveArguments);
+      if (!parsed.success) return invalidInput(input.tool, parsed.error);
+      const written = await writeJsonLinesFile(input.exportTo, (write) =>
+        exportScanPointerTable(parsed.data, exportTarget, write, input.signal),
+      );
+      if (!written.ok) return written;
+      return ok({
+        subject,
+        result: { ...written.value.summary, output: written.value.output },
+        limitations,
+      });
+    }
+    return err(
+      new AnalysisInputError(input.tool, {
+        userMessage:
+          "File export is available for search_rom_strings and scan_pointer_table only.",
+      }),
     );
-    if (!written.ok) return written;
-    return ok({
-      subject,
-      result: { ...written.value.summary, output: written.value.output },
-      limitations,
-    });
   }
 
   const result = await executeOnLocalTarget(
     input.tool,
-    input.arguments,
+    effectiveArguments,
     target,
     input.signal,
   );

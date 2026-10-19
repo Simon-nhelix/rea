@@ -116,7 +116,7 @@ describe("scan_pointer_table with declared control codes", () => {
     expect(records[1]?.control_codes).toBeUndefined();
   });
 
-  it("refuses declarations the 16-bit word encodings already own", async () => {
+  it("refuses odd-byte control code declarations in 16-bit word encodings", async () => {
     const result = await scan("words.bin", {
       ...BASE,
       encoding: "sjis-le16",
@@ -125,7 +125,38 @@ describe("scan_pointer_table with declared control codes", () => {
     });
     expect(result.ok).toBe(false);
     if (!result.ok)
-      expect(result.error.userMessage).toContain("terminator_word");
+      expect(result.error.userMessage).toContain("even byte lengths");
+  });
+
+  it("decodes 16-bit word encodings (sjis-swap16) with word-aligned control codes", async () => {
+    // 0x00 table [0010 0020]
+    // 0x10 あ(0x82A0 -> LE 0xA0 0x82) {WAIT: 0x01FF, arg 0x0000} い(0x82A2 -> LE 0xA2 0x82) END(0xFFFF)
+    // 0x20 か(0x82A9 -> LE 0xA9 0x82) END(0xFFFF)
+    const swapBuf = new Uint8Array(0x30);
+    swapBuf.set([0x10, 0x00, 0x20, 0x00], 0x00);
+    swapBuf.set(
+      [0xa0, 0x82, 0xff, 0x01, 0x00, 0x00, 0xa2, 0x82, 0xff, 0xff],
+      0x10,
+    );
+    swapBuf.set([0xa9, 0x82, 0xff, 0xff], 0x20);
+    await writeFile(join(root, "swap16.bin"), swapBuf);
+
+    const result = await scan("swap16.bin", {
+      ...BASE,
+      encoding: "sjis-swap16",
+      terminator_word: 0xffff,
+      control_codes: [{ hex: "FF 01", name: "WAIT", argument_bytes: 2 }],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const records = manuscripts(result.value.result);
+    expect(records[0]?.jp).toBe("あ{WAIT}い");
+    expect(records[0]?.byte_length).toBe(10);
+    expect(records[0]?.character_length).toBe(2);
+    expect(records[0]?.control_codes).toEqual([
+      { name: "WAIT", offset: 2, byte_length: 4, arguments_hex: "0000" },
+    ]);
+    expect(records[1]?.jp).toBe("か");
   });
 
   it("refuses two declarations of the same bytes", async () => {

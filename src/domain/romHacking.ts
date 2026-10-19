@@ -2,12 +2,22 @@ import { z } from "zod";
 import { err, ok, type Result } from "./result.js";
 import {
   decodeRomTextWithControlCodes,
+  matchRomControlCodeAt,
   romControlCodeFields,
   type RomControlCodeTable,
   type RomControlCodeUse,
   type RomTextWithControlCodes,
   withTerminatorAsEndCode,
+  withWordTerminatorAsEndCode,
 } from "./romControlCodes.js";
+import {
+  findOrphanStringsInPointerGaps,
+  inferredBaseCandidateSchema,
+  inferOverlayLoadAddress,
+  orphanStringEntrySchema,
+  type InferredBaseCandidate,
+  type OrphanStringEntry,
+} from "./romLoadAddressInference.js";
 import {
   getSjisDoubleByteDecodeTable,
   getSjisEncodeMap,
@@ -36,6 +46,7 @@ export const ROM_TEXT_ENCODINGS = [
   "ascii",
   "tbl",
   "sjis-le16",
+  "sjis-swap16",
   "tile-le16",
   "tile-be16",
 ] as const;
@@ -66,7 +77,9 @@ type WordRomTextEncoding = (typeof WORD_ROM_TEXT_ENCODINGS)[number];
 export const isWordRomTextEncoding = (
   encoding: RomTextEncoding,
 ): encoding is WordRomTextEncoding =>
-  (WORD_ROM_TEXT_ENCODINGS as readonly string[]).includes(encoding);
+  (WORD_ROM_TEXT_ENCODINGS as readonly string[]).includes(
+    encoding === "sjis-swap16" ? "sjis-le16" : encoding,
+  );
 
 /** Encodings that decode through a caller-supplied character table. */
 export const requiresRomCharTable = (encoding: RomTextEncoding): boolean =>
@@ -299,6 +312,8 @@ export const normalizeRomTextEncoding = (
       return "utf-16le";
     case "utf16be":
       return "utf-16be";
+    case "sjis-swap16":
+      return "sjis-le16";
     default:
       return encoding;
   }
@@ -703,10 +718,6 @@ export const decodeRomStringFromBytes = (
 /**
  * Decode one ROM string with declared control codes held apart from the glyph
  * runs, so argument bytes are never read as text and line breaks are visible.
- *
- * Only byte encodings are decoded here. In the 16-bit word encodings
- * terminator_word and newline_word already own string ends and line breaks,
- * and a byte-declared code could land on half a word.
  */
 export const decodeRomStringWithControlCodes = (
   bytes: Uint8Array,
@@ -714,16 +725,65 @@ export const decodeRomStringWithControlCodes = (
   terminatorByte: number | null,
   customTable: CustomCharTable | undefined,
   codes: RomControlCodeTable,
-): RomTextWithControlCodes =>
-  decodeRomTextWithControlCodes(
+  words?: RomWordFormat | undefined,
+): RomTextWithControlCodes => {
+  const canonical = normalizeRomTextEncoding(encoding);
+  if (isWordRomTextEncoding(canonical)) {
+    const format =
+      words ??
+      (() => {
+        const res = resolveRomWordFormat({
+          encoding: canonical,
+          terminatorByte,
+          customTable,
+        });
+        return res.ok ? res.value : undefined;
+      })();
+    const effectiveCodes =
+      format !== undefined
+        ? withWordTerminatorAsEndCode(
+            codes,
+            format.terminatorWord,
+            format.littleEndian,
+          )
+        : codes;
+    return decodeRomTextWithControlCodes(
+      bytes,
+      effectiveCodes,
+      (run) =>
+        decodeRomStringFromBytes(
+          run,
+          canonical,
+          null,
+          customTable,
+          format === undefined
+            ? undefined
+            : { ...format, terminatorWord: null },
+        ).decoded,
+      2,
+    );
+  }
+  return decodeRomTextWithControlCodes(
     bytes,
     withTerminatorAsEndCode(codes, terminatorByte),
     // Each run already ends at a code or the buffer, so no terminator applies.
     (run) => decodeRomStringFromBytes(run, encoding, null, customTable).decoded,
   );
+};
 
 /** Re-export so result builders need one import for a code occurrence. */
-export type { RomControlCodeUse, RomTextWithControlCodes };
+export type {
+  RomControlCodeUse,
+  RomTextWithControlCodes,
+  InferredBaseCandidate,
+  OrphanStringEntry,
+};
+export {
+  inferOverlayLoadAddress,
+  findOrphanStringsInPointerGaps,
+  inferredBaseCandidateSchema,
+  orphanStringEntrySchema,
+};
 
 /** Which word alignments a 16-bit word scan examines, by absolute offset. */
 export const ROM_WORD_PARITIES = ["both", "even", "odd"] as const;
@@ -802,6 +862,8 @@ export interface ScannedRomString {
   readonly terminated: boolean;
   /** text_score, present when requested or when filters need it. */
   readonly score?: number;
+  /** Control-code display metadata when controlCodes was supplied. */
+  readonly display?: RomTextWithControlCodes | undefined;
   /** Restart point that yields this string first. */
   readonly resume: RomScanResume;
 }
@@ -815,6 +877,8 @@ export interface RomStringScanInput {
   readonly customTable?: CustomCharTable | undefined;
   /** Required for word encodings; resolved by resolveRomWordFormat. */
   readonly words?: RomWordFormat | undefined;
+  /** Optional control-code table so inline codes and operand bytes do not split strings. */
+  readonly controlCodes?: RomControlCodeTable | undefined;
   /** When false, rawHex is "" and no hex formatting is paid per string. */
   readonly includeRawHex?: boolean | undefined;
   /** Buffer offset to start scanning from. */
@@ -836,6 +900,7 @@ interface RawScannedString {
   readonly decoded: string;
   readonly byteLength: number;
   readonly terminated: boolean;
+  readonly display?: RomTextWithControlCodes | undefined;
 }
 
 /**
@@ -871,6 +936,7 @@ export function* scanRomStrings(
       rawHex: input.includeRawHex === false ? "" : formatHexPattern(slice),
       terminated: raw.terminated,
       ...(input.measure === true && score !== undefined ? { score } : {}),
+      ...(raw.display !== undefined ? { display: raw.display } : {}),
       resume,
     };
   };
@@ -920,7 +986,13 @@ function* scanWordStrings(
   const streams = ([0, 1] as const).map((absoluteParity) => {
     const at = startFor(absoluteParity);
     if (at === null) return undefined;
-    const runs = scanWordRuns(bytes, at, format, input.minLength);
+    const runs = scanWordRuns(
+      bytes,
+      at,
+      format,
+      input.minLength,
+      input.controlCodes,
+    );
     return (function* () {
       for (const raw of runs) {
         // The resume head is filled in by the merge below.
@@ -965,6 +1037,7 @@ function* scanWordRuns(
   at: number,
   format: RomWordFormat,
   minLength: number,
+  controlCodes?: RomControlCodeTable | undefined,
 ): Generator<RawScannedString, void, undefined> {
   let pos = at;
   while (pos + 1 < bytes.length) {
@@ -974,7 +1047,25 @@ function* scanWordRuns(
     let group: number | undefined;
     let terminated = false;
     let groupChanged = false;
+    let usedControlCodes = false;
     while (pos + 1 < bytes.length) {
+      if (characters > 0 && controlCodes !== undefined) {
+        const ctrl = matchRomControlCodeAt(bytes, pos, controlCodes);
+        if (ctrl !== undefined) {
+          const totalBytes = ctrl.bytes.length + ctrl.argumentBytes;
+          if (pos + totalBytes > bytes.length) break;
+          pos += totalBytes;
+          usedControlCodes = true;
+          if (ctrl.role === "end") {
+            terminated = true;
+            break;
+          }
+          if (ctrl.role === "line-break" || ctrl.role === "page-break") {
+            parts.push("\n");
+          }
+          continue;
+        }
+      }
       const word = readWord(bytes, pos, format.littleEndian);
       if (word === format.terminatorWord) {
         pos += 2;
@@ -997,13 +1088,36 @@ function* scanWordRuns(
       characters++;
       pos += 2;
     }
-    if (characters >= minLength)
-      yield {
-        offsetInBuffer: runStart,
-        decoded: parts.join(""),
-        byteLength: pos - runStart,
-        terminated,
-      };
+    if (characters >= minLength) {
+      if (controlCodes !== undefined) {
+        const withCodes = decodeRomStringWithControlCodes(
+          bytes.subarray(runStart, pos),
+          format.encoding,
+          null,
+          undefined,
+          controlCodes,
+          format,
+        );
+        yield {
+          offsetInBuffer: runStart,
+          decoded: withCodes.text,
+          byteLength: pos - runStart,
+          terminated,
+          display: withCodes,
+        };
+      } else {
+        yield {
+          offsetInBuffer: runStart,
+          decoded: parts.join(""),
+          byteLength: pos - runStart,
+          terminated,
+        };
+      }
+    }
+    if (characters < minLength && usedControlCodes) {
+      pos = runStart + 2;
+      continue;
+    }
     // A word with another attribute starts the next run; any other stop word
     // (not text, not a control word) cannot start one.
     if (!terminated && !groupChanged && pos + 1 < bytes.length) pos += 2;
@@ -1016,7 +1130,7 @@ function* scanByteStrings(
   startOffset: number | undefined,
   fullwidthOnly: boolean,
 ): Generator<RawScannedString, void, undefined> {
-  const { bytes, minLength, terminatorByte, customTable } = input;
+  const { bytes, minLength, terminatorByte, customTable, controlCodes } = input;
   const canonical = normalizeRomTextEncoding(input.encoding);
   const sjisDecoder =
     canonical === "sjis" || canonical === "cp932"
@@ -1074,6 +1188,22 @@ function* scanByteStrings(
       const chars: string[] = [];
       let terminated = false;
       while (pos < bytes.length) {
+        if (chars.length > 0 && controlCodes !== undefined) {
+          const ctrl = matchRomControlCodeAt(bytes, pos, controlCodes);
+          if (ctrl !== undefined) {
+            const totalBytes = ctrl.bytes.length + ctrl.argumentBytes;
+            if (pos + totalBytes > bytes.length) break;
+            pos += totalBytes;
+            if (ctrl.role === "end") {
+              terminated = true;
+              break;
+            }
+            if (ctrl.role === "line-break" || ctrl.role === "page-break") {
+              chars.push("\n");
+            }
+            continue;
+          }
+        }
         let matchedText: string | undefined;
         let matchedLen = 0;
         let hitEnd = false;
@@ -1108,12 +1238,29 @@ function* scanByteStrings(
         }
       }
       if (chars.length >= minLength) {
-        yield {
-          offsetInBuffer: cursor,
-          decoded: chars.join(""),
-          byteLength: pos - cursor,
-          terminated,
-        };
+        if (controlCodes !== undefined) {
+          const withCodes = decodeRomStringWithControlCodes(
+            bytes.subarray(cursor, pos),
+            canonical,
+            terminatorByte,
+            customTable,
+            controlCodes,
+          );
+          yield {
+            offsetInBuffer: cursor,
+            decoded: withCodes.text,
+            byteLength: pos - cursor,
+            terminated,
+            display: withCodes,
+          };
+        } else {
+          yield {
+            offsetInBuffer: cursor,
+            decoded: chars.join(""),
+            byteLength: pos - cursor,
+            terminated,
+          };
+        }
         cursor = pos;
         continue;
       }
@@ -1122,15 +1269,26 @@ function* scanByteStrings(
     }
 
     if (sjisDecoder !== undefined) {
-      // One-pass byte-class scan: classify units without decoding, decode the
-      // accepted run once, and jump past rejected runs. Any suffix of a run
-      // rejected for length or the multibyte gate is shorter / no more
-      // multibyte, so re-scanning it (cursor++) could only repeat rejection.
       let pos = cursor;
       let charCount = 0;
       let multibyteCount = 0;
       let terminated = false;
+      let usedControlCodes = false;
       while (pos < bytes.length) {
+        if (charCount > 0 && controlCodes !== undefined) {
+          const ctrl = matchRomControlCodeAt(bytes, pos, controlCodes);
+          if (ctrl !== undefined) {
+            const totalBytes = ctrl.bytes.length + ctrl.argumentBytes;
+            if (pos + totalBytes > bytes.length) break;
+            pos += totalBytes;
+            usedControlCodes = true;
+            if (ctrl.role === "end") {
+              terminated = true;
+              break;
+            }
+            continue;
+          }
+        }
         const b0 = bytes[pos] ?? 0;
         if (terminatorByte !== null && b0 === terminatorByte) {
           pos++;
@@ -1139,11 +1297,36 @@ function* scanByteStrings(
         }
         const unitLength = unitLengthAt(pos);
         if (unitLength === 0) break;
+        if (controlCodes !== undefined) {
+          try {
+            sjisDecoder.decode(bytes.subarray(pos, pos + unitLength));
+          } catch {
+            break;
+          }
+        }
         if (isMultibyteUnit(pos, unitLength)) multibyteCount++;
         charCount++;
         pos += unitLength;
       }
       if (charCount >= minLength && multibyteCount > 0) {
+        if (controlCodes !== undefined) {
+          const withCodes = decodeRomStringWithControlCodes(
+            bytes.subarray(cursor, pos),
+            canonical,
+            terminatorByte,
+            customTable,
+            controlCodes,
+          );
+          yield {
+            offsetInBuffer: cursor,
+            decoded: withCodes.text,
+            byteLength: pos - cursor,
+            terminated,
+            display: withCodes,
+          };
+          cursor = Math.max(pos, cursor + 1);
+          continue;
+        }
         const contentEnd = terminated ? pos - 1 : pos;
         let decoded: string | undefined;
         let acceptedEnd = pos;
@@ -1151,9 +1334,6 @@ function* scanByteStrings(
         try {
           decoded = sjisDecoder.decode(bytes.subarray(cursor, contentEnd));
         } catch {
-          // A class-valid but unmapped pair rejects the one-shot decode;
-          // fall back to per-unit decoding of this run only and keep the
-          // decodable prefix, matching the previous truncation behavior.
           const parts: string[] = [];
           let prefixChars = 0;
           let prefixMultibyte = 0;
@@ -1189,14 +1369,30 @@ function* scanByteStrings(
           continue;
         }
       }
-      cursor = Math.max(pos, cursor + 1);
+      cursor = usedControlCodes ? cursor + 1 : Math.max(pos, cursor + 1);
       continue;
     }
 
     // ASCII / UTF-8 printable run
     let pos = cursor;
+    let charLen = 0;
     let terminated = false;
+    let usedControlCodes = false;
     while (pos < bytes.length) {
+      if (charLen > 0 && controlCodes !== undefined) {
+        const ctrl = matchRomControlCodeAt(bytes, pos, controlCodes);
+        if (ctrl !== undefined) {
+          const totalBytes = ctrl.bytes.length + ctrl.argumentBytes;
+          if (pos + totalBytes > bytes.length) break;
+          pos += totalBytes;
+          usedControlCodes = true;
+          if (ctrl.role === "end") {
+            terminated = true;
+            break;
+          }
+          continue;
+        }
+      }
       const b = bytes[pos] ?? 0;
       if (terminatorByte !== null && b === terminatorByte) {
         pos++;
@@ -1204,26 +1400,43 @@ function* scanByteStrings(
         break;
       }
       if (b >= 0x20 && b <= 0x7e) {
+        charLen++;
         pos++;
         continue;
       }
       break;
     }
-    const charLen = terminated ? pos - 1 - cursor : pos - cursor;
     if (charLen >= minLength) {
       const slice = bytes.subarray(cursor, pos);
-      yield {
-        offsetInBuffer: cursor,
-        decoded: decodeRomStringFromBytes(slice, canonical, terminatorByte)
-          .decoded,
-        byteLength: slice.length,
-        terminated,
-      };
+      if (controlCodes !== undefined) {
+        const withCodes = decodeRomStringWithControlCodes(
+          slice,
+          canonical,
+          terminatorByte,
+          customTable,
+          controlCodes,
+        );
+        yield {
+          offsetInBuffer: cursor,
+          decoded: withCodes.text,
+          byteLength: slice.length,
+          terminated,
+          display: withCodes,
+        };
+      } else {
+        yield {
+          offsetInBuffer: cursor,
+          decoded: decodeRomStringFromBytes(slice, canonical, terminatorByte)
+            .decoded,
+          byteLength: slice.length,
+          terminated,
+        };
+      }
       cursor = pos;
       continue;
     }
     // A rejected printable run's suffixes are shorter, so jump past it.
-    cursor = Math.max(pos, cursor + 1);
+    cursor = usedControlCodes ? cursor + 1 : Math.max(pos, cursor + 1);
   }
 }
 
@@ -1460,6 +1673,7 @@ export const searchRomStringsInputSchema = z.strictObject({
     .describe(
       "Opaque continuation token from a previous identical call's next_cursor; resumes after the last returned match.",
     ),
+  ...romControlCodeFields,
 });
 
 export type SearchRomStringsInput = z.output<
@@ -1531,6 +1745,20 @@ export const romStringMatchSchema = z.strictObject({
   text: z.string(),
   text_truncated: z.boolean().optional(),
   text_score: z.number().min(0).max(1).optional(),
+  lines: z.array(z.string()).optional(),
+  character_length: z.number().int().min(0).optional(),
+  longest_line_characters: z.number().int().min(0).optional(),
+  control_codes: z
+    .array(
+      z.strictObject({
+        name: z.string(),
+        offset: z.number().int().min(0),
+        byte_length: z.number().int().min(0),
+        arguments_hex: z.string(),
+        arguments_truncated: z.boolean().optional(),
+      }),
+    )
+    .optional(),
   bytes_hex: z.string().optional(),
   byte_length: z.number().int().min(0),
   terminated: z.boolean(),
@@ -1598,7 +1826,7 @@ export const scanPointerTableInputSchema = z.strictObject({
     .number()
     .int()
     .min(1)
-    .max(512)
+    .max(16_384)
     .default(32)
     .describe("Number of pointer table entries to read."),
   start_index: z
@@ -1695,6 +1923,12 @@ export const scanPointerTableInputSchema = z.strictObject({
     .describe(
       "Emit manuscript records and suppress pointer entries (entries is empty, entries_scanned still reports the scanned count). Implies include_manuscript.",
     ),
+  include_orphan_strings: z
+    .boolean()
+    .optional()
+    .describe(
+      "Scan gaps between sorted pointer targets for valid unreferenced strings (e.g. follow-up dialogue pages or inline choice text advancing past a terminator without a dedicated pointer slot).",
+    ),
   ...romControlCodeFields,
 });
 
@@ -1763,6 +1997,8 @@ export const scanPointerTableResultSchema = z.strictObject({
   start_index: z.number().int().min(0).optional(),
   next_start_index: z.number().int().min(0).optional(),
   manuscript_records: z.array(manuscriptRecordSchema).optional(),
+  /** Unreferenced strings discovered in gaps between sorted pointer targets when include_orphan_strings is true. */
+  orphan_strings: z.array(orphanStringEntrySchema).optional(),
   /** Whether the scanned entries cover their string region (local bytes with a terminator). */
   coverage: pointerTableCoverageSchema.nullable().optional(),
   source: romByteSourceSchema.optional(),
@@ -1857,7 +2093,13 @@ export const discoverPointerTablesInputSchema = z.strictObject({
     .string()
     .default("0x0")
     .describe(
-      "Base address added to each raw pointer value (e.g. 0x08000000 for 16-bit relative offsets).",
+      "Base address added to each raw pointer value (e.g. 0x08000000 for 16-bit relative offsets), or the RAM load base address of an overlay.",
+    ),
+  infer_base_address: z
+    .boolean()
+    .optional()
+    .describe(
+      "Automatically infer candidate RAM load base addresses for headerless overlays/binaries by matching pointer table deltas to string start offsets. When base_address is 0x0, uses the best inferred base address.",
     ),
   stride: z
     .number()
@@ -1995,6 +2237,8 @@ export const discoverPointerTablesResultSchema = z.strictObject({
   pointer_size: z.union([z.literal(2), z.literal(3), z.literal(4)]),
   endian: z.enum(["little", "big"]),
   base_address: z.string(),
+  inferred_base_address: z.string().nullable().optional(),
+  inferred_base_candidates: z.array(inferredBaseCandidateSchema).optional(),
   stride: z.number().int().min(1),
   bytes_scanned: z.number().int().min(0),
   base_mode: z.enum(POINTER_BASE_MODES).optional(),

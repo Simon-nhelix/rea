@@ -152,7 +152,7 @@ export const parseRomControlCodes = (
   return ok({ codes, byFirstByte, maxByteLength });
 };
 
-const matchAt = (
+export const matchRomControlCodeAt = (
   bytes: Uint8Array,
   at: number,
   table: RomControlCodeTable,
@@ -204,6 +204,7 @@ export interface RomTextSegments {
 export const segmentRomTextByControlCodes = (
   bytes: Uint8Array,
   table: RomControlCodeTable,
+  stepBytes = 1,
 ): RomTextSegments => {
   const segments: RomTextSegment[] = [];
   let textStart = 0;
@@ -217,9 +218,9 @@ export const segmentRomTextByControlCodes = (
       });
   };
   while (pos < bytes.length) {
-    const code = matchAt(bytes, pos, table);
+    const code = matchRomControlCodeAt(bytes, pos, table);
     if (code === undefined) {
-      pos += 1;
+      pos += stepBytes;
       continue;
     }
     flushText(pos);
@@ -283,10 +284,12 @@ export const decodeRomTextWithControlCodes = (
   bytes: Uint8Array,
   table: RomControlCodeTable,
   decodeText: (run: Uint8Array) => string,
+  stepBytes = 1,
 ): RomTextWithControlCodes => {
   const { segments, byteLength, stop } = segmentRomTextByControlCodes(
     bytes,
     table,
+    stepBytes,
   );
   const parts: string[] = [];
   const uses: RomControlCodeUse[] = [];
@@ -377,5 +380,51 @@ export const withTerminatorAsEndCode = (
     codes: [...table.codes, terminator],
     byFirstByte,
     maxByteLength: Math.max(table.maxByteLength, 1),
+  };
+};
+
+/**
+ * Treat a 16-bit terminator_word as an unreported end code when scanning
+ * 16-bit word encodings (sjis-le16, tile-le16, tile-be16).
+ */
+export const withWordTerminatorAsEndCode = (
+  table: RomControlCodeTable,
+  terminatorWord: number | null,
+  littleEndian: boolean,
+  name = "terminator",
+): RomControlCodeTable => {
+  if (terminatorWord === null) return table;
+  const b0 = littleEndian
+    ? terminatorWord & 0xff
+    : (terminatorWord >>> 8) & 0xff;
+  const b1 = littleEndian
+    ? (terminatorWord >>> 8) & 0xff
+    : terminatorWord & 0xff;
+  const existing = table.byFirstByte.get(b0);
+  if (
+    existing?.some(
+      (code) =>
+        code.bytes.length === 2 && code.bytes[0] === b0 && code.bytes[1] === b1,
+    ) === true
+  )
+    return table;
+  const terminator: RomControlCode = {
+    bytes: Uint8Array.of(b0, b1),
+    name,
+    argumentBytes: 0,
+    role: "end",
+    reported: false,
+  };
+  const byFirstByte = new Map<number, ReadonlyArray<RomControlCode>>(
+    table.byFirstByte,
+  );
+  const bucket = [...(existing ?? []), terminator].sort(
+    (a, b) => b.bytes.length - a.bytes.length,
+  );
+  byFirstByte.set(b0, bucket);
+  return {
+    codes: [...table.codes, terminator],
+    byFirstByte,
+    maxByteLength: Math.max(table.maxByteLength, 2),
   };
 };

@@ -241,4 +241,46 @@ describe("local byte source exports and inspection", () => {
     const blob = await inspectDiscImage(join(root, "blob.dat"));
     expect(blob.ok).toBe(false);
   });
+
+  it("exports scan_pointer_table manuscript records as JSON Lines", async () => {
+    const ptrBin = new Uint8Array(0x30);
+    ptrBin.set([0x10, 0x00, 0x20, 0x00], 0x00);
+    ptrBin.set([...DOU], 0x10);
+    ptrBin.set([...KANA], 0x20);
+    const ptrPath = join(root, "ptr.bin");
+    const outPath = join(root, "ptr-manuscript.jsonl");
+    await writeFile(ptrPath, ptrBin);
+
+    const exported = await runLocalRomTool({
+      path: ptrPath,
+      tool: "scan_pointer_table",
+      arguments: {
+        table_offset: 0,
+        count: 2,
+        pointer_size: 2,
+        endian: "little",
+        encoding: "sjis-swap16",
+        terminator_word: 0xffff,
+        newline_word: 0xfffe,
+        manuscript_only: true,
+      },
+      signal,
+      localBytes: true,
+      exportTo: { path: outPath, overwrite: true },
+    });
+    expect(exported?.ok).toBe(true);
+    if (exported === undefined || !exported.ok) return;
+    expect(exported.value.result).toMatchObject({
+      entries_scanned: 2,
+      output: { path: outPath, format: "jsonl", records: 2 },
+    });
+    const rows = (await readFile(outPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { id: string; jp: string });
+    expect(rows.map((r) => [r.id, r.jp])).toEqual([
+      ["ptr_0000", "どう"],
+      ["ptr_0001", "かな\nよ"],
+    ]);
+  });
 });

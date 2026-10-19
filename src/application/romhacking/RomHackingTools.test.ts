@@ -683,3 +683,170 @@ describe("RomHackingTools provider search cursor", () => {
     expect(seenCursors).toEqual([undefined, "bind:0x8002000"]);
   });
 });
+
+describe("RomHackingTools P1 overlay base inference", () => {
+  it("infers headerless overlay RAM base address in discover_pointer_tables", async () => {
+    const overlay = Buffer.alloc(0x100, 0);
+    const loadBase = 0x06048000;
+    overlay.writeUInt32BE(loadBase + 0x40, 0);
+    overlay.writeUInt32BE(loadBase + 0x46, 4);
+    overlay.writeUInt32BE(loadBase + 0x4c, 8);
+    overlay.writeUInt32BE(loadBase + 0x52, 12);
+    Buffer.from([0x97, 0x45, 0x8e, 0xd2, 0x00]).copy(overlay, 0x40); // 勇者
+    Buffer.from([0x96, 0x82, 0x96, 0x40, 0x00]).copy(overlay, 0x46); // 魔法
+    Buffer.from([0x90, 0xed, 0x8e, 0x6d, 0x00]).copy(overlay, 0x4c); // 戦士
+    Buffer.from([0x97, 0x45, 0x8e, 0xd2, 0x00]).copy(overlay, 0x52); // 勇者
+
+    const dir = await mkdtemp(join(tmpdir(), "rea-overlay-"));
+    try {
+      const overlayPath = join(dir, "overlay.bin");
+      await writeFile(overlayPath, overlay);
+      const target: BinaryTarget = {
+        path: overlayPath,
+        sha256: "b".repeat(64),
+        kind: "executable",
+        format: "raw-binary",
+        architecture: "m68k",
+        availableArchitectures: ["m68k"],
+        entryPoint: "0x0",
+        entryPointSource: "0x0",
+        loadAddress: "0x0",
+        loadAddressSource: "0x0",
+      };
+      const discovered = await executeDiscoverPointerTables(
+        countingAnalysis,
+        {
+          start_offset: 0,
+          length: overlay.length,
+          pointer_size: 4,
+          endian: "big",
+          base_address: "0x0",
+          infer_base_address: true,
+          min_entries: 4,
+          encoding: "sjis",
+          terminator_byte: 0x00,
+          min_string_length: 2,
+          max_tables: 10,
+          sample_entries: 3,
+          resolve_xrefs: false,
+          target_after_terminator: false,
+        },
+        undefined,
+        target,
+      );
+      expect(discovered.ok).toBe(true);
+      if (!discovered.ok) return;
+      const data = discovered.value as {
+        inferred_base_address: string | null;
+        inferred_base_candidates: Array<{ base_address: string }>;
+        total_tables: number;
+        tables: Array<{ entry_count: number }>;
+      };
+      expect(data.inferred_base_address).toBe("0x6048000");
+      expect(data.inferred_base_candidates[0]?.base_address).toBe("0x6048000");
+      expect(data.total_tables).toBe(1);
+      expect(data.tables[0]?.entry_count).toBe(4);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("RomHackingTools P1 orphan strings and search control codes", () => {
+  it("detects orphan strings in pointer gaps and decodes control codes in search_rom_strings", async () => {
+    const rom = Buffer.alloc(0x100, 0);
+    rom.writeUInt16LE(0x20, 0);
+    rom.writeUInt16LE(0x40, 2);
+    // 0x20: "勇者\0" (5 bytes), followed at 0x25 by orphan "戦士\0" (5 bytes), then 0x00 padding until 0x40
+    Buffer.from([0x97, 0x45, 0x8e, 0xd2, 0x00]).copy(rom, 0x20);
+    Buffer.from([0x90, 0xed, 0x8e, 0x6d, 0x00]).copy(rom, 0x25);
+    // 0x40: "魔{COLOR 00}法\0" where 0x1B 0x00 has an operand equal to terminator 0x00
+    Buffer.from([0x96, 0x82, 0x1b, 0x00, 0x96, 0x40, 0x00]).copy(rom, 0x40);
+
+    const dir = await mkdtemp(join(tmpdir(), "rea-orphan-"));
+    try {
+      const romPath = join(dir, "orphan.bin");
+      await writeFile(romPath, rom);
+      const target: BinaryTarget = {
+        path: romPath,
+        sha256: "c".repeat(64),
+        kind: "executable",
+        format: "raw-binary",
+        architecture: "arm",
+        availableArchitectures: ["arm"],
+        entryPoint: "0x0",
+        entryPointSource: "0x0",
+        loadAddress: "0x0",
+        loadAddressSource: "0x0",
+      };
+      const scanRes = await executeScanPointerTable(
+        countingAnalysis,
+        {
+          table_offset: 0,
+          count: 2,
+          start_index: 0,
+          pointer_size: 2,
+          endian: "little",
+          base_address: "0x0",
+          encoding: "sjis",
+          terminator_byte: 0x00,
+          preview_bytes: 32,
+          resolve_xrefs: false,
+          include_manuscript: false,
+          include_hex: false,
+          manuscript_only: false,
+          include_orphan_strings: true,
+        },
+        undefined,
+        target,
+      );
+      expect(scanRes.ok).toBe(true);
+      if (!scanRes.ok) return;
+      const scanData = scanRes.value as {
+        orphan_strings?: Array<{
+          after_entry_index: number;
+          file_offset: number;
+          text: string;
+          allocated_budget_bytes: number;
+        }>;
+      };
+      expect(scanData.orphan_strings).toHaveLength(1);
+      expect(scanData.orphan_strings?.[0]).toMatchObject({
+        after_entry_index: 0,
+        file_offset: 0x25,
+        text: "戦士",
+        allocated_budget_bytes: 0x40 - 0x25,
+      });
+
+      const searchRes = await executeSearchRomStrings(
+        countingAnalysis,
+        searchInput({
+          start_offset: 0x40,
+          length: 0x20,
+          encoding: "sjis",
+          min_length: 2,
+          terminator_byte: 0x00,
+          control_codes: [
+            { hex: "1B", name: "COLOR", argument_bytes: 1, role: "plain" },
+          ],
+        }),
+        undefined,
+        target,
+      );
+      expect(searchRes.ok).toBe(true);
+      if (!searchRes.ok) return;
+      const searchData = searchRes.value as {
+        matches: Array<{
+          text: string;
+          byte_length: number;
+          character_length?: number;
+        }>;
+      };
+      expect(searchData.matches[0]?.text).toBe("魔{COLOR}法");
+      expect(searchData.matches[0]?.byte_length).toBe(7);
+      expect(searchData.matches[0]?.character_length).toBe(2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
