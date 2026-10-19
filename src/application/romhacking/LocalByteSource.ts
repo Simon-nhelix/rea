@@ -6,12 +6,23 @@ import { AnalysisInputError } from "../../domain/analysisErrorCore.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
   CD_USER_DATA_BYTES,
+  detectRawSectorLayout,
   extractDataTrackUserData,
   parseCueSheet,
+  parseGdiSheet,
+  parseIso9660FileSystem,
   parsePceCdIpl,
+  parsePlayStationSystemCnf,
+  parseSegaIpBin,
+  resolveDiscLocations,
   resolveFirstDataTrack,
+  resolveGdiDataTrack,
   type DataTrackLayout,
+  type DiscResolvedLocation,
+  type Iso9660FileSystem,
   type PceCdIpl,
+  type PlayStationSystemCnf,
+  type SegaIpBin,
 } from "../../domain/discImage.js";
 import type { EvidenceSubjectTarget } from "../../domain/evidence.js";
 import { err, ok, type Result } from "../../domain/result.js";
@@ -207,8 +218,76 @@ export const readCueDataTrack = async (
   });
 };
 
+/** Read a Dreamcast .gdi sheet and project its primary data track onto 2048-byte user data. */
+export const readGdiDataTrack = async (
+  operation: string,
+  gdiPath: string,
+): Promise<Result<DiscImageRead, AnalysisError>> => {
+  let gdiBytes: Buffer;
+  try {
+    if ((await stat(gdiPath)).size > MAX_CUE_SHEET_BYTES)
+      return err(
+        inputError(operation, `GDI sheet ${gdiPath} is larger than 1 MiB`),
+      );
+    gdiBytes = await readFile(gdiPath);
+  } catch (cause) {
+    return err(inputError(operation, `Failed to read ${gdiPath}`, cause));
+  }
+  const sheet = parseGdiSheet(gdiBytes.toString("utf8"));
+  if (!sheet.ok)
+    return err(inputError(operation, `${gdiPath}: ${sheet.error}`));
+  const gdiDirectory = dirname(gdiPath);
+  const filePath = (name: string): string =>
+    isAbsolute(name) ? name : resolve(gdiDirectory, name);
+  const sizes = new Map<string, number>();
+  for (const track of sheet.value.tracks) {
+    if (track.trackType !== 4) continue;
+    try {
+      sizes.set(track.fileName, (await stat(filePath(track.fileName))).size);
+    } catch (cause) {
+      return err(
+        inputError(
+          operation,
+          `GDI track file "${track.fileName}" was not found next to ${basename(gdiPath)}`,
+          cause,
+        ),
+      );
+    }
+  }
+  const layout = resolveGdiDataTrack(sheet.value, sizes);
+  if (!layout.ok)
+    return err(inputError(operation, `${gdiPath}: ${layout.error}`));
+  const imagePath = filePath(layout.value.fileName);
+  const image = await readWholeFile(operation, imagePath);
+  if (!image.ok) return image;
+  const userData = extractDataTrackUserData(image.value, layout.value);
+  return ok({
+    cuePath: gdiPath,
+    cueSha256: sha256(gdiBytes),
+    imagePath,
+    imageSha256: sha256(image.value),
+    layout: layout.value,
+    userData: userData.bytes,
+    mismatchedSectors: userData.mismatchedSectors,
+    firstMismatchedSector: userData.firstMismatchedSector,
+    tracks: sheet.value.tracks.map((entry) => ({
+      track: entry.number,
+      mode:
+        entry.trackType === 4
+          ? entry.sectorSize === 2352
+            ? "MODE1/2352"
+            : "MODE1/2048"
+          : "AUDIO",
+      file: entry.fileName,
+    })),
+  });
+};
+
 const isCuePath = (path: string): boolean =>
   extname(path).toLowerCase() === ".cue";
+
+const isGdiPath = (path: string): boolean =>
+  extname(path).toLowerCase() === ".gdi";
 
 /** Whether a plain file is laid out in 2048-byte user-data sectors (.iso). */
 const hasIsoSectors = (path: string, length: number): boolean =>
@@ -216,9 +295,45 @@ const hasIsoSectors = (path: string, length: number): boolean =>
   length > 0 &&
   length % CD_USER_DATA_BYTES === 0;
 
+const discSourceFromRead = (
+  canonical: string,
+  reason: RomByteSourceDescription["reason"],
+  disc: DiscImageRead,
+): LocalByteSource => {
+  const { layout } = disc;
+  return {
+    kind: "local-bytes",
+    path: canonical,
+    sha256: disc.cueSha256,
+    bytes: disc.userData,
+    description: {
+      mode: "disc-image",
+      reason,
+      byte_length: disc.userData.length,
+      sector_size: CD_USER_DATA_BYTES,
+      disc: {
+        track: layout.track,
+        track_mode: layout.mode,
+        image_path: disc.imagePath,
+        image_sha256: disc.imageSha256,
+        first_lba: layout.firstLba,
+        sectors: layout.sectorCount,
+        raw_sector_bytes: layout.rawSectorBytes,
+        user_data_offset: layout.userDataOffset,
+        first_sector_in_image: layout.firstSectorInFile,
+        header_mismatched_sectors: disc.mismatchedSectors,
+        first_mismatched_sector: disc.firstMismatchedSector,
+        other_data_tracks: [...layout.otherDataTracks],
+      },
+    },
+    cueTracks: disc.tracks,
+  };
+};
+
 /**
- * Open a local file for ROM text tools without format admission. `.cue` files
- * become their first data track's user data; other files are read as-is.
+ * Open a local file for ROM text tools without format admission. `.cue`, `.gdi`,
+ * and raw 2352-byte `.bin` tracks become their first data track's user data;
+ * other files are read as-is.
  */
 export const openLocalByteSource = async (
   operation: string,
@@ -231,37 +346,42 @@ export const openLocalByteSource = async (
   if (isCuePath(canonical)) {
     const disc = await readCueDataTrack(operation, canonical);
     if (!disc.ok) return disc;
-    const { layout } = disc.value;
-    return ok({
-      kind: "local-bytes",
-      path: canonical,
-      sha256: disc.value.cueSha256,
-      bytes: disc.value.userData,
-      description: {
-        mode: "disc-image",
-        reason,
-        byte_length: disc.value.userData.length,
-        sector_size: CD_USER_DATA_BYTES,
-        disc: {
-          track: layout.track,
-          track_mode: layout.mode,
-          image_path: disc.value.imagePath,
-          image_sha256: disc.value.imageSha256,
-          first_lba: layout.firstLba,
-          sectors: layout.sectorCount,
-          raw_sector_bytes: layout.rawSectorBytes,
-          user_data_offset: layout.userDataOffset,
-          first_sector_in_image: layout.firstSectorInFile,
-          header_mismatched_sectors: disc.value.mismatchedSectors,
-          first_mismatched_sector: disc.value.firstMismatchedSector,
-          other_data_tracks: [...layout.otherDataTracks],
-        },
-      },
-      cueTracks: disc.value.tracks,
-    });
+    return ok(discSourceFromRead(canonical, reason, disc.value));
+  }
+  if (isGdiPath(canonical)) {
+    const disc = await readGdiDataTrack(operation, canonical);
+    if (!disc.ok) return disc;
+    return ok(discSourceFromRead(canonical, reason, disc.value));
   }
   const bytes = await readWholeFile(operation, canonical);
   if (!bytes.ok) return bytes;
+  const rawLayout =
+    extname(canonical).toLowerCase() === ".bin"
+      ? detectRawSectorLayout(basename(canonical), bytes.value)
+      : undefined;
+  if (rawLayout !== undefined) {
+    const imageSha = sha256(bytes.value);
+    const userData = extractDataTrackUserData(bytes.value, rawLayout);
+    return ok(
+      discSourceFromRead(canonical, reason, {
+        cuePath: canonical,
+        cueSha256: imageSha,
+        imagePath: canonical,
+        imageSha256: imageSha,
+        layout: rawLayout,
+        userData: userData.bytes,
+        mismatchedSectors: userData.mismatchedSectors,
+        firstMismatchedSector: userData.firstMismatchedSector,
+        tracks: [
+          {
+            track: rawLayout.track,
+            mode: rawLayout.mode,
+            file: basename(canonical),
+          },
+        ],
+      }),
+    );
+  }
   return ok({
     kind: "local-bytes",
     path: canonical,
@@ -278,18 +398,30 @@ export const openLocalByteSource = async (
   });
 };
 
-/** Disc-image facts for `inspect-disc-image`: layout plus a PC Engine CD IPL. */
+export interface InspectDiscImageOptions {
+  readonly resolveLbas?: readonly number[];
+  readonly resolveOffsets?: readonly number[];
+}
+
+export type InspectDiscImageResult = {
+  readonly source: RomByteSourceDescription;
+  readonly tracks?: CueTrackSummary[];
+  readonly pce_cd_ipl: PceCdIpl | null;
+  readonly sega_ip_bin: SegaIpBin | null;
+  readonly system_cnf: PlayStationSystemCnf | null;
+  readonly iso9660: Iso9660FileSystem | null;
+  readonly resolved_locations?: DiscResolvedLocation[];
+};
+
+/** Disc-image facts for `inspect-disc-image`: layout, boot headers, ISO9660 tree, and free gaps. */
 export const inspectDiscImage = async (
   path: string,
+  options?: InspectDiscImageOptions,
 ): Promise<
   Result<
     {
       readonly subject: EvidenceSubjectTarget;
-      readonly result: {
-        readonly source: RomByteSourceDescription;
-        readonly tracks?: CueTrackSummary[];
-        readonly pce_cd_ipl: PceCdIpl | null;
-      };
+      readonly result: InspectDiscImageResult;
     },
     AnalysisError
   >
@@ -302,15 +434,49 @@ export const inspectDiscImage = async (
     return err(
       inputError(
         operation,
-        "inspect-disc-image reads .cue sheets or .iso files made of 2048-byte sectors",
+        "inspect-disc-image reads .cue, .gdi, 2048-byte-sector .iso, or 2352-byte-sector .bin disc images",
       ),
     );
   // The PC Engine IPL record is sector 1 of the data track; sector 0 holds
-  // the copyright notice.
+  // the copyright notice or Sega IP.BIN.
   const ipl = parsePceCdIpl(
     bytes.subarray(CD_USER_DATA_BYTES, CD_USER_DATA_BYTES * 2),
     1,
   );
+  const segaIpBin = parseSegaIpBin(bytes.subarray(0, CD_USER_DATA_BYTES));
+  const firstLba = description.disc?.first_lba ?? 0;
+  const iso9660 = parseIso9660FileSystem(bytes, firstLba) ?? null;
+  const systemCnfEntry = iso9660?.files.find(
+    (f) => f.path.toUpperCase() === "/SYSTEM.CNF",
+  );
+  const systemCnf =
+    systemCnfEntry !== undefined &&
+    systemCnfEntry.user_data_offset + systemCnfEntry.size <= bytes.length
+      ? (parsePlayStationSystemCnf(
+          bytes
+            .subarray(
+              systemCnfEntry.user_data_offset,
+              systemCnfEntry.user_data_offset + systemCnfEntry.size,
+            )
+            .toString("latin1"),
+        ) ?? null)
+      : null;
+  const hasLocationQueries =
+    (options?.resolveLbas?.length ?? 0) > 0 ||
+    (options?.resolveOffsets?.length ?? 0) > 0;
+  const resolvedLocations = hasLocationQueries
+    ? resolveDiscLocations({
+        userDataLength: bytes.length,
+        firstLba,
+        iso9660,
+        ...(options?.resolveLbas === undefined
+          ? {}
+          : { lbas: options.resolveLbas }),
+        ...(options?.resolveOffsets === undefined
+          ? {}
+          : { offsets: options.resolveOffsets }),
+      })
+    : undefined;
   const tracks =
     source.value.cueTracks === undefined
       ? undefined
@@ -321,6 +487,12 @@ export const inspectDiscImage = async (
       source: description,
       ...(tracks === undefined ? {} : { tracks }),
       pce_cd_ipl: ipl ?? null,
+      sega_ip_bin: segaIpBin ?? null,
+      system_cnf: systemCnf,
+      iso9660,
+      ...(resolvedLocations === undefined
+        ? {}
+        : { resolved_locations: resolvedLocations }),
     },
   });
 };

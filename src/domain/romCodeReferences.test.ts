@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   parseAddress32,
+  scanCodeRegion,
   scanMipsRegion,
   type CodeReferenceKind,
 } from "./romCodeReferences.js";
@@ -331,7 +332,9 @@ describe("gp-relative references", () => {
       }),
     ).toEqual({ value: 0x0051ee00, address: 0x00100100, fileOffset: 0 });
   });
+});
 
+describe("R5900, indexed base, and call argument resolution", () => {
   it("pairs lui with R5900 daddiu, daddu move, and ld/sd/lq/sq accesses", () => {
     const daddiu = (rt: number, rs: number, imm: number) =>
       i(0x19, rs, rt, imm);
@@ -380,5 +383,181 @@ describe("gp-relative references", () => {
       targetAddress: 0x004b5430,
       sourceLuiAddress: 0x00100000,
     });
+  });
+
+  it("resolves call arguments (including delay-slot setup) and caller signatures", () => {
+    const bytes = bytesOf([
+      lui(R.a0, 0x800d),
+      addiu(R.a1, R.zero, 42),
+      jal(0x800cba44),
+      addiu(R.a0, R.a0, 0x1234), // delay slot completes $a0 = 0x800d1234
+    ]);
+    const hits = scanMipsRegion(
+      {
+        file: "f",
+        bytes,
+        fileOffset: 0,
+        length: bytes.length,
+        address: 0x80010000,
+        resolveCallArguments: true,
+        includeCallerSignatures: true,
+      },
+      one(0x800cba44),
+      ALL,
+    );
+    expect(hits).toHaveLength(1);
+    expect(hits[0]?.callArguments).toEqual({
+      a0: "0x800d1234",
+      a1: "0x0000002a",
+    });
+    expect(hits[0]?.callerSignature).toBeTypeOf("string");
+    expect(hits[0]?.callerSignature?.length).toBeGreaterThanOrEqual(16);
+  });
+});
+
+describe("multi-architecture scanCodeRegion", () => {
+  it("scans SuperH sh2-be mov.l @(disp,PC) literal pool loads, jsr @Rn, and bsr", () => {
+    // PC at 0x06004000:
+    // 0x06004000: D402 -> mov.l @(8, PC), r4  (pool at (0x06004000 & ~3) + 4 + 8 = 0x0600400C)
+    // 0x06004002: D003 -> mov.l @(12, PC), r0 (pool at (0x06004002 & ~3) + 4 + 12 = 0x06004010)
+    // 0x06004004: 400B -> jsr @r0
+    // 0x06004006: 0009 -> nop
+    // 0x06004008: B004 -> bsr 0x06004014 (PC + 4 + 4*2 = 0x06004014)
+    // 0x0600400A: 0009 -> nop
+    // 0x0600400C: 0x06050000 (string pointer)
+    // 0x06004010: 0x06012340 (callee function)
+    const buf = Buffer.alloc(0x18, 0);
+    buf.writeUInt16BE(0xd402, 0x00);
+    buf.writeUInt16BE(0xd003, 0x02);
+    buf.writeUInt16BE(0x400b, 0x04);
+    buf.writeUInt16BE(0x0009, 0x06);
+    buf.writeUInt16BE(0xb004, 0x08);
+    buf.writeUInt16BE(0x0009, 0x0a);
+    buf.writeUInt32BE(0x06050000, 0x0c);
+    buf.writeUInt32BE(0x06012340, 0x10);
+
+    const hits = scanCodeRegion(
+      "sh2-be",
+      {
+        file: "0.BIN",
+        bytes: new Uint8Array(buf),
+        fileOffset: 0,
+        length: buf.length,
+        address: 0x06004000,
+        resolveCallArguments: true,
+      },
+      [
+        { address: 0x06050000, length: 1 },
+        { address: 0x06012340, length: 1 },
+        { address: 0x06004014, length: 1 },
+      ],
+      ALL,
+    );
+    expect(
+      hits.map((h) => [h.kind, h.address, h.targetAddress]),
+    ).toContainEqual(["address_pair", 0x06004000, 0x06050000]);
+    const jsrHit = hits.find(
+      (h) => h.kind === "call" && h.address === 0x06004004,
+    );
+    expect(jsrHit?.targetAddress).toBe(0x06012340);
+    expect(jsrHit?.callArguments).toEqual({ r4: "0x06050000" });
+    expect(
+      hits.some((h) => h.kind === "call" && h.targetAddress === 0x06004014),
+    ).toBe(true);
+  });
+
+  it("scans 65816 jsl, jml, and 24-bit long loads", () => {
+    // 0x808000: 22 40 81 C0 -> jsl $c08140
+    // 0x808004: 5C 00 90 C0 -> jml $c09000
+    // 0x808008: AF 10 20 7E -> lda.l $7e2010
+    const bytes = new Uint8Array([
+      0x22, 0x40, 0x81, 0xc0, 0x5c, 0x00, 0x90, 0xc0, 0xaf, 0x10, 0x20, 0x7e,
+    ]);
+    const hits = scanCodeRegion(
+      "65816",
+      {
+        file: "rom.sfc",
+        bytes,
+        fileOffset: 0,
+        length: bytes.length,
+        address: 0x808000,
+      },
+      [
+        { address: 0xc08140, length: 1 },
+        { address: 0xc09000, length: 1 },
+        { address: 0x7e2010, length: 1 },
+      ],
+      ALL,
+    );
+    expect(hits.map((h) => [h.kind, h.instruction, h.targetAddress])).toEqual([
+      ["call", "jsl 0xc08140", 0xc08140],
+      ["jump", "jml 0xc09000", 0xc09000],
+      ["address_pair", "lda.l 0x7e2010", 0x7e2010],
+    ]);
+  });
+
+  it("scans HuC6280 block transfer (tii) and jsr", () => {
+    // 0x4000: 73 00 90 00 30 40 00 -> tii 0x9000, 0x3000, 0x0040
+    // 0x4007: 20 80 45 -> jsr 0x4580
+    const bytes = new Uint8Array([
+      0x73, 0x00, 0x90, 0x00, 0x30, 0x40, 0x00, 0x20, 0x80, 0x45,
+    ]);
+    const hits = scanCodeRegion(
+      "huc6280",
+      {
+        file: "pce.bin",
+        bytes,
+        fileOffset: 0,
+        length: bytes.length,
+        address: 0x4000,
+      },
+      [
+        { address: 0x9000, length: 1 },
+        { address: 0x4580, length: 1 },
+      ],
+      ALL,
+    );
+    expect(hits.map((h) => [h.kind, h.instruction, h.targetAddress])).toEqual([
+      ["address_pair", "tii 0x9000, 0x3000, 0x0040", 0x9000],
+      ["call", "jsr 0x4580", 0x4580],
+    ]);
+  });
+
+  it("scans Thumb-LE ldr Rd, [pc, #imm] literal pools and 32-bit bl calls", () => {
+    // 0x08000100: 4801 -> ldr r0, [pc, #0x4] -> pool at (0x08000100 + 4) & ~3 + 4 = 0x08000108
+    // 0x08000102: F000 F802 -> bl 0x0800010A
+    // 0x08000106: 0000 -> nop
+    // 0x08000108: 0x08054320 (literal pool entry)
+    const buf = Buffer.alloc(12, 0);
+    buf.writeUInt16LE(0x4801, 0);
+    buf.writeUInt16LE(0xf000, 2);
+    buf.writeUInt16LE(0xf802, 4);
+    buf.writeUInt16LE(0x0000, 6);
+    buf.writeUInt32LE(0x08054320, 8);
+    const hits = scanCodeRegion(
+      "thumb-le",
+      {
+        file: "rom.gba",
+        bytes: new Uint8Array(buf),
+        fileOffset: 0,
+        length: buf.length,
+        address: 0x08000100,
+        resolveCallArguments: true,
+      },
+      [
+        { address: 0x08054320, length: 1 },
+        { address: 0x0800010a, length: 1 },
+      ],
+      ALL,
+    );
+    expect(
+      hits.some(
+        (h) => h.kind === "address_pair" && h.targetAddress === 0x08054320,
+      ),
+    ).toBe(true);
+    const blHit = hits.find(
+      (h) => h.kind === "call" && h.targetAddress === 0x0800010a,
+    );
+    expect(blHit?.callArguments).toEqual({ r0: "0x08054320" });
   });
 });

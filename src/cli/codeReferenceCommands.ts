@@ -3,6 +3,7 @@ import type { Logger } from "pino";
 import { CodeReferenceService } from "../application/romhacking/CodeReferenceService.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { logCliCommand } from "../cliLogging.js";
+import { CODE_REFERENCE_ARCHITECTURES } from "../domain/romCodeReferences.js";
 import { absoluteCallerPath } from "../filesystem/callerPath.js";
 import { withCommandCancellation } from "./commandCancellation.js";
 import { finishAnalysisCommand } from "./finishAnalysisCommand.js";
@@ -41,17 +42,23 @@ export const registerCodeReferenceCommands = (
   const service = new CodeReferenceService();
   cli.command(CLI_COMMANDS.findCodeReferences, {
     description:
-      "Find jal/j, lui+addiu/load/store and pointer-word references to addresses across several MIPS code files with per-file load addresses",
+      "Find static call/jump, address-formation, PC-literal, block-transfer, and pointer-word references to addresses across code files (MIPS, SuperH, 65816, 6502/HuC6280, ARM/Thumb)",
     options: z.object({
       file: z
         .array(z.string())
         .describe(
-          "Repeat per code file: PATH (PS-X EXE header gives the load address) or PATH:0xLOADADDR for headerless overlays",
+          "Repeat per code file: PATH (PS-X EXE/ELF/header supplies load address) or PATH:0xLOADADDR for headerless overlays",
         ),
       target: z
         .array(z.string())
         .describe(
-          "Repeat per target: 0xADDRESS or 0xADDRESS+LENGTH for a range",
+          "Repeat per target: 0xADDRESS[:name] or 0xADDRESS+LENGTH[:name] for a range",
+        ),
+      architecture: z
+        .enum(CODE_REFERENCE_ARCHITECTURES)
+        .default("mips-le")
+        .describe(
+          "Instruction set to scan (mips-le, sh2-be, sh4-le, 65816, 6502, huc6280, arm-le, thumb-le)",
         ),
       gp: z
         .string()
@@ -63,6 +70,18 @@ export const registerCodeReferenceCommands = (
         .boolean()
         .default(true)
         .describe("Detect gp-relative references (--no-gp-relative to skip)"),
+      resolveCallArguments: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Resolve immediate/address argument registers at call sites (--resolve-call-arguments)",
+        ),
+      includeCallerSignatures: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Include caller_signature surrounding instruction hex at call/jump sites for rom-qa overlay disambiguation (--include-caller-signatures)",
+        ),
       kind: z
         .array(
           z.enum([
@@ -92,8 +111,11 @@ export const registerCodeReferenceCommands = (
                 {
                   files: options.file.map(parseFileSpec),
                   targets: options.target.map(parseTargetSpec),
+                  architecture: options.architecture,
                   ...(options.gp === undefined ? {} : { gp: options.gp }),
                   gp_relative: options.gpRelative,
+                  resolve_call_arguments: options.resolveCallArguments,
+                  include_caller_signatures: options.includeCallerSignatures,
                   ...(options.kind === undefined
                     ? {}
                     : { kinds: options.kind }),

@@ -931,20 +931,43 @@ export const registerRomHackingCommands = (
   });
 };
 
-/** `inspect-disc-image`: cue/iso data-track layout and PC Engine CD IPL record. */
+/** `inspect-disc-image`: cue/gdi/iso/bin data-track layout, boot headers, ISO9660 tree, and free gaps. */
 export const registerDiscImageCommand = (
   cli: CliInstance,
   logger: Logger,
 ): void => {
   cli.command(CLI_COMMANDS.inspectDiscImage, {
     description:
-      "Inspect a .cue sheet or 2048-byte-sector .iso: data-track layout, LBAs, and the PC Engine CD IPL boot record",
+      "Inspect a .cue, .gdi, 2048-byte-sector .iso, or 2352-byte-sector .bin disc image: data-track layout, boot headers (PC Engine IPL, Sega IP.BIN, PlayStation SYSTEM.CNF), ISO9660 directory tree, unallocated gaps, and LBA/offset-to-file resolution",
     args: z.object({
-      path: z.string().describe(".cue sheet or .iso path"),
+      path: z
+        .string()
+        .describe(".cue, .gdi, .iso, or raw 2352-byte-sector .bin path"),
     }),
-    run: ({ args }) =>
+    options: z.object({
+      resolveLba: z
+        .array(z.number().int().min(0))
+        .optional()
+        .describe(
+          "Resolve one or more LBAs to their containing ISO9660 file or disc region",
+        ),
+      resolveOffset: z
+        .array(z.number().int().min(0))
+        .optional()
+        .describe(
+          "Resolve one or more 2048-byte user-data offsets to their containing ISO9660 file or disc region",
+        ),
+    }),
+    run: ({ args, options }) =>
       logCliCommand(logger, CLI_COMMANDS.inspectDiscImage, async () => {
-        const inspected = await inspectDiscImage(args.path);
+        const inspected = await inspectDiscImage(args.path, {
+          ...(options.resolveLba === undefined
+            ? {}
+            : { resolveLbas: options.resolveLba }),
+          ...(options.resolveOffset === undefined
+            ? {}
+            : { resolveOffsets: options.resolveOffset }),
+        });
         if (!inspected.ok)
           return {
             error: "Analysis failed",
@@ -952,12 +975,20 @@ export const registerDiscImageCommand = (
           };
         return createEvidence(inspected.value.subject, REA_WORKFLOW_PROVIDER, {
           operation: "inspect_disc_image",
-          parameters: { path: args.path },
+          parameters: {
+            path: args.path,
+            ...(options.resolveLba === undefined
+              ? {}
+              : { resolve_lba: options.resolveLba }),
+            ...(options.resolveOffset === undefined
+              ? {}
+              : { resolve_offset: options.resolveOffset }),
+          },
           result: inspected.value.result,
           confidence: "observed",
           limitations: [
-            "Reads cue FILE/TRACK/INDEX placement and sector headers; EDC/ECC is not verified.",
-            "pce_cd_ipl is parsed only when sector 1 carries the PC Engine CD-ROM SYSTEM ID.",
+            "Reads cue/gdi FILE/TRACK/INDEX placement and sector headers; EDC/ECC is not verified.",
+            "pce_cd_ipl, sega_ip_bin, system_cnf, and iso9660 are populated only when their respective headers or descriptors are present.",
           ],
         });
       }),

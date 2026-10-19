@@ -426,6 +426,96 @@ const availableInstallation = (
   };
 };
 
+const STALE_HOMEBREW_CELLAR_GHIDRA = /\/Cellar\/ghidra\/[^/]+\/libexec$/u;
+
+const resolveInstallDir = async (
+  options: GhidraInstallationOptions,
+  platform: NodeJS.Platform,
+  host: GhidraInstallationHost,
+): Promise<{
+  readonly installDir: string | null;
+  readonly properties: string | undefined;
+  readonly applicationPropertiesPath: string | null;
+}> => {
+  const path = platform === "win32" ? win32 : posix;
+  const readProps = async (dir: string | null) => {
+    if (dir === null)
+      return { applicationPropertiesPath: null, properties: undefined };
+    const applicationPropertiesPath = path.join(
+      dir,
+      "Ghidra",
+      "application.properties",
+    );
+    const properties = await host.readText(applicationPropertiesPath, {
+      resourceOwner: options.resourceOwner,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
+    return { applicationPropertiesPath, properties };
+  };
+  // An explicit setting remains authoritative except when a Homebrew Cellar
+  // version path went stale after `brew upgrade ghidra` and a valid installation
+  // is discoverable.
+  const initialDir =
+    options.installDir ??
+    host.discoverInstallDirOnPath?.(options.environment, platform) ??
+    null;
+  const initial = await readProps(initialDir);
+  if (
+    initial.properties === undefined &&
+    options.installDir !== undefined &&
+    STALE_HOMEBREW_CELLAR_GHIDRA.test(options.installDir)
+  ) {
+    const fallbackDir =
+      host.discoverInstallDirOnPath?.(options.environment, platform) ?? null;
+    if (fallbackDir !== null && fallbackDir !== options.installDir) {
+      const fallback = await readProps(fallbackDir);
+      if (fallback.properties !== undefined)
+        return { installDir: fallbackDir, ...fallback };
+    }
+  }
+  return { installDir: initialDir, ...initial };
+};
+
+const resolveJavaCommand = (
+  options: GhidraInstallationOptions,
+  platform: NodeJS.Platform,
+  architecture: NodeJS.Architecture,
+  host: GhidraInstallationHost,
+): string => {
+  const path = platform === "win32" ? win32 : posix;
+  if (options.javaHome !== undefined)
+    return path.join(
+      options.javaHome,
+      "bin",
+      platform === "win32" ? "java.exe" : "java",
+    );
+  if (platform !== "darwin") return platform === "win32" ? "java.exe" : "java";
+  // Check the caller's PATH, never a file named java in the working directory
+  // or macOS's /usr/bin/java system stub before keg-only Homebrew OpenJDK.
+  const javaOnPath = options.environment.PATH?.split(":").some(
+    (directory) =>
+      path.isAbsolute(directory) &&
+      directory !== "/usr/bin" &&
+      host.executable(path.join(directory, "java")),
+  );
+  if (javaOnPath) return "java";
+  // Prefer the Homebrew prefix matching the process architecture.
+  const prefixes =
+    architecture === "arm64"
+      ? ["/opt/homebrew", "/usr/local"]
+      : ["/usr/local", "/opt/homebrew"];
+  return (
+    prefixes
+      .map((prefix) =>
+        path.join(
+          prefix,
+          "opt/openjdk/libexec/openjdk.jdk/Contents/Home/bin/java",
+        ),
+      )
+      .find((candidate) => host.executable(candidate)) ?? "java"
+  );
+};
+
 const installationCoordinates = async (
   options: GhidraInstallationOptions,
   platform: NodeJS.Platform,
@@ -433,16 +523,8 @@ const installationCoordinates = async (
   host: GhidraInstallationHost,
 ): Promise<GhidraInstallationCoordinates> => {
   const path = platform === "win32" ? win32 : posix;
-  // An explicit setting remains authoritative even when malformed or stale;
-  // automatic discovery is only a fallback when the caller supplied none.
-  const installDir =
-    options.installDir ??
-    host.discoverInstallDirOnPath?.(options.environment, platform) ??
-    null;
-  const applicationPropertiesPath =
-    installDir === null
-      ? null
-      : path.join(installDir, "Ghidra", "application.properties");
+  const { installDir, applicationPropertiesPath, properties } =
+    await resolveInstallDir(options, platform, host);
   const analyzeHeadlessPath =
     installDir === null
       ? null
@@ -478,13 +560,6 @@ const installationCoordinates = async (
             decompilerExecutable,
           ),
         ].find((candidate) => host.executable(candidate)) ?? null);
-  const properties =
-    applicationPropertiesPath === null
-      ? undefined
-      : await host.readText(applicationPropertiesPath, {
-          resourceOwner: options.resourceOwner,
-          ...(options.signal === undefined ? {} : { signal: options.signal }),
-        });
   const nativeDecompilerHeader =
     nativeDecompilerPath === null || host.executableHeader === undefined
       ? ok(undefined)
@@ -498,38 +573,7 @@ const installationCoordinates = async (
       nativeDecompilerHeader.error.cleanupIncomplete)
   )
     throw nativeDecompilerHeader.error;
-  const javaCommand = (() => {
-    if (options.javaHome !== undefined)
-      return path.join(
-        options.javaHome,
-        "bin",
-        platform === "win32" ? "java.exe" : "java",
-      );
-    if (platform !== "darwin")
-      return platform === "win32" ? "java.exe" : "java";
-    // Check the caller's PATH, never a file named java in the working directory.
-    const javaOnPath = options.environment.PATH?.split(":").some(
-      (directory) =>
-        path.isAbsolute(directory) &&
-        host.executable(path.join(directory, "java")),
-    );
-    if (javaOnPath) return "java";
-    // Prefer the Homebrew prefix matching the process architecture.
-    const prefixes =
-      architecture === "arm64"
-        ? ["/opt/homebrew", "/usr/local"]
-        : ["/usr/local", "/opt/homebrew"];
-    return (
-      prefixes
-        .map((prefix) =>
-          path.join(
-            prefix,
-            "opt/openjdk/libexec/openjdk.jdk/Contents/Home/bin/java",
-          ),
-        )
-        .find((candidate) => host.executable(candidate)) ?? "java"
-    );
-  })();
+  const javaCommand = resolveJavaCommand(options, platform, architecture, host);
   // Relative JAVA_HOME is refused by configuration validation without execution.
   const javaProbe =
     options.javaHome === undefined || path.isAbsolute(options.javaHome)
@@ -1000,6 +1044,25 @@ export const systemGhidraInstallationHost = (): GhidraInstallationHost => ({
   discoverInstallDirOnPath: discoverGhidraInstallationOnPath,
 });
 
+const isCompleteGhidraRoot = (
+  root: string,
+  path: typeof posix | typeof win32,
+  platform: NodeJS.Platform,
+): boolean => {
+  const properties = path.join(root, "Ghidra", "application.properties");
+  const headless = path.join(
+    root,
+    "support",
+    platform === "win32" ? "analyzeHeadless.bat" : "analyzeHeadless",
+  );
+  try {
+    return statSync(properties).isFile() && executablePath(headless);
+  } catch (cause: unknown) {
+    void cause;
+    return false;
+  }
+};
+
 /** Find a PATH launcher whose real target is inside a complete Ghidra tree. */
 export const discoverGhidraInstallationOnPath = (
   environment: Readonly<NodeJS.ProcessEnv>,
@@ -1009,11 +1072,27 @@ export const discoverGhidraInstallationOnPath = (
   const path = platform === "win32" ? win32 : posix;
   const pathValue = environment.PATH;
   if (pathValue === undefined || pathValue.length === 0) return undefined;
+  const directories = pathValue.split(pathDelimiter);
+  const home = environment.HOME;
+  if (
+    home !== undefined &&
+    path.isAbsolute(home) &&
+    directories.some((dir) => dir.startsWith(`${home}/`))
+  ) {
+    const userToolsCandidate = path.join(
+      home,
+      "Documents",
+      "tools",
+      `ghidra_${SUPPORTED_GHIDRA_VERSION}_PUBLIC`,
+    );
+    if (isCompleteGhidraRoot(userToolsCandidate, path, platform))
+      return userToolsCandidate;
+  }
   const launchers =
     platform === "win32"
       ? ["ghidra.bat", "ghidraRun.bat", "ghidra.exe", "ghidraRun.exe"]
       : ["ghidra", "ghidraRun"];
-  for (const directory of pathValue.split(pathDelimiter)) {
+  for (const directory of directories) {
     if (directory.length === 0) continue;
     for (const launcher of launchers) {
       let resolved: string;
@@ -1025,18 +1104,13 @@ export const discoverGhidraInstallationOnPath = (
         void cause;
         continue;
       }
-      const root = dirname(resolved);
-      const properties = path.join(root, "Ghidra", "application.properties");
-      const headless = path.join(
-        root,
-        "support",
-        platform === "win32" ? "analyzeHeadless.bat" : "analyzeHeadless",
-      );
-      try {
-        if (statSync(properties).isFile() && executablePath(headless))
-          return root;
-      } catch (cause: unknown) {
-        void cause;
+      const launcherDir = dirname(resolved);
+      const candidateRoots =
+        path.basename(launcherDir) === "bin"
+          ? [launcherDir, path.resolve(launcherDir, "..", "libexec")]
+          : [launcherDir];
+      for (const root of candidateRoots) {
+        if (isCompleteGhidraRoot(root, path, platform)) return root;
       }
     }
   }

@@ -150,6 +150,30 @@ it.skipIf(process.platform === "win32")(
         process.platform,
       ),
     ).toBeUndefined();
+
+    const cellarVersion = join(root, "Cellar", "ghidra", "12.1.3");
+    const cellarBin = join(cellarVersion, "bin");
+    const cellarLibexec = join(cellarVersion, "libexec");
+    const brewBin = join(root, "brew-bin");
+    await mkdir(cellarBin, { recursive: true });
+    await mkdir(join(cellarLibexec, "Ghidra"), { recursive: true });
+    await mkdir(join(cellarLibexec, "support"), { recursive: true });
+    await mkdir(brewBin, { recursive: true });
+    await writeFile(join(cellarBin, "ghidraRun"), "#!/bin/sh\nexit 0\n");
+    await chmod(join(cellarBin, "ghidraRun"), 0o700);
+    await writeFile(
+      join(cellarLibexec, "Ghidra", "application.properties"),
+      "application.version=12.1.3\n",
+    );
+    await writeFile(
+      join(cellarLibexec, "support", "analyzeHeadless"),
+      "#!/bin/sh\nexit 0\n",
+    );
+    await chmod(join(cellarLibexec, "support", "analyzeHeadless"), 0o700);
+    await symlink(join(cellarBin, "ghidraRun"), join(brewBin, "ghidraRun"));
+    expect(
+      discoverGhidraInstallationOnPath({ PATH: brewBin }, process.platform),
+    ).toBe(cellarLibexec);
   },
 );
 
@@ -171,6 +195,29 @@ it("does not fall back to PATH when an explicit Ghidra installation path is malf
     status: "failed",
     detail: "GHIDRA_INSTALL_DIR must be absolute",
   });
+});
+
+it("recovers when an explicit Homebrew Cellar Ghidra path is stale after upgrade", async () => {
+  const inspection = await inspectGhidraInstallation(
+    {
+      resourceOwner: inspectionResources.owner,
+      environment: { PATH: "/opt/homebrew/bin" },
+      installDir: "/opt/homebrew/Cellar/ghidra/12.1.2/libexec",
+      platform: "darwin",
+      architecture: "arm64",
+    },
+    host({
+      discoverInstallDirOnPath: () => INSTALL,
+      probeJava: () =>
+        javaProbeOk<GhidraJavaObservation>({
+          ...JAVA,
+          osArch: "aarch64",
+          osName: "Mac OS X",
+        }),
+    }),
+  );
+  expect(inspection.status).toBe("available");
+  expect(inspection.installDir).toBe(INSTALL);
 });
 
 it("probes the selected Java environment without reading conflicting ambient settings", async () => {

@@ -390,3 +390,138 @@ export const parsePceCdIpl = (
     },
   };
 };
+
+/** One track line in a Dreamcast .gdi disc descriptor. */
+export interface GdiTrack {
+  readonly number: number;
+  readonly startLba: number;
+  readonly trackType: number;
+  readonly sectorSize: number;
+  readonly fileName: string;
+  readonly offset: number;
+}
+
+export interface GdiSheet {
+  readonly tracks: readonly GdiTrack[];
+}
+
+/** Parse a Dreamcast .gdi sheet. */
+export const parseGdiSheet = (text: string): Result<GdiSheet, string> => {
+  const lines = text
+    .replace(/^\uFEFF/u, "")
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length < 2) return err("GDI sheet has no track entries");
+  const declaredCount = Number(lines[0]);
+  if (!Number.isInteger(declaredCount) || declaredCount < 1)
+    return err("GDI sheet header is not a valid track count");
+  const tracks: GdiTrack[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const tokens = cueTokens(lines[i] ?? "");
+    if (tokens.length < 6)
+      return err(`Invalid GDI track entry at line ${i + 1}`);
+    const number = Number(tokens[0]);
+    const startLba = Number(tokens[1]);
+    const trackType = Number(tokens[2]);
+    const sectorSize = Number(tokens[3]);
+    const fileName = tokens[4] ?? "";
+    const offset = Number(tokens[5]);
+    if (
+      !Number.isInteger(number) ||
+      !Number.isInteger(startLba) ||
+      !Number.isInteger(trackType) ||
+      (sectorSize !== CD_USER_DATA_BYTES &&
+        sectorSize !== RAW_CD_SECTOR_BYTES) ||
+      fileName.length === 0 ||
+      !Number.isInteger(offset)
+    )
+      return err(`Invalid GDI track fields at line ${i + 1}`);
+    tracks.push({
+      number,
+      startLba,
+      trackType,
+      sectorSize,
+      fileName,
+      offset,
+    });
+  }
+  return tracks.length === 0
+    ? err("GDI sheet declares no tracks")
+    : ok({ tracks });
+};
+
+/** Select the primary data track (preferring the Dreamcast high-density area at LBA 45000). */
+export const resolveGdiDataTrack = (
+  sheet: GdiSheet,
+  fileBytes: ReadonlyMap<string, number>,
+): Result<DataTrackLayout, string> => {
+  const dataTracks = sheet.tracks.filter((t) => t.trackType === 4);
+  if (dataTracks.length === 0) return err("GDI sheet declares no data track");
+  const selected =
+    dataTracks.find((t) => t.startLba >= 45000) ?? dataTracks[0]!;
+  const size = fileBytes.get(selected.fileName);
+  if (size === undefined)
+    return err(`Size of GDI track file "${selected.fileName}" is unknown`);
+  if (size % selected.sectorSize !== 0)
+    return err(
+      `GDI track file "${selected.fileName}" size ${size} is not a multiple of ${selected.sectorSize}-byte sectors`,
+    );
+  const mode: DataTrackMode =
+    selected.sectorSize === RAW_CD_SECTOR_BYTES ? "MODE1/2352" : "MODE1/2048";
+  return ok({
+    track: selected.number,
+    mode,
+    fileName: selected.fileName,
+    rawSectorBytes: selected.sectorSize,
+    userDataOffset: selected.sectorSize === RAW_CD_SECTOR_BYTES ? 16 : 0,
+    firstSectorInFile: 0,
+    sectorCount: size / selected.sectorSize,
+    firstLba: selected.startLba,
+    otherDataTracks: dataTracks
+      .filter((t) => t.number !== selected.number)
+      .map((t) => t.number),
+  });
+};
+
+/** Auto-detect a raw 2352-byte Mode 1 or Mode 2 Form 1 .bin image from sector 0's sync header. */
+export const detectRawSectorLayout = (
+  fileName: string,
+  bytes: Uint8Array,
+): DataTrackLayout | undefined => {
+  if (
+    bytes.length < RAW_CD_SECTOR_BYTES ||
+    bytes.length % RAW_CD_SECTOR_BYTES !== 0
+  )
+    return undefined;
+  for (let i = 0; i < SYNC.length; i++) {
+    if (bytes[i] !== SYNC[i]) return undefined;
+  }
+  const modeByte = bytes[15];
+  if (modeByte !== 1 && modeByte !== 2) return undefined;
+  const mode: DataTrackMode = modeByte === 1 ? "MODE1/2352" : "MODE2/2352";
+  return {
+    track: 1,
+    mode,
+    fileName,
+    rawSectorBytes: RAW_CD_SECTOR_BYTES,
+    userDataOffset: modeByte === 1 ? 16 : 24,
+    firstSectorInFile: 0,
+    sectorCount: bytes.length / RAW_CD_SECTOR_BYTES,
+    firstLba: 0,
+    otherDataTracks: [],
+  };
+};
+
+export {
+  parseIso9660FileSystem,
+  parsePlayStationSystemCnf,
+  parseSegaIpBin,
+  resolveDiscLocations,
+  type DiscResolvedLocation,
+  type Iso9660FileEntry,
+  type Iso9660FileSystem,
+  type Iso9660UnallocatedGap,
+  type PlayStationSystemCnf,
+  type SegaIpBin,
+} from "./iso9660.js";

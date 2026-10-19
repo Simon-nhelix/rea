@@ -6,14 +6,14 @@ import type { ToolContract } from "./toolContractTypes.js";
 import { toolContractMetadata } from "./toolEffects.js";
 import { evidenceResultOf } from "./toolOutputSchemaPrimitives.js";
 
-/** Reference search over several MIPS code files; independent of any open target. */
+/** Reference search over several code files; independent of any open target. */
 export const ROM_CODE_REFERENCE_TOOL_CONTRACTS = [
   {
     name: "find_code_references",
     ...toolContractMetadata("find_code_references"),
     kind: "artifact-provider",
     description:
-      "Find static references to addresses (functions, strings, tables, or whole address ranges) across several MIPS little-endian code files, each with its own load address (PS-X EXE header supplies it; headerless overlays take load_address), without opening a target or a disassembler. Detects jal/j targets (call/jump), lui plus addiu/ori/load/store address formation (address_pair, reporting the exact formed address), $gp-relative accesses (gp_relative: base register 28 plus signed offset; gp is given or inferred from a lui/addiu $gp initializer, and tracking stops where a function rewrites $gp), and aligned 32-bit pointer words (pointer_word, e.g. function or string pointer tables). Each hit lists file, file offset, virtual address, instruction text or bytes, register and the exact target address; the summary gives counts per target and states explicitly when 0 references were found. Files sharing a load address cannot coexist at runtime, so the file of a hit matters. Static scan only: indirect addresses, jr jump tables, compressed or encrypted code and absent overlays are not seen.",
+      "Find static references to addresses (functions, strings, tables, or whole address ranges) across several code files (mips-le, sh2-be, sh4-le, 65816, 6502, huc6280, arm-le, thumb-le), each with its own load address (PS-X EXE, multi-PT_LOAD ELF32, Saturn IP.BIN, iNES, or GBA headers supply it automatically; headerless overlays take load_address), without opening a target or a disassembler. Detects call/jump targets, register/PC-literal address formation (address_pair, including MIPS lui+addiu/load/store, SuperH mov.l @(disp,PC) literal loads and jsr @Rn, 65816 long addressing, HuC6280 tii/tai block transfers, and ARM/Thumb literal pools), $gp-relative accesses (gp_relative), and pointer words (pointer_word). Optional resolve_call_arguments reports immediate/address argument registers at call sites, and include_caller_signatures attaches surrounding instruction hex for rom-qa overlay disambiguation.",
     inputSchema: findCodeReferencesInputSchema,
     outputSchema: evidenceResultOf(findCodeReferencesResultSchema),
     examples: [

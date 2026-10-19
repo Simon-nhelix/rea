@@ -288,4 +288,56 @@ describe("CLI spec parsing", () => {
     ]);
     expect(report.total_references).toBe(3);
   });
+
+  it("scans all PT_LOAD segments in a multi-segment ELF32-LE and resolves call arguments", async () => {
+    const elfPath = join(directory, "MULTI_SEG.ELF");
+    const addiu = (rt: number, rs: number, imm: number) =>
+      ((9 << 26) | (rs << 21) | (rt << 16) | (imm & 0xffff)) >>> 0;
+
+    // ELF header + 2 program headers (0x34 + 64 = 0x74; pad to 0x100)
+    const header = Buffer.alloc(0x100, 0);
+    header.set([0x7f, 0x45, 0x4c, 0x46, 1, 1, 1]);
+    header.writeUInt16LE(2, 0x10);
+    header.writeUInt16LE(8, 0x12);
+    header.writeUInt32LE(0x34, 0x1c); // e_phoff
+    header.writeUInt16LE(32, 0x2a); // e_phentsize
+    header.writeUInt16LE(2, 0x2c); // e_phnum = 2
+    // Segment 0 (.text): offset 0x100, vaddr 0x00100000, filesz 16
+    header.writeUInt32LE(1, 0x34);
+    header.writeUInt32LE(0x100, 0x38);
+    header.writeUInt32LE(0x00100000, 0x3c);
+    header.writeUInt32LE(16, 0x44);
+    // Segment 1 (.data): offset 0x110, vaddr 0x00450000, filesz 8
+    header.writeUInt32LE(1, 0x54);
+    header.writeUInt32LE(0x110, 0x58);
+    header.writeUInt32LE(0x00450000, 0x5c);
+    header.writeUInt32LE(8, 0x64);
+
+    const seg0 = words([
+      lui(4, 0x0045),
+      addiu(4, 4, 0x0004),
+      jal(0x00100500),
+      0,
+    ]);
+    const seg1 = words([0x00100500, 0xdeadbeef]);
+    await writeFile(elfPath, Buffer.concat([header, seg0, seg1]));
+
+    const res = await new CodeReferenceService().find({
+      files: [{ path: elfPath }],
+      targets: [{ address: "0x00100500" }],
+      resolve_call_arguments: true,
+      include_caller_signatures: true,
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    const report = resultOf(res.value);
+    // Both PT_LOAD segments are scanned: jal in seg0 and pointer_word in seg1!
+    expect(report.files).toHaveLength(2);
+    expect(report.total_references).toBe(2);
+    const callHit = report.references.find((r) => r.kind === "call");
+    const ptrHit = report.references.find((r) => r.kind === "pointer_word");
+    expect(callHit?.call_arguments).toEqual({ a0: "0x00450004" });
+    expect(callHit?.caller_signature).toBeTypeOf("string");
+    expect(ptrHit?.address).toBe("0x00450000");
+  });
 });

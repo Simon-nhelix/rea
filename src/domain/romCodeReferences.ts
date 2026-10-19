@@ -63,6 +63,29 @@ export const codeReferenceTargetInputSchema = z.strictObject({
   name: z.string().min(1).max(200).optional().describe("Optional label."),
 });
 
+import {
+  callerSignatureAt,
+  scanArchitectureRegion,
+} from "./romCodeReferenceArchScanners.js";
+
+export const CODE_REFERENCE_ARCHITECTURES = [
+  "mips-le",
+  "sh2-be",
+  "sh4-le",
+  "65816",
+  "6502",
+  "huc6280",
+  "arm-le",
+  "thumb-le",
+] as const;
+
+export const codeReferenceArchitectureSchema = z.enum(
+  CODE_REFERENCE_ARCHITECTURES,
+);
+export type CodeReferenceArchitecture = z.infer<
+  typeof codeReferenceArchitectureSchema
+>;
+
 export const findCodeReferencesInputSchema = z.strictObject({
   files: z
     .array(codeReferenceFileInputSchema)
@@ -74,10 +97,11 @@ export const findCodeReferencesInputSchema = z.strictObject({
     .min(1)
     .max(1024)
     .describe("Addresses or address ranges to find references to."),
-  architecture: z
-    .enum(["mips-le"])
+  architecture: codeReferenceArchitectureSchema
     .default("mips-le")
-    .describe("Instruction set. mips-le covers PS1, and PS2/PSP basic MIPS."),
+    .describe(
+      "Instruction set: mips-le (PS1/PS2/PSP), sh2-be (Saturn), sh4-le (Dreamcast), 65816 (SNES), 6502 (NES), huc6280 (PC Engine), arm-le / thumb-le (GBA/NDS).",
+    ),
   gp: addressSchema
     .optional()
     .describe(
@@ -87,6 +111,18 @@ export const findCodeReferencesInputSchema = z.strictObject({
     .boolean()
     .default(true)
     .describe("Set false to skip gp_relative detection entirely."),
+  resolve_call_arguments: z
+    .boolean()
+    .default(false)
+    .describe(
+      "When true, include known constant argument registers (a0-a3 on MIPS, r4-r7 on SuperH, r0-r3 on ARM/Thumb) at each call reference.",
+    ),
+  include_caller_signatures: z
+    .boolean()
+    .default(false)
+    .describe(
+      "When true, include a hex byte signature around each reference for runtime overlay disambiguation.",
+    ),
   kinds: z
     .array(codeReferenceKindSchema)
     .min(1)
@@ -128,22 +164,31 @@ export const codeReferenceSchema = z.strictObject({
   target: z.string(),
   offset_in_target: z.number().int().min(0),
   source_lui_address: z.string().nullable(),
+  call_arguments: z.record(z.string(), z.string()).optional(),
+  caller_signature: z.string().optional(),
 });
 
+export const LOAD_ADDRESS_SOURCES = [
+  "ps-x-exe-header",
+  "elf32-le-header",
+  "mwo3-header",
+  "sega-ip-header",
+  "ines-header",
+  "gba-rom-header",
+  "caller",
+] as const;
+
+export type LoadAddressSource = (typeof LOAD_ADDRESS_SOURCES)[number];
+
 export const findCodeReferencesResultSchema = z.strictObject({
-  architecture: z.literal("mips-le"),
+  architecture: codeReferenceArchitectureSchema,
   files: z.array(
     z.strictObject({
       path: z.string(),
       sha256: z.string(),
       size: z.number().int().min(0),
       load_address: z.string(),
-      load_address_source: z.enum([
-        "ps-x-exe-header",
-        "elf32-le-header",
-        "mwo3-header",
-        "caller",
-      ]),
+      load_address_source: z.enum(LOAD_ADDRESS_SOURCES),
       scanned_file_offset: z.number().int().min(0),
       scanned_bytes: z.number().int().min(0),
       region_end_address: z.string(),
@@ -266,6 +311,8 @@ interface RegisterValue {
   /** The value is the configured $gp. */
   readonly gp: boolean;
   readonly luiAddress: number | undefined;
+  /** Formed from $zero + imm (li); used for call_arguments only, not address_pair. */
+  readonly immediateOnly?: boolean | undefined;
 }
 
 /** Region of one file: bytes [fileOffset, fileOffset+length) load at `address`. */
@@ -277,11 +324,18 @@ export interface ScanRegion {
   readonly address: number;
   /** Known $gp value, enabling gp_relative references. */
   readonly gp?: number | undefined;
+  readonly resolveCallArguments?: boolean | undefined;
+  readonly includeCallerSignatures?: boolean | undefined;
 }
 
 export interface ScanTarget {
   readonly address: number;
   readonly length: number;
+}
+
+export interface ScanOptions {
+  readonly resolveCallArguments?: boolean | undefined;
+  readonly includeCallerSignatures?: boolean | undefined;
 }
 
 export interface RawReference {
@@ -294,6 +348,8 @@ export interface RawReference {
   readonly targetAddress: number;
   readonly targetIndex: number;
   readonly sourceLuiAddress: number | null;
+  readonly callArguments?: Record<string, string> | undefined;
+  readonly callerSignature?: string | undefined;
 }
 
 const bytesOf = (word: number): string =>
@@ -383,9 +439,21 @@ const immediateEffect = (scanner: Scanner, d: Decoded): Effect => {
         luiAddress: d.pc,
       },
     };
-  const base = scanner.regs[d.rs];
-  if (base === undefined) return { dest: d.rt };
   const isOri = d.op === 0x0d;
+  if (d.rs === 0) {
+    return {
+      dest: d.rt,
+      value: {
+        value: (isOri ? d.imm : d.simm) >>> 0,
+        derived: true,
+        gp: false,
+        luiAddress: undefined,
+        immediateOnly: true,
+      },
+    };
+  }
+  const base = scanner.regs[d.rs];
+  if (base === undefined || base.immediateOnly) return { dest: d.rt };
   const formed = (isOri ? base.value | d.imm : base.value + d.simm) >>> 0;
   const text = isOri
     ? `ori ${reg(d.rt)}, ${reg(d.rs)}, 0x${d.imm.toString(16)}`
@@ -417,7 +485,11 @@ const memoryEffect = (scanner: Scanner, d: Decoded): Effect => {
   const base = scanner.regs[d.rs];
   // An access at offset 0 of a register formed by addiu/ori repeats the
   // address already reported for that instruction.
-  if (base !== undefined && !(base.derived && d.simm === 0)) {
+  if (
+    base !== undefined &&
+    !base.immediateOnly &&
+    !(base.derived && d.simm === 0)
+  ) {
     const formed = (base.value + d.simm) >>> 0;
     const target = scanner.findTarget(formed);
     if (target !== undefined)
@@ -497,11 +569,27 @@ const CALLER_SAVED = [
   1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 31,
 ];
 
+const snapshotMipsArgs = (
+  regs: readonly (RegisterValue | undefined)[],
+): Record<string, string> | undefined => {
+  const out: Record<string, string> = {};
+  let any = false;
+  for (let r = 4; r <= 7; r++) {
+    const val = regs[r];
+    if (val !== undefined && !val.gp) {
+      out[reg(r)] = hex(val.value);
+      any = true;
+    }
+  }
+  return any ? out : undefined;
+};
+
 /** Scan one region and return every reference to any target, in file order. */
 export const scanMipsRegion = (
   region: ScanRegion,
   scanTargets: readonly ScanTarget[],
   kinds: ReadonlySet<CodeReferenceKind>,
+  options?: ScanOptions,
 ): RawReference[] => {
   const targets: Target[] = scanTargets.map((target, index) => ({
     start: target.address >>> 0,
@@ -534,8 +622,15 @@ export const scanMipsRegion = (
         };
   regs[28] = gpValue;
   let current: Decoded | undefined;
+  let pendingCallHitIndex: number | undefined;
+  const resolveArgs =
+    options?.resolveCallArguments ?? region.resolveCallArguments;
+  const includeSignatures =
+    options?.includeCallerSignatures ?? region.includeCallerSignatures;
   const emit: Emit = ({ kind, instruction, register, formed, target, lui }) => {
     if (!kinds.has(kind) || current === undefined) return;
+    const callArgs =
+      kind === "call" && resolveArgs ? snapshotMipsArgs(regs) : undefined;
     results.push({
       kind,
       fileOffset: current.fileOffset,
@@ -546,7 +641,21 @@ export const scanMipsRegion = (
       targetAddress: formed >>> 0,
       targetIndex: target.index,
       sourceLuiAddress: lui?.luiAddress ?? null,
+      ...(callArgs === undefined ? {} : { callArguments: callArgs }),
+      ...(includeSignatures
+        ? {
+            callerSignature: callerSignatureAt(
+              region.bytes,
+              current.fileOffset,
+              region.fileOffset,
+              region.length,
+            ),
+          }
+        : {}),
     });
+    if (kind === "call" && resolveArgs) {
+      pendingCallHitIndex = results.length - 1;
+    }
   };
   const scanner: Scanner = { regs, gp: region.gp, findTarget, emit };
 
@@ -575,6 +684,21 @@ export const scanMipsRegion = (
       regs[effect.dest] = effect.value;
 
     if (inDelaySlot) {
+      if (
+        pending === "call" &&
+        pendingCallHitIndex !== undefined &&
+        resolveArgs
+      ) {
+        const afterSlotArgs = snapshotMipsArgs(regs);
+        const hit = results[pendingCallHitIndex];
+        if (hit !== undefined && afterSlotArgs !== undefined) {
+          results[pendingCallHitIndex] = {
+            ...hit,
+            callArguments: afterSlotArgs,
+          };
+        }
+      }
+      pendingCallHitIndex = undefined;
       if (pending === "call") for (const r of CALLER_SAVED) regs[r] = undefined;
       else {
         regs.fill(undefined);
@@ -589,6 +713,31 @@ export const scanMipsRegion = (
     }
   }
   return results;
+};
+
+/** Scan one region using the selected architecture's instruction decoder. */
+export const scanCodeRegion = (
+  architecture: CodeReferenceArchitecture,
+  region: ScanRegion,
+  scanTargets: readonly ScanTarget[],
+  kinds: ReadonlySet<CodeReferenceKind>,
+  options?: ScanOptions,
+): RawReference[] => {
+  const mergedOptions: ScanOptions = {
+    resolveCallArguments:
+      options?.resolveCallArguments ?? region.resolveCallArguments,
+    includeCallerSignatures:
+      options?.includeCallerSignatures ?? region.includeCallerSignatures,
+  };
+  return architecture === "mips-le"
+    ? scanMipsRegion(region, scanTargets, kinds, mergedOptions)
+    : scanArchitectureRegion(
+        architecture,
+        region,
+        scanTargets,
+        kinds,
+        mergedOptions,
+      );
 };
 
 export const formatAddress32 = hex;

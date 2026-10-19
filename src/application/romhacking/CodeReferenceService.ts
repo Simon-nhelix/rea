@@ -17,11 +17,13 @@ import {
   formatAddress32,
   parseAddress32,
   ROM_CODE_REFERENCE_PROVIDER_IDENTITY,
-  scanMipsRegion,
+  scanCodeRegion,
   type CodeReference,
+  type CodeReferenceArchitecture,
   type CodeReferenceKind,
   type FindCodeReferencesInput,
   type FindCodeReferencesResult,
+  type LoadAddressSource,
 } from "../../domain/romCodeReferences.js";
 import { CODE_REFERENCE_LIMITATIONS } from "../../domain/romCodeReferenceLimitations.js";
 import { overlappingRegions } from "../../domain/romCodeReferenceRegions.js";
@@ -36,34 +38,35 @@ interface LoadedRegion {
   readonly bytes: Uint8Array;
   readonly sha256: string;
   readonly loadAddress: number;
-  readonly loadAddressSource:
-    | "ps-x-exe-header"
-    | "elf32-le-header"
-    | "mwo3-header"
-    | "caller";
+  readonly loadAddressSource: LoadAddressSource;
   readonly fileOffset: number;
   readonly length: number;
   readonly notes: readonly string[];
   readonly useGp: boolean;
 }
 
-/** Locate a file's loadable region: PS-X EXE, ELF32-LE, MWo3, or caller load address. */
-const locateRegion = (
+type RegionCoordinate = Omit<
+  LoadedRegion,
+  "sha256" | "path" | "bytes" | "useGp"
+>;
+
+/** Locate all loadable regions of a file: PS-X EXE, multi-PT_LOAD ELF32, MWo3, console headers, or caller load address. */
+const locateRegions = (
   path: string,
   bytes: Uint8Array,
   explicit: number | undefined,
-): Result<
-  Omit<LoadedRegion, "sha256" | "path" | "bytes" | "useGp">,
-  AnalysisError
-> => {
+  architecture: CodeReferenceArchitecture,
+): Result<readonly RegionCoordinate[], AnalysisError> => {
   if (explicit !== undefined)
-    return ok({
-      loadAddress: explicit,
-      loadAddressSource: "caller",
-      fileOffset: 0,
-      length: bytes.length,
-      notes: [],
-    });
+    return ok([
+      {
+        loadAddress: explicit,
+        loadAddressSource: "caller",
+        fileOffset: 0,
+        length: bytes.length,
+        notes: [],
+      },
+    ]);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const magic = Buffer.from(bytes.subarray(0, 8)).toString("latin1");
   if (magic === "PS-X EXE" && bytes.length >= PSX_HEADER_BYTES) {
@@ -71,20 +74,22 @@ const locateRegion = (
     const declared = view.getUint32(0x1c, true);
     const available = bytes.length - PSX_HEADER_BYTES;
     const length = Math.min(declared, available);
-    return ok({
-      loadAddress: textAddress,
-      loadAddressSource: "ps-x-exe-header",
-      fileOffset: PSX_HEADER_BYTES,
-      length,
-      notes:
-        declared > available
-          ? [
-              `${path}: PS-X EXE header declares ${declared} text bytes but only ${available} follow the header; scanned ${available}.`,
-            ]
-          : [],
-    });
+    return ok([
+      {
+        loadAddress: textAddress,
+        loadAddressSource: "ps-x-exe-header",
+        fileOffset: PSX_HEADER_BYTES,
+        length,
+        notes:
+          declared > available
+            ? [
+                `${path}: PS-X EXE header declares ${declared} text bytes but only ${available} follow the header; scanned ${available}.`,
+              ]
+            : [],
+      },
+    ]);
   }
-  // 32-bit little-endian MIPS ELF (PS2/PSP)
+  // 32-bit ELF (MIPS, SuperH, or ARM): collect ALL PT_LOAD segments with p_filesz > 0
   if (
     bytes.length >= 0x34 &&
     bytes[0] === 0x7f &&
@@ -92,25 +97,26 @@ const locateRegion = (
     bytes[2] === 0x4c &&
     bytes[3] === 0x46 &&
     bytes[4] === 1 &&
-    bytes[5] === 1 &&
-    view.getUint16(0x12, true) === 8
+    (bytes[5] === 1 || bytes[5] === 2)
   ) {
-    const phOff = view.getUint32(0x1c, true);
-    const phEntSize = view.getUint16(0x2a, true);
-    const phNum = view.getUint16(0x2c, true);
+    const little = bytes[5] === 1;
+    const phOff = view.getUint32(0x1c, little);
+    const phEntSize = view.getUint16(0x2a, little);
+    const phNum = view.getUint16(0x2c, little);
+    const segments: RegionCoordinate[] = [];
     if (phOff > 0 && phEntSize >= 32 && phNum > 0 && phNum <= 1024) {
       for (let i = 0; i < phNum; i++) {
         const off = phOff + i * phEntSize;
         if (off + 32 > bytes.length) break;
-        const pType = view.getUint32(off, true);
+        const pType = view.getUint32(off, little);
         if (pType !== 1) continue; // PT_LOAD
-        const pOffset = view.getUint32(off + 0x04, true);
-        const pVaddr = view.getUint32(off + 0x08, true);
-        const pFilesz = view.getUint32(off + 0x10, true);
+        const pOffset = view.getUint32(off + 0x04, little);
+        const pVaddr = view.getUint32(off + 0x08, little);
+        const pFilesz = view.getUint32(off + 0x10, little);
         if (pFilesz === 0 || pOffset >= bytes.length) continue;
         const available = bytes.length - pOffset;
         const length = Math.min(pFilesz, available);
-        return ok({
+        segments.push({
           loadAddress: pVaddr,
           loadAddressSource: "elf32-le-header",
           fileOffset: pOffset,
@@ -124,6 +130,7 @@ const locateRegion = (
         });
       }
     }
+    if (segments.length > 0) return ok(segments);
   }
   // CodeWarrior PS2 'MWo3' overlay (0x40-byte header placed at base loadAddress)
   if (
@@ -139,18 +146,71 @@ const locateRegion = (
     const declared = textSize + dataSize;
     const available = bytes.length - 0x40;
     const length = Math.min(declared, available);
-    return ok({
-      loadAddress: (baseAddress + 0x40) >>> 0,
-      loadAddressSource: "mwo3-header",
-      fileOffset: 0x40,
-      length,
-      notes:
-        declared > available
-          ? [
-              `${path}: MWo3 header declares ${declared} payload bytes but only ${available} follow the 0x40-byte header; scanned ${available}.`,
-            ]
-          : [],
-    });
+    return ok([
+      {
+        loadAddress: (baseAddress + 0x40) >>> 0,
+        loadAddressSource: "mwo3-header",
+        fileOffset: 0x40,
+        length,
+        notes:
+          declared > available
+            ? [
+                `${path}: MWo3 header declares ${declared} payload bytes but only ${available} follow the 0x40-byte header; scanned ${available}.`,
+              ]
+            : [],
+      },
+    ]);
+  }
+  // Sega Saturn IP.BIN ("SEGA SEGASATURN ")
+  if (
+    bytes.length >= 0x100 &&
+    Buffer.from(bytes.subarray(0, 16)).toString("latin1") === "SEGA SEGASATURN "
+  ) {
+    return ok([
+      {
+        loadAddress: 0x06002000,
+        loadAddressSource: "sega-ip-header",
+        fileOffset: 0,
+        length: bytes.length,
+        notes: [],
+      },
+    ]);
+  }
+  // NES iNES header ("NES\x1a")
+  if (
+    bytes.length > 16 &&
+    bytes[0] === 0x4e &&
+    bytes[1] === 0x45 &&
+    bytes[2] === 0x53 &&
+    bytes[3] === 0x1a
+  ) {
+    return ok([
+      {
+        loadAddress: 0x8000,
+        loadAddressSource: "ines-header",
+        fileOffset: 16,
+        length: bytes.length - 16,
+        notes: [],
+      },
+    ]);
+  }
+  // GBA ROM (0x08000000) when arm-le / thumb-le or .gba
+  if (
+    (architecture === "arm-le" ||
+      architecture === "thumb-le" ||
+      path.toLowerCase().endsWith(".gba")) &&
+    bytes.length >= 0xc0 &&
+    bytes[0xb2] === 0x96
+  ) {
+    return ok([
+      {
+        loadAddress: 0x08000000,
+        loadAddressSource: "gba-rom-header",
+        fileOffset: 0,
+        length: bytes.length,
+        notes: [],
+      },
+    ]);
   }
   return err(
     new AnalysisInputError(OPERATION, {
@@ -190,9 +250,11 @@ interface GpResolution {
 const resolveGp = (
   explicit: string | undefined,
   enabled: boolean,
+  architecture: CodeReferenceArchitecture,
   regions: readonly LoadedRegion[],
 ): GpResolution => {
-  if (!enabled) return { value: undefined, source: null, file: null };
+  if (!enabled || architecture !== "mips-le")
+    return { value: undefined, source: null, file: null };
   const given = explicit === undefined ? undefined : parseAddress32(explicit);
   if (given !== undefined)
     return { value: given, source: "caller", file: null };
@@ -227,12 +289,22 @@ const tallyReferences = (
   regions: readonly LoadedRegion[],
   targets: readonly NamedTarget[],
   options: {
+    readonly architecture: CodeReferenceArchitecture;
     readonly kinds: ReadonlySet<CodeReferenceKind>;
     readonly maxReferences: number;
     readonly gp: number | undefined;
+    readonly resolveCallArguments: boolean;
+    readonly includeCallerSignatures: boolean;
   },
 ): Tally => {
-  const { kinds, maxReferences, gp } = options;
+  const {
+    architecture,
+    kinds,
+    maxReferences,
+    gp,
+    resolveCallArguments,
+    includeCallerSignatures,
+  } = options;
   const tally: Tally = {
     references: [],
     perFile: [],
@@ -248,7 +320,8 @@ const tallyReferences = (
     total: 0,
   };
   for (const region of regions) {
-    const found = scanMipsRegion(
+    const found = scanCodeRegion(
+      architecture,
       {
         file: region.path,
         bytes: region.bytes,
@@ -259,6 +332,7 @@ const tallyReferences = (
       },
       targets,
       kinds,
+      { resolveCallArguments, includeCallerSignatures },
     );
     tally.perFile.push(found.length);
     for (const hit of found) {
@@ -287,6 +361,12 @@ const tallyReferences = (
             hit.sourceLuiAddress === null
               ? null
               : formatAddress32(hit.sourceLuiAddress),
+          ...(hit.callArguments === undefined
+            ? {}
+            : { call_arguments: hit.callArguments }),
+          ...(hit.callerSignature === undefined
+            ? {}
+            : { caller_signature: hit.callerSignature }),
         });
     }
   }
@@ -310,6 +390,8 @@ const evidenceParameters = (
   architecture: input.architecture,
   gp: input.gp ?? null,
   gp_relative: input.gp_relative,
+  resolve_call_arguments: input.resolve_call_arguments,
+  include_caller_signatures: input.include_caller_signatures,
   kinds: [...kinds],
   max_references: input.max_references,
 });
@@ -326,7 +408,10 @@ const buildResult = (
   regions: readonly LoadedRegion[],
   targets: readonly NamedTarget[],
   tally: Tally,
-  header: { readonly architecture: "mips-le"; readonly gp: GpResolution },
+  header: {
+    readonly architecture: CodeReferenceArchitecture;
+    readonly gp: GpResolution;
+  },
 ): FindCodeReferencesResult => ({
   architecture: header.architecture,
   gp: gpReport(header.gp),
@@ -376,7 +461,7 @@ const buildResult = (
   truncated: tally.total > tally.references.length,
 });
 
-/** Find references to addresses across several MIPS code files. */
+/** Find references to addresses across several code files. */
 export class CodeReferenceService {
   /** Nothing is held between calls. */
   close(): Promise<void> {
@@ -416,9 +501,10 @@ export class CodeReferenceService {
         file.path,
         file.load_address,
         file.use_gp,
+        input.architecture,
       );
       if (!loaded.ok) return loaded;
-      regions.push(loaded.value);
+      regions.push(...loaded.value);
     }
 
     const targets = input.targets.map((target) => ({
@@ -435,11 +521,19 @@ export class CodeReferenceService {
         "pointer_word",
       ],
     );
-    const gp = resolveGp(input.gp, input.gp_relative, regions);
+    const gp = resolveGp(
+      input.gp,
+      input.gp_relative,
+      input.architecture,
+      regions,
+    );
     const tally = tallyReferences(regions, targets, {
+      architecture: input.architecture,
       kinds,
       maxReferences: input.max_references,
       gp: gp.value,
+      resolveCallArguments: input.resolve_call_arguments,
+      includeCallerSignatures: input.include_caller_signatures,
     });
     const result = buildResult(regions, targets, tally, {
       architecture: input.architecture,
@@ -452,10 +546,10 @@ export class CodeReferenceService {
         parameters: evidenceParameters(input, kinds),
         result: jsonValueSchema.parse(validated),
         confidence: "derived",
-        subjectUnavailableReason: `Evidence covers ${regions.length} file(s); each file's SHA-256 is in result.files.`,
-        locations: regions.map((region) => ({
+        subjectUnavailableReason: `Evidence covers ${regions.length} region(s) across ${input.files.length} file(s); each region's SHA-256 is in result.files.`,
+        locations: input.files.map((file) => ({
           kind: "artifact-path" as const,
-          path: region.path,
+          path: file.path,
         })),
         limitations: [
           ...CODE_REFERENCE_LIMITATIONS,
@@ -465,7 +559,9 @@ export class CodeReferenceService {
                 `$gp ${formatAddress32(gp.value ?? 0)} was inferred from the lui/addiu pair at ${formatAddress32(gp.address ?? 0)} in ${gp.file ?? ""} and applied to every file with use_gp; pass gp to override.`,
               ]
             : []),
-          ...(input.gp_relative && gp.value === undefined
+          ...(input.architecture === "mips-le" &&
+          input.gp_relative &&
+          gp.value === undefined
             ? [
                 "No $gp value was given or found, so gp_relative references were skipped.",
               ]
@@ -479,7 +575,8 @@ export class CodeReferenceService {
     path: string,
     loadAddress: string | undefined,
     useGp: boolean,
-  ): Promise<Result<LoadedRegion, AnalysisError>> {
+    architecture: CodeReferenceArchitecture,
+  ): Promise<Result<readonly LoadedRegion[], AnalysisError>> {
     let bytes: Uint8Array;
     try {
       const info = await stat(path);
@@ -498,18 +595,22 @@ export class CodeReferenceService {
         }),
       );
     }
-    const located = locateRegion(
+    const located = locateRegions(
       path,
       bytes,
       loadAddress === undefined ? undefined : parseAddress32(loadAddress),
+      architecture,
     );
     if (!located.ok) return located;
-    return ok({
-      path,
-      bytes,
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      useGp,
-      ...located.value,
-    });
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    return ok(
+      located.value.map((region) => ({
+        path,
+        bytes,
+        sha256,
+        useGp,
+        ...region,
+      })),
+    );
   }
 }
