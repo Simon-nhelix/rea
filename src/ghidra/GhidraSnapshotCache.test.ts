@@ -1,3 +1,5 @@
+import { ok as javaProbeOk } from "../domain/result.js";
+import type { GhidraJavaObservation } from "./GhidraJavaProbe.js";
 import { describe, expect, it } from "vitest";
 
 import { createTestBinarySession } from "../../tests/fixtures/binarySession.js";
@@ -43,15 +45,16 @@ const fixture = (version = "12.1.4", coverage?: RelationshipCoverage) => {
       readText: () =>
         `application.version=${version}\napplication.java.min=21\n`,
       executable: () => true,
-      probeJava: () => ({
-        osArch: "amd64",
-        osName: "Linux",
-        version: "21.0.11",
-        major: 21,
-        home: "/usr/lib/jvm/jdk-21",
-        bits: 64,
-        runtime: "jdk",
-      }),
+      probeJava: () =>
+        javaProbeOk<GhidraJavaObservation>({
+          osArch: "amd64",
+          osName: "Linux",
+          version: "21.0.11",
+          major: 21,
+          home: "/usr/lib/jvm/jdk-21",
+          bits: 64,
+          runtime: "jdk",
+        }),
     },
     (options) => ({
       start: async () =>
@@ -91,6 +94,13 @@ const fixture = (version = "12.1.4", coverage?: RelationshipCoverage) => {
             throw new Error("Expected an annotation name");
           name = parameters.name;
         }
+        if (operation === "read_binary_inventory_summary")
+          return ok({
+            document: "fixture",
+            segments: [],
+            procedure_count: 0,
+            string_count: 0,
+          });
         const dossier = functionDossierSchema.parse(ghidraFunctionDossier());
         dossier.procedure.name = name;
         dossier.pseudocode = `void ${name}() {}`;
@@ -264,6 +274,7 @@ describe("Ghidra snapshot profile admission", () => {
 
 describe("Ghidra snapshot cache", () => {
   it.each([
+    { operation: "read_binary_inventory_summary", parameters: {} },
     { operation: "analyze_function", parameters: { procedure: "0x1000" } },
     {
       operation: "procedure_pseudo_code",
@@ -324,6 +335,9 @@ describe("Ghidra snapshot cache", () => {
   it("keeps annotation-dependent reads live after cancellation reimports the original artifact", async () => {
     const { session, calls, cancellationReady } = fixture();
     await open(session);
+    expect(
+      (await session.execute("read_binary_inventory_summary", {})).ok,
+    ).toBe(true);
     const parameters = { procedure: "0x1000", document: "fixture" };
     expect(
       await session.execute("procedure_pseudo_code", parameters),
@@ -339,13 +353,17 @@ describe("Ghidra snapshot cache", () => {
         })
       ).ok,
     ).toBe(true);
-    for (let index = 0; index < 2; index += 1)
+    for (let index = 0; index < 2; index += 1) {
+      expect(
+        (await session.execute("read_binary_inventory_summary", {})).ok,
+      ).toBe(true);
       expect(
         await session.execute("procedure_pseudo_code", parameters),
       ).toMatchObject({
         ok: true,
         value: { result: "void renamed() {}" },
       });
+    }
     expect(session.exportAnalysisSnapshot().ok).toBe(false);
     const controller = new AbortController();
     const cancelled = session.execute(
@@ -359,13 +377,22 @@ describe("Ghidra snapshot cache", () => {
       ok: false,
       error: { _tag: "AnalysisCancelledError" },
     });
-    for (let index = 0; index < 2; index += 1)
+    for (let index = 0; index < 2; index += 1) {
+      expect(
+        (await session.execute("read_binary_inventory_summary", {})).ok,
+      ).toBe(true);
       expect(
         await session.execute("procedure_pseudo_code", parameters),
       ).toMatchObject({
         ok: true,
         value: { result: "void original() {}" },
       });
+    }
+    expect(
+      calls.filter(
+        (operation) => operation === "read_binary_inventory_summary",
+      ),
+    ).toHaveLength(5);
     expect(
       calls.filter((operation) => operation === "procedure_pseudo_code"),
     ).toHaveLength(5);

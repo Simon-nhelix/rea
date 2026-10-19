@@ -25,6 +25,7 @@ import {
 import { range } from "./javascriptStaticAnalysisHelpers.js";
 import {
   propertyName,
+  semanticFinalObjectProperty,
   semanticStaticPropertyKey,
   semanticWrappedWriteSite,
   semanticWriteSiteReadsFirst,
@@ -39,8 +40,10 @@ import {
   semanticImportEqualsSpecifier,
 } from "./javascriptModuleDeclaration.js";
 import {
+  commonJsDefinedExport,
   commonJsExportName,
   type CommonJsExportReceiverEffect,
+  type CommonJsExportSite,
 } from "./javascriptCommonJsExportReceivers.js";
 
 interface CollectCallableInput {
@@ -83,7 +86,7 @@ export const collectSemanticModuleLink = (
   node: t.Node,
   state: JavaScriptSemanticAnalysisState,
   commonJsReceivers: ReadonlyMap<
-    t.AssignmentExpression,
+    CommonJsExportSite,
     CommonJsExportReceiverEffect
   >,
 ): void => {
@@ -120,7 +123,10 @@ export const collectSemanticModuleLink = (
   else if (t.isVariableDeclarator(node)) collectRequireLink(node, state);
   else if (t.isAssignmentExpression(node))
     collectCommonJsExport(node, state, commonJsReceivers.get(node));
-  else if (t.isCallExpression(node)) collectUnboundRequireLink(node, state);
+  else if (t.isCallExpression(node)) {
+    collectDefinedCommonJsExport(node, state, commonJsReceivers.get(node));
+    collectUnboundRequireLink(node, state);
+  }
 };
 
 const collectImportEquals = (
@@ -473,10 +479,37 @@ const collectCommonJsExport = (
   const exportedName = commonJsExportName(node.left, state);
   if (exportedName === undefined) return;
   if (receiverEffect === "detached") return;
-  // Simple assignment chains yield their rightmost assigned value. Compound
-  // and logical writes also depend on the previous value, so remain unknown.
-  let value =
+  // Compound and logical writes also depend on the previous value, so remain
+  // unknown.
+  const value =
     node.operator === "=" && receiverEffect !== "uncertain" ? node.right : null;
+  addCommonJsExport(node, state, exportedName, value);
+};
+
+const collectDefinedCommonJsExport = (
+  node: t.CallExpression,
+  state: JavaScriptSemanticAnalysisState,
+  receiverEffect: CommonJsExportReceiverEffect | undefined,
+): void => {
+  const defined = commonJsDefinedExport(node, state);
+  if (defined === undefined || receiverEffect === "detached") return;
+  // A data descriptor exports its value; an accessor's result stays unknown.
+  const descriptor = unwrapJavaScriptExpression(defined.descriptor).node;
+  const value =
+    receiverEffect !== "uncertain" && t.isObjectExpression(descriptor)
+      ? (semanticFinalObjectProperty(descriptor, "value") ?? null)
+      : null;
+  addCommonJsExport(node, state, defined.exportedName, value);
+};
+
+const addCommonJsExport = (
+  node: CommonJsExportSite,
+  state: JavaScriptSemanticAnalysisState,
+  exportedName: string,
+  exported: t.Node | null,
+): void => {
+  // Simple assignment chains yield their rightmost assigned value.
+  let value = exported;
   while (t.isAssignmentExpression(value, { operator: "=" }))
     value = value.right;
   const required =
@@ -670,6 +703,7 @@ const isDeleteSite = (site: t.Node): boolean =>
   t.isUnaryExpression(site, { operator: "delete" });
 
 const isPatternOwnerDeclaration = (node: t.Node): boolean =>
+  t.isTSParameterProperty(node) ||
   (t.isVariableDeclarator(node) && t.isPattern(node.id)) ||
   (t.isFunction(node) &&
     node.params.some((value): value is t.Pattern => t.isPattern(value))) ||
@@ -699,6 +733,8 @@ const isDeclarationIdentifier = (
 ): boolean => {
   if (t.isTSImportEqualsDeclaration(parent)) return parent.id === node;
   return (
+    (t.isTSParameterProperty(parent) &&
+      patternContains(parent.parameter, node)) ||
     (t.isVariableDeclarator(parent) && patternContains(parent.id, node)) ||
     ((t.isFunctionDeclaration(parent) || t.isFunctionExpression(parent)) &&
       parent.id === node) ||
@@ -722,10 +758,23 @@ const isNonReferenceKey = (node: t.Identifier, parent: t.Node): boolean =>
     parent.key === node &&
     !parent.computed &&
     !(t.isObjectProperty(parent) && parent.shorthand)) ||
+  isNoncomputedClassMemberKey(node, parent) ||
+  t.isPrivateName(parent) ||
   (t.isExportSpecifier(parent) && parent.exported === node) ||
   t.isLabeledStatement(parent) ||
   t.isBreakStatement(parent) ||
   t.isContinueStatement(parent);
+
+/** A noncomputed class member name is a property key, never a lexical read. */
+const isNoncomputedClassMemberKey = (
+  node: t.Identifier,
+  parent: t.Node,
+): boolean =>
+  (t.isClassMethod(parent) ||
+    t.isClassProperty(parent) ||
+    t.isTSDeclareMethod(parent)) &&
+  parent.key === node &&
+  !parent.computed;
 
 const patternNames = (pattern: t.Node): string[] => {
   if (t.isTSParameterProperty(pattern)) return patternNames(pattern.parameter);
@@ -747,6 +796,8 @@ const patternNames = (pattern: t.Node): string[] => {
 
 const patternContains = (pattern: t.Node, target: t.Identifier): boolean =>
   pattern === target ||
+  (t.isTSParameterProperty(pattern) &&
+    patternContains(pattern.parameter, target)) ||
   (t.isAssignmentPattern(pattern) && patternContains(pattern.left, target)) ||
   (t.isRestElement(pattern) && patternContains(pattern.argument, target)) ||
   (t.isObjectPattern(pattern) &&

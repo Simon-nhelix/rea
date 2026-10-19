@@ -112,7 +112,8 @@ export class IdaProvider implements AnalysisProviderCandidate {
     };
     if (
       target.kind === "executable" &&
-      isElfMetadataArchitecture(target.architecture)
+      (isElfMetadataArchitecture(target.architecture) ||
+        target.architecture === "hexagon")
     )
       return {
         status: "unsupported",
@@ -122,7 +123,9 @@ export class IdaProvider implements AnalysisProviderCandidate {
             ? "MIPS"
             : target.architecture === "riscv"
               ? "RISC-V"
-              : "PowerPC"
+              : target.architecture === "powerpc"
+                ? "PowerPC"
+                : "Hexagon"
         } lane. Select a supported Ghidra profile instead.`,
         diagnostics,
       };
@@ -149,6 +152,21 @@ export class IdaProvider implements AnalysisProviderCandidate {
         reason:
           "Console ROM and executable analysis requires the Ghidra adapter.",
         diagnostics,
+      };
+    // Attached identity is the recorded whole-input digest, which every slice
+    // of a universal file shares, so it cannot prove the GUI loaded the slice
+    // admission selected. Headless mode thins that slice into its own input.
+    const config = this.#configuration();
+    if (
+      target.format === "mach-o-universal" &&
+      config.ok &&
+      config.value.mode === "attached"
+    )
+      return {
+        status: "unsupported",
+        code: "target_format_unsupported",
+        reason: `Attached IDA records only the whole-file digest of a universal Mach-O, so REA cannot verify that the open database is its ${target.architecture} slice. Extract that slice with lipo -thin and open the thin file in both IDA and REA, or use headless mode.`,
+        diagnostics: { ...diagnostics, mode: "attached" },
       };
     return { status: "supported", code: null, reason: null, diagnostics };
   }

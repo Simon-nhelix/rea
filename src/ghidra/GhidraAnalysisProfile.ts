@@ -1,3 +1,4 @@
+import type { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import type {
   AnalysisProfileResolution,
   ProviderIdentity,
@@ -85,12 +86,15 @@ export const resolveGhidraAnalysisProfile = async (
   target: BinaryTarget,
   identity: ProviderIdentity,
   installation: GhidraInstallationInspection,
+  resources: ArtifactResourceScope,
   signal?: AbortSignal,
   languageOverride?: GhidraLanguageOverride,
   disabledAnalyzers?: readonly string[],
 ): Promise<Result<AnalysisProfileResolution, AnalysisError>> => {
   if (signal?.aborted === true)
-    return Promise.resolve(err(new AnalysisCancelledError("open_binary")));
+    return Promise.resolve(
+      err(new AnalysisCancelledError("open_binary", { cause: signal.reason })),
+    );
   if (target.kind !== "executable")
     return Promise.resolve(ok({ profile: null }));
   if (installation.status === "unavailable")
@@ -118,7 +122,7 @@ export const resolveGhidraAnalysisProfile = async (
       ),
     );
   const pspExtension = isGhidraPspTarget(target)
-    ? await resolveGhidraPspExtension(installation, signal)
+    ? await resolveGhidraPspExtension(installation, resources, signal)
     : null;
   if (pspExtension !== null && !pspExtension.ok) return pspExtension;
   const provider = { ...identity, version: installation.providerVersion };
@@ -363,7 +367,7 @@ export const resolveGhidraAnalysisProfile = async (
           ? {
               load_image_evidence: dosCom
                 ? "independent-com-mapping-context-v1"
-                : "independent-mz-mapping-relocations-v1",
+                : "independent-mz-mapping-relocations-v2",
             }
           : {}),
         jump_table_evidence: "typed-case-default-blocks-v1",

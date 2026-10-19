@@ -12,6 +12,7 @@ export const BINARY_ARCHITECTURES = [
   "arm64",
   "6502",
   "huc6280",
+  "m68k",
 ] as const satisfies readonly BinaryArchitecture[];
 
 /** Provider-neutral CPU family for a caller-supplied raw-binary load. */
@@ -85,7 +86,9 @@ export interface RawBinaryAdmissionRejection {
 const addressWidth = (architecture: BinaryArchitecture): bigint =>
   architecture === "6502" || architecture === "huc6280"
     ? 0xffffn
-    : architecture === "x86" || architecture === "arm"
+    : architecture === "x86" ||
+        architecture === "arm" ||
+        architecture === "m68k"
       ? 0xffffffffn
       : 0xffffffffffffffffn;
 
@@ -100,7 +103,7 @@ export const admitRawBinary = (input: {
   if (!architecture.success)
     return err({
       reason:
-        "raw-binary format requires architecture (x86, x86_64, arm, arm64, 6502, or huc6280)",
+        "raw-binary format requires architecture (x86, x86_64, arm, arm64, 6502, huc6280, or m68k)",
       constraint: "load_selection_rejected",
     });
   if (typeof input.entryPoint !== "string")
@@ -121,6 +124,12 @@ export const admitRawBinary = (input: {
   )
     return err({
       reason: `raw-binary ${architecture.data} entry_point ${entry.value.canonical} must be 4-byte aligned`,
+      constraint: "load_selection_rejected",
+    });
+  // 68000-family instruction words are fetched from even addresses.
+  if (architecture.data === "m68k" && entry.value.value % 2n !== 0n)
+    return err({
+      reason: `raw-binary m68k entry_point ${entry.value.canonical} must be 2-byte aligned`,
       constraint: "load_selection_rejected",
     });
   const length = validateRawBinaryLength(input.fileBytes);

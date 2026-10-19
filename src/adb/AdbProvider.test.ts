@@ -568,7 +568,7 @@ it.each([
   async (_, stderr, excerpt) => {
     const { binary } = await writeAdbStub(
       () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
-if [ "$1" = "-s" ]; then printf '%s\\n' "${stderr.replace(/'/gu, "'\\''")}" >&2; exit 1; fi`,
+if [ "$1" = "-s" ]; then printf '%s\\n' "${stderr}" >&2; exit 1; fi`,
     );
     const projected = await refusedBy(providerOver(binary), {
       operation: "inspect_adb_device",
@@ -706,6 +706,50 @@ exit 1`,
   expect(result.total_bytes).toBe(34);
 });
 
+it("marks coverage partial when `pkg=null` leaves permissions unknown", async () => {
+  const { binary } = await writeAdbStub(
+    shellStub({
+      "dumpsys:package": `Packages:
+  Package [com.example] (abcdef):
+    userId=10234
+    pkg=null
+    versionCode=45 minSdk=24 targetSdk=34
+    codePath=/data/app/com.example
+`,
+    }),
+  );
+  const result = await evidenceResult(providerOver(binary), {
+    operation: "inspect_adb_package",
+    input: { serial: "emulator-5554", package: "com.example" },
+  });
+  expect(result).toMatchObject({
+    requested_permissions_count: null,
+    coverage: "partial",
+  });
+});
+
+it("keeps permission counts unknown when package state is not established", async () => {
+  const { binary } = await writeAdbStub(
+    shellStub({
+      "dumpsys:package": `Packages:
+  Package [com.example] (abcdef):
+    appId=10234
+    codePath=/data/app/com.example
+    versionCode=45 minSdk=24 targetSdk=34
+`,
+    }),
+  );
+  const result = await evidenceResult(providerOver(binary), {
+    operation: "inspect_adb_package",
+    input: { serial: "emulator-5554", package: "com.example" },
+  });
+  expect(result).toMatchObject({
+    version_code: "45",
+    requested_permissions_count: null,
+    coverage: "partial",
+  });
+});
+
 it("projects package details from dumpsys package output", async () => {
   const { binary } = await writeAdbStub(
     shellStub({
@@ -749,6 +793,7 @@ it.each(["9007199254740993", "-4294967296"])(
       shellStub({
         "dumpsys:package": `Packages:
   Package [com.example] (abcdef):
+    pkg=Package{abcdef com.example}
     versionCode=${versionCode} minSdk=24 targetSdk=34
 `,
       }),
@@ -759,6 +804,7 @@ it.each(["9007199254740993", "-4294967296"])(
     });
     expect(result).toMatchObject({
       version_code: versionCode,
+      requested_permissions_count: 0,
       coverage: "complete",
     });
   },
@@ -826,6 +872,137 @@ exit 1`,
     sha256: digest,
   });
 });
+
+it.each([
+  [
+    "pull_adb_file",
+    "adb: error: failed to stat remote object /sdcard/unauthorized.bin: No such file or directory",
+    "/sdcard/unauthorized.bin",
+  ],
+  [
+    "pull_adb_file",
+    "adb: error: failed to open /sdcard/unauthorized.bin: Permission denied",
+    "/sdcard/unauthorized.bin",
+  ],
+  [
+    "pull_adb_file",
+    "* daemon not running; starting now at tcp:5037\n* daemon started successfully\nadb: error: device offline",
+    "emulator-5554",
+  ],
+  ["pull_adb_file", "error: device unauthorized", "emulator-5554"],
+  [
+    "pull_adb_file",
+    "* daemon not running. starting it now on port 5037 *\r\n* daemon started successfully *\r\nerror: device offline",
+    "emulator-5554",
+  ],
+  [
+    "pull_adb_file",
+    "* daemon started successfully *\r\nerror: device 'emulator-5554' not found",
+    "emulator-5554",
+  ],
+  [
+    "push_adb_file",
+    "adb: error: connect failed: device offline",
+    "emulator-5554",
+  ],
+  ["push_adb_file", "error: device unauthorized", "emulator-5554"],
+  ["push_adb_file", "Permission denied", "/sdcard/unauthorized.bin"],
+] as const)(
+  "attributes %s refusal %s to %s",
+  async (operation, reason, path) => {
+    const { binary, root } = await writeAdbStub(
+      () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
+if [ "$1" != "-s" ] || [ "$2" != "emulator-5554" ]; then exit 91; fi
+if [ "$3" = "shell" ] && [ "$4" = "test" ] && [ "$6" = "/sdcard/unauthorized.bin" ]; then exit 1; fi
+if [ "$3:$4" = "pull:/sdcard/unauthorized.bin" ] || [ "$3:$5" = "push:/sdcard/unauthorized.bin" ]; then
+  printf '%s\\n' '${reason.replaceAll("'", "'\\''")}' >&2
+  exit 1
+fi
+exit 91`,
+    );
+    const localPath = join(root, "payload.bin");
+    await writeFile(localPath, "payload");
+    const input = {
+      serial: "emulator-5554",
+      device_path: "/sdcard/unauthorized.bin",
+    };
+    const projected = await refusedBy(
+      providerOver(binary),
+      operation === "pull_adb_file"
+        ? {
+            operation,
+            input: { ...input, output_directory: join(root, "pulls") },
+          }
+        : {
+            operation,
+            input: { ...input, local_path: localPath, overwrite: false },
+          },
+    );
+    expect(projected).toMatchObject({
+      code: "unsupported_target",
+      details: { operation, path, reason },
+      message: `Unsupported target for ${operation} at ${path}: ${reason}`,
+    });
+  },
+);
+
+it.each([
+  ["pull_adb_file", "cannot create '%s': Permission denied"],
+  ["pull_adb_file", "cannot create file/directory '%s': Permission denied"],
+  ["pull_adb_file", "cannot write '%s': Permission denied"],
+  ["push_adb_file", "cannot stat '%s': No such file or directory"],
+  ["push_adb_file", "opening '%s' locally failed: Permission denied"],
+  ["push_adb_file", "reading '%s' locally failed: Permission denied"],
+  ["push_adb_file", "failed to read all of '%s': Permission denied"],
+] as const)(
+  "keeps the actual host file identity for %s refusal %s",
+  async (operation, diagnostic) => {
+    const { binary, root } = await writeAdbStub(
+      (stubRoot) => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
+if [ "$1" != "-s" ] || [ "$2" != "emulator-5554" ]; then exit 91; fi
+if [ "$3" = "shell" ] && [ "$4" = "test" ]; then exit 1; fi
+if [ "$3" = "pull" ]; then
+  printf '%s' "$5" > '${stubRoot}/host-path'
+  printf "adb: error: ${diagnostic}\\n" "$5" >&2
+  exit 1
+fi
+if [ "$3" = "push" ]; then
+  printf '%s' "$4" > '${stubRoot}/host-path'
+  printf "adb: error: ${diagnostic}\\n" "$4" >&2
+  exit 1
+fi
+exit 91`,
+    );
+    const localPath = join(root, "payload.bin");
+    await writeFile(localPath, "payload");
+    const input = {
+      serial: "emulator-5554",
+      device_path: "/sdcard/sample.bin",
+    };
+    const projected = await refusedBy(
+      providerOver(binary),
+      operation === "pull_adb_file"
+        ? {
+            operation,
+            input: { ...input, output_directory: join(root, "pulls") },
+          }
+        : {
+            operation,
+            input: { ...input, local_path: localPath, overwrite: false },
+          },
+    );
+    const hostPath = await readFile(join(root, "host-path"), "utf8");
+    expect(projected).toMatchObject({
+      code: "unsupported_target",
+      details: {
+        operation,
+        path: hostPath,
+        reason: expect.stringContaining(hostPath),
+      },
+    });
+    expect(projected.message).toContain(`at ${hostPath}:`);
+  },
+);
 
 it.each([
   ["/data/local/tmp/..", "dot_segment"],
@@ -1067,7 +1244,10 @@ if [ "$1" = "-s" ]; then printf '%s\\n' "$3" >> "${stubRoot}/calls"; printf '%s\
       },
     });
     // Existence is unknown, so nothing is claimed about the path and no push runs.
-    expect(projected).toMatchObject({ code: "unsupported_target" });
+    expect(projected).toMatchObject({
+      code: "unsupported_target",
+      details: { path: "emulator-5554", reason: stderr },
+    });
     expect(projected.message).toContain(state);
     expect(projected.message).not.toContain("already exists");
     expect(await readFile(join(root, "calls"), "utf8")).toBe("shell\n");
@@ -1280,6 +1460,26 @@ it("inspects the display and window focus", async () => {
   );
 });
 
+// Older builds print `wm density` as a bare number; the display projection
+// must keep it as the physical density (morluto/rea#3942).
+it("keeps a bare numeric wm density as the physical density", async () => {
+  const { binary } = await writeAdbStub(
+    shellStub({
+      "wm:size": "Physical size: 1080x2340\n",
+      "wm:density": "420\n",
+    }),
+  );
+  const display = await evidenceResult(providerOver(binary), {
+    operation: "inspect_adb_display",
+    input: { serial: "emulator-5554" },
+  });
+  expect(display).toMatchObject({
+    physical_size: { width: 1080, height: 2340 },
+    physical_density: 420,
+    override_density: null,
+  });
+});
+
 it("reads Android 16 focus declarations from displays when windows omits them", async () => {
   const { binary } = await writeAdbStub(
     shellStub({
@@ -1296,8 +1496,8 @@ it("reads Android 16 focus declarations from displays when windows omits them", 
     focused_window: "Window{abc u0 com.example/.Main}",
     focused_app: "ActivityRecord{def u0 com.example/.Main t1}",
     observed_lines: [
-      "Window{abc u0 com.example/.Main}",
-      "ActivityRecord{def u0 com.example/.Main t1}",
+      "mCurrentFocus=Window{abc u0 com.example/.Main}",
+      "mFocusedApp=ActivityRecord{def u0 com.example/.Main t1}",
     ],
   });
   const execution = await providerOver(binary).execute({
@@ -1333,6 +1533,41 @@ it("describes missing window focus as unknown after both sections omit declarati
     expect.stringContaining("focus is unknown"),
   );
 });
+
+it.each(["windows", "displays"])(
+  "preserves explicitly absent focus from %s without another fallback",
+  async (section) => {
+    const declarations = "  mCurrentFocus=null\n  mFocusedApp=null\n";
+    const { binary } = await writeAdbStub(
+      shellStub({
+        "dumpsys:window:windows":
+          section === "windows" ? declarations : "no focus\n",
+        ...(section === "displays"
+          ? { "dumpsys:window:displays": declarations }
+          : {}),
+      }),
+    );
+    const execution = await providerOver(binary).execute({
+      operation: "inspect_adb_window",
+      input: { serial: "emulator-5554" },
+    });
+    expect(execution.ok).toBe(true);
+    if (!execution.ok) throw execution.error;
+    expect(execution.value.result).toMatchObject({
+      focused_window: null,
+      focused_app: null,
+      observed_lines: ["  mCurrentFocus=null", "  mFocusedApp=null"],
+    });
+    expect(execution.value.limitations).toContain(
+      `Focus declarations were read from \`dumpsys window ${section}\``,
+    );
+    expect(
+      execution.value.limitations.some((line) =>
+        line.includes("focus is unknown"),
+      ),
+    ).toBe(false);
+  },
+);
 
 it("reads one settings value and reports device-side nulls", async () => {
   const { binary } = await writeAdbStub(shellStub({ "settings:get": "1\n" }));
@@ -1460,7 +1695,7 @@ exit 1`,
 it("uninstalls a package and reports the device's refusal for absent ones", async () => {
   const { binary } = await writeAdbStub(
     () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
-if [ "$1" = "-s" ] && [ "$3" = "uninstall" ]; then printf 'Success\\n'; exit 0; fi
+if [ "$#" = 8 ] && [ "$1" = "-s" ] && [ "$3" = "shell" ] && [ "$4" = "pm" ] && [ "$5" = "uninstall" ] && [ "$6" = "--user" ] && [ "$7" = 0 ]; then printf 'Success\\n'; exit 0; fi
 exit 1`,
   );
   const removed = await evidenceResult(providerOver(binary), {
@@ -1471,7 +1706,7 @@ exit 1`,
 
   const { binary: refusing } = await writeAdbStub(
     () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
-if [ "$1" = "-s" ] && [ "$3" = "uninstall" ]; then printf 'Failure [not installed for 0]\\n'; exit 0; fi
+if [ "$#" = 8 ] && [ "$1" = "-s" ] && [ "$3" = "shell" ] && [ "$4" = "pm" ] && [ "$5" = "uninstall" ] && [ "$6" = "--user" ] && [ "$7" = 0 ]; then printf 'Failure [not installed for 0]\\n'; exit 0; fi
 exit 1`,
   );
   const projected = await refusedBy(providerOver(refusing), {
@@ -1515,7 +1750,7 @@ exit 1`,
 it("preserves the device's uninstall refusal when adb exits nonzero", async () => {
   const { binary } = await writeAdbStub(
     () => `if [ "$1" = "version" ]; then ${VERSION_BLOCK}; exit 0; fi
-if [ "$1" = "-s" ] && [ "$3" = "uninstall" ]; then printf 'Failure [not installed for 0]\\n'; exit 1; fi
+if [ "$#" = 8 ] && [ "$1" = "-s" ] && [ "$3" = "shell" ] && [ "$4" = "pm" ] && [ "$5" = "uninstall" ] && [ "$6" = "--user" ] && [ "$7" = 0 ]; then printf 'Failure [not installed for 0]\\n'; exit 1; fi
 exit 1`,
   );
   const projected = await refusedBy(providerOver(binary), {

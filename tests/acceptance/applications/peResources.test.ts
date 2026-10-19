@@ -92,6 +92,104 @@ const expectPeInputFailuresAcrossAdapters = async (input: {
 
 const contract = toolContract("inspect_pe_resources");
 
+const expectPeMappingOwnershipAcrossAdapters = async (
+  cli: TestCli,
+  client: Client,
+  root: string,
+): Promise<void> => {
+  for (const { name, payloadRva, payloadBytes, section, expectedOffset } of [
+    {
+      name: "empty-header",
+      payloadRva: 0x300,
+      payloadBytes: 0,
+      section: null,
+      expectedOffset: 0x300,
+    },
+    {
+      name: "header-section-collision",
+      payloadRva: 0x300,
+      payloadBytes: 0,
+      section: { rva: 0x300, bytes: 4 },
+      expectedOffset: null,
+    },
+    {
+      name: "empty-section-in-header",
+      payloadRva: 0x300,
+      payloadBytes: 4,
+      section: { rva: 0x301, bytes: 0 },
+      expectedOffset: 0x300,
+    },
+    {
+      name: "empty-section-in-resources",
+      payloadRva: null,
+      payloadBytes: 4,
+      section: { rva: 0x2001, bytes: 0 },
+      expectedOffset: "original",
+    },
+  ]) {
+    const fixture = peResourceFixture(false, [
+      { type: 10, name: 1, language: 1033, payload: Buffer.from("DATA") },
+    ]);
+    const data = fixture.dataOffsets[0] ?? 0;
+    let bytes = fixture.bytes;
+    const originalPayloadOffset = bytes.readUInt32LE(data) - 0x1c00;
+    if (payloadRva !== null) bytes.writeUInt32LE(payloadRva, data);
+    bytes.writeUInt32LE(payloadBytes, data + 4);
+    if (section !== null) {
+      bytes.writeUInt16LE(2, 0x86);
+      const at = fixture.sectionAt + 40;
+      bytes.writeUInt32LE(section.bytes, at + 8);
+      bytes.writeUInt32LE(section.rva, at + 12);
+      bytes.writeUInt32LE(section.bytes, at + 16);
+      bytes.writeUInt32LE(bytes.length, at + 20);
+      bytes = Buffer.concat([bytes, Buffer.alloc(section.bytes)]);
+    }
+    const path = join(root, `${name}.exe`);
+    await writeFile(path, bytes);
+    if (expectedOffset === null) {
+      await expectPeInputFailureAcrossAdapters({
+        cli,
+        client,
+        toolName: contract.name,
+        path,
+        reason: "invalid_format",
+      });
+      continue;
+    }
+    const result = await cli.run({
+      arguments: ["inspect-pe-resources", path, "--json"],
+    });
+    expect(result.exitCode, name).toBe(0);
+    const evidence = contract.outputSchema.parse(result.json);
+    const response = await client.callTool({
+      name: contract.name,
+      arguments: { path },
+    });
+    expect(response.isError, name).not.toBe(true);
+    const mcp = contract.outputSchema.parse(response.structuredContent);
+    expect(mcp.subject).toEqual(evidence.subject);
+    expect(mcp.evidence_id).toBe(evidence.evidence_id);
+    expect(mcp.normalized_result).toEqual(evidence.normalized_result);
+    expect(evidence.normalized_result).toMatchObject({
+      coverage: { status: "complete", resources: 1 },
+      resources: [
+        {
+          payload: {
+            location: {
+              offset:
+                expectedOffset === "original"
+                  ? originalPayloadOffset
+                  : expectedOffset,
+              bytes: payloadBytes,
+            },
+          },
+        },
+      ],
+    });
+    expect(await readFile(path)).toEqual(bytes);
+  }
+};
+
 const expectPeInventoriesAcrossAdapters = async (
   cli: TestCli,
   client: Client,
@@ -123,6 +221,7 @@ const expectPeInventoriesAcrossAdapters = async (
     expect(evidence.subject?.digest).toMatchObject({
       sha256: createHash("sha256").update(fixture.bytes).digest("hex"),
     });
+    expect(evidence.subject?.architecture).toBe(plus ? "x86_64" : "x86");
     expect(report.coverage).toMatchObject({
       status: "complete",
       resources: 5,
@@ -158,6 +257,7 @@ const expectPeInventoriesAcrossAdapters = async (
     });
     expect(response.isError).not.toBe(true);
     const mcp = contract.outputSchema.parse(response.structuredContent);
+    expect(mcp.subject).toEqual(evidence.subject);
     expect(mcp.evidence_id).toBe(evidence.evidence_id);
     expect(mcp.normalized_result).toEqual(evidence.normalized_result);
     const text = response.content.find(({ type }) => type === "text");
@@ -201,6 +301,7 @@ cliTest(
         "inspect_pe_resources",
       );
       await expectPeInventoriesAcrossAdapters(cli, client, root);
+      await expectPeMappingOwnershipAcrossAdapters(cli, client, root);
       await expectPePaddingFailureAcrossAdapters({
         cli,
         client,

@@ -1,4 +1,12 @@
-import { access, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  readFile,
+  rm,
+  writeFile,
+  open,
+  stat,
+  type FileHandle,
+} from "node:fs/promises";
 import { dirname } from "node:path";
 
 import { describe, expect, it, onTestFinished, vi } from "vitest";
@@ -6,6 +14,8 @@ import { z } from "zod";
 
 import { AnalysisCancelledError } from "../../../../src/domain/analysisErrorCore.js";
 import { EvidenceIntegrityError } from "../../../../src/domain/evidenceErrors.js";
+import { ArtifactFileCleanupFailure } from "../../../../src/artifacts/ArtifactFileOperation.js";
+import { resolvedAnalysisError } from "../../../../src/domain/analysisErrorBase.js";
 import { projectAnalysisError } from "../../../../src/domain/analysisErrorProjection.js";
 import { nativeCallObservationInputSchema } from "../../../../src/domain/native/nativeCallObservation.js";
 import { nativeCallPartialObservationSchema } from "../../../../src/domain/native/nativeCallPartialObservation.js";
@@ -86,6 +96,7 @@ const configSchema = z.object({
   observation_path: z.string(),
   stdout_capture_path: z.string(),
   stderr_capture_path: z.string(),
+  pid_path: z.string(),
 });
 
 const configFromArguments = async (arguments_: readonly string[]) => {
@@ -145,7 +156,15 @@ const fixtureTracer = (
       if (configPath === undefined)
         throw new Error("fake LLDB launcher was not called");
       const root = dirname(configPath);
-      await expect(access(root)).rejects.toThrow();
+      if (outcome === "cancelled") await expect(access(root)).rejects.toThrow();
+      else {
+        // The simulated launcher reported incomplete cleanup without returning
+        // its process owner. That absence cannot establish completion.
+        await expect(access(root)).resolves.toBeUndefined();
+        onTestFinished(async () => {
+          await rm(root, { recursive: true, force: true });
+        });
+      }
     },
   };
 };
@@ -247,6 +266,60 @@ describe("LLDB completed trace retention through finalization", () => {
 });
 
 describe("LLDB failure retention through the production tracer", () => {
+  it("treats an invalid UTF-8 tracer result as unavailable and retains journal facts", async () => {
+    let configPath: string | undefined;
+    const tracer = new LldbCallTracer(
+      {},
+      async (_executable, arguments_) => {
+        const resolved = await configFromArguments(arguments_);
+        configPath = resolved.configPath;
+        await writeFile(
+          resolved.config.observation_path,
+          `${JSON.stringify({ kind: "event", event: EVENT })}\n`,
+        );
+        await writeFile(
+          resolved.config.result_path,
+          Buffer.concat([
+            Buffer.from('{"status":"tracer-error","error":"before'),
+            Buffer.from([0xff]),
+            Buffer.from('after"}'),
+          ]),
+        );
+        return {
+          kind: "exited",
+          targetLaunched: false,
+          exitCode: 1,
+          output: "invalid UTF-8 tracer result",
+          targetIdentity: undefined,
+          cleanupFailure: undefined,
+        };
+      },
+      async () => ok(fakeTool),
+    );
+
+    const result = await tracer.trace(request);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("Expected unavailable tracer result");
+    expect(result.error).toMatchObject({
+      _tag: "ProviderAdapterError",
+      diagnostics: { reason: "LLDB exited without a usable tracer result" },
+      partialObservation: { events: [EVENT] },
+    });
+    expect(result.error.cause).toMatchObject({
+      code: "ERR_ENCODING_INVALID_ENCODED_DATA",
+    });
+    expect(result.error.secondaryFailures).toHaveLength(1);
+    expect(result.error.secondaryFailures[0]?.cause).toBeInstanceOf(
+      AggregateError,
+    );
+    if (configPath === undefined)
+      throw new Error("LLDB fixture did not launch");
+    await expect(access(dirname(configPath))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
   it("waits for an active trace before client close removes its runtime root", async () => {
     const launchGate = createDeferred<void>();
     const launchStarted = createDeferred<void>();
@@ -547,3 +620,403 @@ describe("LLDB retains ambiguous target ownership", () => {
     }
   });
 });
+
+it("retains journal descriptor cleanup after a cancelled run instead of removing its runtime", async () => {
+  let release: (() => Promise<void>) | undefined;
+  let restoreRead: (() => void) | undefined;
+  let captured: FileHandle | undefined;
+  let allowClose = false;
+  let configPath: string | undefined;
+  let attempts = 0;
+  const tracer = new LldbCallTracer(
+    {},
+    async (_executable, args) => {
+      const resolved = await configFromArguments(args);
+      configPath = resolved.configPath;
+      await writeFile(
+        resolved.config.observation_path,
+        JSON.stringify({
+          kind: "other-stop",
+          reason: "controlled journal fact",
+        }) + "\n",
+      );
+      const probe = await open(resolved.config.observation_path, "r");
+      const prototype = Object.getPrototypeOf(probe) as FileHandle;
+      await probe.close();
+      const original = prototype.read;
+      const read = vi
+        .spyOn(prototype, "read")
+        .mockImplementationOnce(async function (
+          this: FileHandle,
+          ...parameters: Parameters<FileHandle["read"]>
+        ) {
+          captured = this;
+          release = this.close.bind(this);
+          this.close = async () => {
+            attempts += 1;
+            if (!allowClose)
+              throw new Error("controlled journal descriptor close failure");
+            await release!();
+          };
+          return Reflect.apply(original, this, parameters);
+        });
+      restoreRead = () => read.mockRestore();
+      return {
+        kind: "cancelled",
+        targetLaunched: false,
+        targetIdentity: undefined,
+        cleanupFailure: undefined,
+      };
+    },
+    async () => ok(fakeTool),
+  );
+  onTestFinished(async () => {
+    restoreRead?.();
+    allowClose = true;
+    await tracer.close();
+    await release?.();
+  });
+  const result = await tracer.trace(request);
+  expect(result.ok).toBe(false);
+  if (result.ok) throw new Error("Expected cancelled controlled run");
+  const partial = nativeCallPartialObservationSchema.parse(
+    result.error.partialObservation,
+  );
+  expect(partial.process.other_stops).toEqual(["controlled journal fact"]);
+  expect(attempts).toBeGreaterThan(0);
+  if (configPath === undefined)
+    throw new Error("Expected owned runtime config path");
+  const rootRetained = await access(dirname(configPath)).then(
+    () => true,
+    () => false,
+  );
+  expect({
+    cleanupIncomplete: result.error.cleanupIncomplete,
+    rootRetained,
+    descriptorStillOpen: captured !== undefined && captured.fd >= 0,
+  }).toEqual({
+    cleanupIncomplete: true,
+    rootRetained: true,
+    descriptorStillOpen: true,
+  });
+  expect((await tracer.close()).ok).toBe(false);
+  allowClose = true;
+  expect((await tracer.close()).ok).toBe(true);
+  expect(result.error.cleanupIncomplete).toBe(false);
+  await expect(access(dirname(configPath))).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+});
+
+/** Write the complete producer facts used by readback ownership controls. */
+const writeReadbackFixture = async (
+  config: z.infer<typeof configSchema>,
+  stdout: string,
+  stderr: string,
+) => {
+  await writeFile(
+    config.observation_path,
+    JSON.stringify({ kind: "event", event: EVENT }) + "\n",
+  );
+  await writeFile(config.stdout_capture_path, stdout);
+  await writeFile(config.stderr_capture_path, stderr);
+  await writeFile(config.pid_path, "12345\n");
+  await writeFile(
+    config.result_path,
+    JSON.stringify({
+      ...successfulTracerOutput,
+      target_output: {
+        ...successfulTracerOutput.target_output,
+        stdout_bytes: Buffer.byteLength(stdout),
+        stderr_bytes: Buffer.byteLength(stderr),
+      },
+    }),
+  );
+};
+
+const readbackPath = (
+  config: z.infer<typeof configSchema>,
+  selected: "journal" | "stdout" | "stderr" | "result" | "pid",
+): string =>
+  ({
+    journal: config.observation_path,
+    stdout: config.stdout_capture_path,
+    stderr: config.stderr_capture_path,
+    result: config.result_path,
+    pid: config.pid_path,
+  })[selected];
+
+const controlReadbackDescriptor = async (options: {
+  readonly path: string;
+  readonly selected: "journal" | "stdout" | "stderr" | "result" | "pid";
+  readonly readFails: boolean;
+  readonly readFailsAfterPrefix: boolean;
+  readonly cancels: boolean;
+  readonly controller: AbortController;
+  readonly reason: unknown;
+  readonly physicalFailure: Error;
+}) => {
+  const selectedStat = await stat(options.path);
+  const probe = await open(options.path, "r");
+  const prototype = Object.getPrototypeOf(probe) as FileHandle;
+  await probe.close();
+  let captured: FileHandle | undefined;
+  let originalClose: (() => Promise<void>) | undefined;
+  let allowClose = false;
+  let partialReadAttempted = false;
+  const arm = async (file: FileHandle) => {
+    if (captured !== undefined) return;
+    const metadata = await file.stat();
+    if (metadata.ino !== selectedStat.ino || metadata.dev !== selectedStat.dev)
+      return;
+    captured = file;
+    originalClose = file.close.bind(file);
+    file.close = async () => {
+      if (!allowClose) {
+        if (options.cancels) options.controller.abort(options.reason);
+        throw new Error("controlled selected descriptor cleanup failure");
+      }
+      await originalClose!();
+    };
+  };
+  const readMethod = prototype.read;
+  const readFileMethod = prototype.readFile;
+  const read = vi.spyOn(prototype, "read").mockImplementation(async function (
+    this: FileHandle,
+    ...parameters: Parameters<FileHandle["read"]>
+  ) {
+    await arm(this);
+    if (options.readFails && captured === this) throw options.physicalFailure;
+    if (options.readFailsAfterPrefix && captured === this) {
+      if (partialReadAttempted) throw options.physicalFailure;
+      partialReadAttempted = true;
+      const [buffer, offset, length, position] = parameters as unknown as [
+        Buffer,
+        number,
+        number,
+        number,
+      ];
+      const prefixLength =
+        options.selected === "journal"
+          ? Buffer.byteLength(
+              JSON.stringify({ kind: "event", event: EVENT }) + "\n",
+            )
+          : 4;
+      return Reflect.apply(readMethod, this, [
+        buffer,
+        offset,
+        Math.min(prefixLength, length),
+        position,
+      ]);
+    }
+    return Reflect.apply(readMethod, this, parameters);
+  });
+  const readFile = vi
+    .spyOn(prototype, "readFile")
+    .mockImplementation(async function (
+      this: FileHandle,
+      ...parameters: Parameters<FileHandle["readFile"]>
+    ) {
+      await arm(this);
+      return Reflect.apply(readFileMethod, this, parameters);
+    });
+  return {
+    get captured() {
+      return captured;
+    },
+    allowClose() {
+      allowClose = true;
+    },
+    restore() {
+      read.mockRestore();
+      readFile.mockRestore();
+    },
+    closeCaptured() {
+      return originalClose?.();
+    },
+  };
+};
+
+interface ReadbackCase {
+  readonly selected: "journal" | "stdout" | "stderr" | "result" | "pid";
+  readonly readFails: boolean;
+  readonly readFailsAfterPrefix?: boolean;
+  readonly rootFails: boolean;
+  readonly cancels: boolean;
+}
+
+const readbackCases: readonly ReadbackCase[] = [
+  ...(["journal", "stdout", "stderr", "result", "pid"] as const).map(
+    (selected) => ({
+      selected,
+      readFails: false,
+      rootFails: false,
+      cancels: false,
+    }),
+  ),
+  {
+    selected: "stdout" as const,
+    readFails: true,
+    readFailsAfterPrefix: false,
+    rootFails: false,
+    cancels: false,
+  },
+  {
+    selected: "stdout" as const,
+    readFails: false,
+    readFailsAfterPrefix: true,
+    rootFails: false,
+    cancels: false,
+  },
+  {
+    selected: "journal" as const,
+    readFails: false,
+    readFailsAfterPrefix: true,
+    rootFails: false,
+    cancels: true,
+  },
+  {
+    selected: "stdout" as const,
+    readFails: false,
+    rootFails: true,
+    cancels: false,
+  },
+  {
+    selected: "stdout" as const,
+    readFails: false,
+    rootFails: false,
+    cancels: true,
+  },
+];
+for (const {
+  selected,
+  readFails,
+  readFailsAfterPrefix = false,
+  rootFails,
+  cancels,
+} of readbackCases)
+  it(`retains ${selected} readback cleanup and sibling facts (read fails: ${readFails || readFailsAfterPrefix}, root fails: ${rootFails})`, async () => {
+    const controller = new AbortController();
+    const reason = { caller: "readback-final-close" };
+    let launches = 0;
+    let runtime: string | undefined;
+    let descriptorControl:
+      | Awaited<ReturnType<typeof controlReadbackDescriptor>>
+      | undefined;
+    let restoreRoot: (() => void) | undefined;
+    const physicalFailure = new Error("controlled capture read failure");
+    const tracer = new LldbCallTracer(
+      {},
+      async (_executable, args) => {
+        launches++;
+        const { config } = await configFromArguments(args);
+        runtime = dirname(config.result_path);
+        await writeReadbackFixture(config, "stdout fact", "stderr fact");
+        const journalRow =
+          JSON.stringify({ kind: "event", event: EVENT }) + "\n";
+        if (selected === "journal" && readFailsAfterPrefix)
+          await writeFile(config.observation_path, journalRow + '{"kind":');
+        descriptorControl = await controlReadbackDescriptor({
+          path: readbackPath(config, selected),
+          selected,
+          readFails,
+          readFailsAfterPrefix,
+          cancels,
+          controller,
+          reason,
+          physicalFailure,
+        });
+        return selected === "journal"
+          ? {
+              kind: "cancelled",
+              targetLaunched: false,
+              targetIdentity: undefined,
+              cleanupFailure: undefined,
+            }
+          : {
+              kind: "exited",
+              targetLaunched: false,
+              targetIdentity: undefined,
+              cleanupFailure: undefined,
+              exitCode: 0,
+              output: "",
+            };
+      },
+      async () => ok(fakeTool),
+    );
+    onTestFinished(async () => {
+      descriptorControl?.restore();
+      restoreRoot?.();
+      descriptorControl?.allowClose();
+      await tracer.close();
+      await descriptorControl?.closeCaptured();
+    });
+    const result = await tracer.trace(request, controller.signal);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("Expected retained readback cleanup");
+    expect(result.error.cleanupIncomplete).toBe(true);
+    const partial = nativeCallPartialObservationSchema.parse(
+      result.error.partialObservation,
+    );
+    expect(partial.events).toEqual([EVENT]);
+    if (selected === "pid") expect(partial.process.pid).toBe(12345);
+    if (readFails) {
+      expect(partial.process.stdout).toBeNull();
+      const primary = result.error.cleanupPrimary;
+      if (!(primary?.cause instanceof AggregateError))
+        throw new Error("Expected retained capture read failure");
+      const frame = primary.cause.errors[0];
+      if (!(frame instanceof ArtifactFileCleanupFailure))
+        throw new Error("Expected exact file cleanup outcome");
+      expect(frame.fileCleanupFailure.outcome).toEqual({
+        kind: "failed",
+        cause: physicalFailure,
+      });
+    } else if (readFailsAfterPrefix && selected === "stdout") {
+      expect(partial.process.stdout).toMatchObject({
+        text: "stdo",
+        truncated: true,
+        complete: false,
+      });
+      const primary = result.error.cleanupPrimary;
+      if (!(primary?.cause instanceof AggregateError))
+        throw new Error("Expected retained capture read failure");
+      expect(primary.cause.errors).toContain(physicalFailure);
+    } else if (readFailsAfterPrefix) {
+      const primary = result.error.cleanupPrimary ?? result.error;
+      expect(primary.cause).toBe(reason);
+      expect(primary.secondaryFailures).toHaveLength(1);
+      expect(primary.secondaryFailures[0]?.cause).toBe(physicalFailure);
+    } else expect(partial.process.stdout?.text).toBe("stdout fact");
+    expect(partial.process.stderr?.text).toBe("stderr fact");
+    expect(descriptorControl?.captured?.fd).toBeGreaterThanOrEqual(0);
+    if (runtime === undefined) throw new Error("Missing owned runtime");
+    await expect(access(runtime)).resolves.toBeUndefined();
+    const replacement = await tracer.trace(request);
+    expect(replacement.ok).toBe(false);
+    expect(launches).toBe(1);
+    descriptorControl?.allowClose();
+    if (rootFails) {
+      const close = vi
+        .spyOn(PrivateRuntimeRoot.prototype, "close")
+        .mockRejectedValueOnce(new Error("controlled parent cleanup failure"));
+      restoreRoot = () => close.mockRestore();
+      const rootRetry = await tracer.close();
+      expect(rootRetry.ok).toBe(false);
+      expect(descriptorControl?.captured?.fd).toBe(-1);
+      expect(result.error.cleanupIncomplete).toBe(true);
+      expect(result.error.cleanupResources).toEqual([runtime]);
+      expect((await tracer.close()).ok).toBe(true);
+      if (!rootRetry.ok) expect(rootRetry.error.cleanupIncomplete).toBe(false);
+    } else expect((await tracer.close()).ok).toBe(true);
+    expect(result.error.cleanupIncomplete).toBe(false);
+    if (cancels)
+      expect(resolvedAnalysisError(result.error)).toMatchObject({
+        _tag: "AnalysisCancelledError",
+        cause: reason,
+      });
+    expect(result.error.cleanupResources).toEqual([]);
+    if (!replacement.ok)
+      expect(replacement.error.cleanupIncomplete).toBe(false);
+    await expect(access(runtime)).rejects.toMatchObject({ code: "ENOENT" });
+  });

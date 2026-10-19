@@ -132,6 +132,12 @@ is null. `total` counts all matching heads; each page preserves complete records
 in stable unknown ID order. Filters apply before paging. Pages reflect current
 session state, so keep the unknown ledger unchanged while traversing it.
 
+Automatically retained workflow questions include their immutable result
+Evidence ID. Distinct results retain independent questions and source links;
+repeating the same result does not create another unknown. Workflow Evidence
+keeps the original residual question text. Explicit `record_unknown` requests
+keep caller-selected identity and reject duplicate creation.
+
 For a portable exported bundle, the CLI shares this projection:
 `rea inspect-evidence-bundle '{"path":"/tmp/evidence.json","detail":"summary","filters":{"operation":"analyze_function"}}' --format json`.
 The CLI validates and materializes that local bundle under its existing memory
@@ -209,6 +215,14 @@ segments are inferences. Because paging follows the full grouping, every page is
 inferred Evidence whenever any group is templated, and derived Evidence only when
 no group was templated.
 See [derived API surfaces](web-network-captures.md#derived-api-surface).
+
+`inspect_analysis_view` also accepts `environment-manifest` for retained HAR capture
+Evidence, projecting the primary origin's request lines into named tools with path
+templates, parameters, observed query names, value-free body shapes and record
+pointers, plus excluded groups and three fixed unknowns. Templates, parameters and
+names are inferences; the Evidence is inferred whenever any tool or excluded group
+is templated, and derived otherwise.
+See [environment manifests](web-network-captures.md#environment-manifest).
 
 `inspect_analysis_view` projects a caller-selected view of already completed
 `inspect_binary_layout`, `analyze_javascript_application`, or `analyze_function`
@@ -355,6 +369,17 @@ checking that a client received the full catalog. An operation absent from all
 groups is missing from the complete inventory; it is not an implicit
 unavailable entry.
 
+`get_call_graph` and `trace_call_path` report `forward` and `backward` modes.
+Each requires `procedure_address` plus `procedure_callees` or `procedure_callers`,
+respectively. The tool is available when either traversal mode is supported;
+`default_mode_available` describes the default forward direction. Read each mode's
+missing operations and remediation before selecting a direction. These facts
+describe traversal prerequisites, not relationship completeness or a guarantee
+for every selector. A trace whose start and goal resolve to the same address can
+finish without reading relationships, even when neither traversal mode is
+available. Discovery does not block that direct invocation or replace its typed
+partial/error outcomes.
+
 The `effects` and `annotations` arrays list the true members of their fixed
 vocabularies. A known member omitted from either array is false. This applies
 only to these closed flag sets; it does not make an omitted tool, provider, mode,
@@ -435,6 +460,9 @@ Provider calls receive the request cancellation signal. Artifact traversal,
 hashing, version comparisons, Hopper requests, and process capture
 check the same signal. Cancellation is distinct from timeout. A cleanup failure
 uses `cleanup_incomplete` and lists only the owned resource kinds that remain.
+Once those owners confirm cleanup, composed failures recover their original
+typed primary outcome and recovery guidance. Historical composition diagnostics
+remain in `details.cleanup_history`, separate from the primary diagnostics.
 An atomic Evidence bundle or snapshot write can publish its complete output
 before staging cleanup fails. In that case, `details.published: true`,
 `details.published_path`, and `details.bytes` retain the publication receipt.
@@ -521,6 +549,12 @@ analysis runtime. These failures are reported at the operation that needs
 them. A configured provider or an endpoint alone does not establish that a
 target is supported.
 
+Composite Hopper regex searches report failures against the accepted
+`search_strings` or `search_procedures` operation. The underlying inventory
+method and request ID remain in `details.diagnostics.provider_request`, with
+the bridge error code and diagnostic type when available. Reattribution
+preserves the failure class, captured output, and live cleanup ownership.
+
 Evidence bundles, snapshots, and extraction use the paths and output behavior
 declared by their tools. Artifact extraction materializes the selected regular
 files into a fresh REA-chosen temporary directory and reports its path.
@@ -530,6 +564,25 @@ and returns its result and Evidence inline. Its owned analysis worker and privat
 temporary source files are declared as `launchesProcess` and `writesFilesystem`,
 including for a single JavaScript source. This internal analysis does not execute
 the supplied application code.
+
+## Static Ghidra bytes and source mappings
+
+`read_bytes` returns initialized analysis memory, including loader fixups, rather
+than live process memory. Check `returned_bytes` and `complete` before decoding:
+reads stop at unmapped or uninitialized bytes. Missing bytes are unknown; do not
+pad an incomplete read with zeros and treat the result as an observation.
+
+`list_segments` reports memory-block initialization and address-space facts.
+`address_to_file_offset` maps one address through the provider's source-byte
+mapping. A successful start-address mapping does not establish that an entire
+range is contiguous in the original file, or that its bytes equal analysis
+memory after loader fixups. Uninitialized, missing, and ambiguous mappings fail
+explicitly; preserve the reported failure rather than guessing an offset.
+
+For constructor-populated pointer or resource slots, a static zero is not proof
+of a later null value. Inspect the slot's `xrefs` and the writer's assembly or
+pseudocode, retaining uncertainty about execution order and runtime values.
+These operations inspect static evidence and do not execute the target.
 
 ## Ghidra first-query deadlines and recovery
 
@@ -828,6 +881,21 @@ retain limitations from the selected dimension; an overall function claim
 includes all dimension limitations. Equal CFGs establish only equal observed
 block sizes and successor relationships. Text from different provider
 identities remains unknown.
+
+The `references` dimension preserves each edge's direction, endpoint identity
+and available kind facts. Within one artifact it compares exact raw endpoint
+coordinates, including the address space; hexadecimal case and zero padding
+do not change identity. Resolving an endpoint to a containing procedure does
+not replace the raw coordinate. Unparseable coordinates stay unknown.
+
+Across artifacts, reference endpoints use stable procedure names. Missing or
+address-generated names remain unknown. A name observed at multiple procedure
+entries retains its label constraint but cannot establish equal endpoints.
+Pairing preserves duplicate counts and considers alternative compatible
+pairings; array order never identifies an edge. Compatible records with
+unknown endpoint identity or kind facts remain `unknown`. Independent known
+facts that contradict every possible pairing still establish `changed`.
+Source Evidence retains the original addresses, names and unavailable facts.
 
 ### Comparison input shapes
 

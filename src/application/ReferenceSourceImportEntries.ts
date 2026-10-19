@@ -157,6 +157,8 @@ const readPackageMains = (
 const RESOLUTION_SUFFIXES: readonly (readonly string[])[] = [
   [""],
   [".ts"],
+  [".mts"],
+  [".cts"],
   [".js"],
   [".mjs"],
   [".cjs"],
@@ -417,6 +419,10 @@ export const parseReferenceSourceEntries = (
     parseFailures: [],
     limitations: [...read.limitations],
   };
+  if (read.rootFailure !== undefined)
+    output.limitations.push(
+      `Reference root enumeration is incomplete: ${read.rootFailure.message}`,
+    );
   const packageMainInventory = readPackageMains(read);
   const context: SpecifierContext = {
     lookupPath: createReferenceSourcePathLookup(filePaths),

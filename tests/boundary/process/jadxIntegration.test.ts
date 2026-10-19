@@ -1,20 +1,25 @@
-import { expect, it as test, vi } from "vitest";
+import { SdkErrorCode } from "@modelcontextprotocol/client";
+import { expect, it as test, onTestFinished, vi } from "vitest";
 import { access, readFile, truncate, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { parseBinaryTarget } from "../../../src/application/BinaryTargetResolver.js";
 import { AndroidAnalysisService } from "../../../src/application/android/AndroidAnalysisService.js";
 import { JadxProvider } from "../../../src/android/JadxProvider.js";
 import { JadxSession } from "../../../src/android/JadxSession.js";
 import { androidResultSchemas } from "../../../src/domain/android/androidAnalysis.js";
+import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
 import { snapshotAndroidEngine } from "../../../src/android/AndroidTargetSnapshot.js";
 import { hashStableFile } from "../../../src/filesystem/StableFileHash.js";
 import { OwnedFileHandle } from "../../../src/filesystem/OwnedFileHandle.js";
 import { RegularFileCleanupFailure } from "../../../src/filesystem/OwnedRegularFile.js";
 import { PrivateRuntimeRoot } from "../../../src/process/PrivateRuntimeRoot.js";
+import { spawnOwnedProviderProcess } from "../../../src/process/ProviderProcess.js";
 import {
   createJadxProtocolFixture as setup,
   verifyJadxFixtureCleanup as verifyCleanup,
 } from "../../fixtures/android/jadx.js";
 import { writeJadxJarInventory } from "../../fixtures/android/jadxJar.js";
+import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 const it = test.skipIf(process.platform === "win32");
 
@@ -446,19 +451,21 @@ it("retains APK identity, original input, raw producer data and normalized obser
   await verifyCleanup(launches);
 });
 
-it("fetches all class pages rather than silently retaining the first upstream page", async () => {
-  const { service, apk, launches, provider } = await setup();
+it("pages matching classes independently of the total APK class count", async () => {
+  const { service, apk, launches, provider } = await setup("large-inventory");
   const outcome = await service.execute("search_android_classes", {
     path: apk,
-    query: "",
+    query: "Class",
   });
   if (!outcome.ok) throw outcome.error;
   const result = androidResultSchemas.search_android_classes.parse(
     outcome.value.normalized_result,
   );
-  expect(result.total_classes).toBe(401);
-  expect(result.matches).toHaveLength(401);
-  expect(result.matches.at(-1)).toBe("fixture.Class399");
+  expect(result.total_classes).toBe(9001);
+  expect(result.matches).toHaveLength(9000);
+  expect(result.matches[0]).toBe("fixture.Class0");
+  expect(result.matches[4096]).toBe("fixture.Class4096");
+  expect(result.matches.at(-1)).toBe("fixture.Class8999");
   await provider.close();
   await verifyCleanup(launches);
 });
@@ -561,7 +568,7 @@ it.each([
   "empty-page",
   "summary-error",
   "wrong-method",
-  "body-error",
+  "wrong-descriptor",
   "partial-xrefs",
 ])(
   "rejects producer failure %s rather than claiming complete analysis",
@@ -668,6 +675,147 @@ it("cancels active and queued requests, cleans ownership and never launches a qu
   await verifyCleanup(launches);
 });
 
+it("ends each queued stalled operation at the caller-selected deadline and cleans ownership", async () => {
+  const { service, apk, launches, provider } = await setup(
+    "stall",
+    undefined,
+    undefined,
+    { REA_JADX_OPERATION_TIMEOUT_MS: "1500" },
+  );
+  const started = performance.now();
+  // The second request waits behind the first; its deadline starts at the
+  // queue front, so it gets its own engine launch and runtime reply.
+  const outcomes = await Promise.all([
+    service.execute("inspect_android_package", { path: apk }),
+    service.execute("inspect_android_package", { path: apk }),
+  ]);
+  expect(performance.now() - started).toBeLessThan(20_000);
+  for (const outcome of outcomes) {
+    expect(outcome).toMatchObject({
+      ok: false,
+      error: {
+        _tag: "AnalysisTimeoutError",
+        timeoutMs: 1500,
+        partialObservation: {
+          calls: [expect.objectContaining({ operation: "rea_jvm_status" })],
+        },
+      },
+    });
+    if (outcome.ok) throw new Error("Expected the selected deadline");
+    expect(projectAnalysisError(outcome.error)).toMatchObject({
+      code: "provider_timeout",
+      details: { timeout_ms: 1500 },
+    });
+  }
+  expect(launches).toHaveLength(2);
+  // The deadline path itself releases ownership before provider shutdown.
+  await verifyCleanup(launches);
+  await provider.close();
+});
+
+it("completes an operation under the largest accepted deadline", async () => {
+  const { service, apk, provider, launches } = await setup(
+    "normal",
+    undefined,
+    undefined,
+    { REA_JADX_OPERATION_TIMEOUT_MS: "2147483647" },
+  );
+  const outcome = await service.execute("inspect_android_package", {
+    path: apk,
+  });
+  expect(outcome.ok).toBe(true);
+  await provider.close();
+  await verifyCleanup(launches);
+});
+
+it.each(["", "2147483648"])(
+  "rejects REA_JADX_OPERATION_TIMEOUT_MS=%j before probing or launching Java",
+  async (value) => {
+    const { service, apk, launches, javaProbeCount } = await setup(
+      "normal",
+      undefined,
+      undefined,
+      { REA_JADX_OPERATION_TIMEOUT_MS: value },
+    );
+    const outcome = await service.execute("inspect_android_package", {
+      path: apk,
+    });
+    expect(outcome).toMatchObject({
+      ok: false,
+      error: {
+        _tag: "AnalysisCapabilityUnavailableError",
+        reason: expect.stringContaining("REA_JADX_OPERATION_TIMEOUT_MS"),
+      },
+    });
+    expect(launches).toHaveLength(0);
+    // The fake JDK records each module-listing probe; none may have run.
+    await expect(javaProbeCount()).rejects.toMatchObject({ code: "ENOENT" });
+  },
+);
+
+it("bounds each upstream call by the selected deadline instead of a fixed limit", async () => {
+  // Provider workflows cannot reach the former fixed 120-second call limit in
+  // a test, so exercise the session boundary that owns each upstream call.
+  const { apk } = await setup();
+  const target = await parseBinaryTarget(apk);
+  if (!target.ok) throw target.error;
+  const workspace = await createTestTempDirectory("rea-jadx-call-deadline-");
+  const pids: number[] = [];
+  const session = new JadxSession(
+    {
+      command: process.execPath,
+      arguments: [],
+      cwd: workspace,
+      hostEnvironment: process.env,
+      signal: new AbortController().signal,
+    },
+    async (options) => {
+      const spawned = await spawnOwnedProviderProcess({
+        ...options,
+        command: process.execPath,
+        arguments: [
+          fileURLToPath(
+            new URL("../../fixtures/android/jadx-mcp.mjs", import.meta.url),
+          ),
+        ],
+        expectedCommand: process.execPath,
+        env: { ...options.env, REA_FAKE_JADX_MODE: "stall" },
+      });
+      if (spawned.process.pid !== undefined) pids.push(spawned.process.pid);
+      return spawned;
+    },
+  );
+  onTestFinished(() => session.close());
+  try {
+    const started = performance.now();
+    await expect(
+      session.execute({
+        request: { operation: "inspect_android_package", input: { path: apk } },
+        target: target.value,
+        snapshot: apk,
+        jarHash: "0".repeat(64),
+        bridgeHash: "0".repeat(64),
+        signal: new AbortController().signal,
+        timeoutMs: 300,
+      }),
+    ).rejects.toMatchObject({
+      code: SdkErrorCode.RequestTimeout,
+      data: { timeout: 300 },
+    });
+    expect(performance.now() - started).toBeLessThan(10_000);
+    expect(session.partialObservation()?.calls).toEqual([
+      expect.objectContaining({ operation: "rea_jvm_status" }),
+    ]);
+  } finally {
+    await session.close();
+  }
+  expect(pids).toHaveLength(1);
+  for (const pid of pids)
+    expect(() => process.kill(-pid, 0)).toThrowError(
+      expect.objectContaining({ code: "ESRCH" }),
+    );
+});
+
 it("reports missing explicit tools without trying to install or launch them", async () => {
   const { apk } = await setup();
   const provider = new JadxProvider({}, () => {
@@ -686,19 +834,38 @@ it("reports missing explicit tools without trying to install or launch them", as
   });
 });
 
-it.each(["tool-error", "frame-overflow"])(
+it.each(["tool-error", "frame-overflow", "body-error", "heap-decoy"])(
   "preserves the actual failed provider constraint for %s",
   async (mode) => {
     const { service, apk, launches, provider } = await setup(mode);
-    const outcome = await service.execute("inspect_android_package", {
-      path: apk,
-    });
+    const outcome = await service.execute(
+      mode === "body-error"
+        ? "inspect_android_method"
+        : "inspect_android_package",
+      {
+        path: apk,
+        ...(mode === "body-error"
+          ? { class_name: "fixture.Target", method_name: "onCreate" }
+          : {}),
+      },
+    );
     if (outcome.ok) throw new Error("Expected a provider failure");
-    if (mode === "tool-error")
+    if (mode !== "frame-overflow")
       expect(outcome.error).toMatchObject({
         _tag: "ProviderAdapterError",
         diagnostics: {
-          reason: "manifest decoder rejected malformed binary XML",
+          upstream_operation:
+            mode === "body-error"
+              ? "get_method_body"
+              : mode === "heap-decoy"
+                ? "load_apk"
+                : "get_android_manifest",
+          reason:
+            mode === "body-error"
+              ? "// ERROR: decompile timed out or failed"
+              : mode === "heap-decoy"
+                ? "load failed: cannot read /inputs/Java heap space.apk"
+                : "manifest decoder rejected malformed binary XML",
         },
       });
     else
@@ -710,6 +877,88 @@ it.each(["tool-error", "frame-overflow"])(
     await verifyCleanup(launches);
   },
 );
+
+it.each(["heap-failure", "other-memory-failure"])(
+  "projects typed JVM memory failure and cleans its process for %s",
+  async (mode) => {
+    const { service, apk, launches, provider } = await setup(mode);
+    const outcome = await service.execute("inspect_android_package", {
+      path: apk,
+    });
+    if (outcome.ok) throw new Error("Expected memory allocation failure");
+    expect(outcome.error).toMatchObject({
+      _tag: "AnalysisResourceConstraintError",
+      resource: "memory",
+      retryable: false,
+      reportedLimits: {
+        observed_max_heap_bytes: 67108864,
+        memory_area: mode === "heap-failure" ? "heap" : "unknown",
+      },
+      diagnostics: { upstream_operation: "load_apk", target_path: apk },
+    });
+    const projected = projectAnalysisError(outcome.error);
+    expect(projected).toMatchObject({
+      code: "resource_constraint",
+      retryable: false,
+    });
+    expect(projected.remediation.action).toContain(
+      mode === "heap-failure"
+        ? "REA_JADX_HEAP_MIB"
+        : "increasing heap alone may not help",
+    );
+    await provider.close();
+    await verifyCleanup(launches);
+  },
+);
+
+it("retains typed memory failure through failed cleanup and restores it after retry", async () => {
+  let fails = true;
+  const { service, apk, launches, provider } = await setup(
+    "heap-failure",
+    () => fails,
+  );
+  const rootClose = vi
+    .spyOn(PrivateRuntimeRoot.prototype, "close")
+    .mockRejectedValueOnce(new Error("fixture workspace close failure"));
+  try {
+    const result = await service.execute("inspect_android_package", {
+      path: apk,
+    });
+    if (result.ok) throw new Error("Expected failed memory cleanup");
+    const failure = result.error;
+    expect(failure.cleanupIncomplete).toBe(true);
+    expect(projectAnalysisError(failure)).toMatchObject({
+      code: "cleanup_incomplete",
+      details: {
+        diagnostics: { primary_error: { code: "resource_constraint" } },
+      },
+    });
+    const workspace = launches[0]?.cwd;
+    expect(failure.cleanupResources).toContain(workspace);
+    fails = false;
+    await expect(provider.close()).rejects.toMatchObject({
+      cleanupIncomplete: true,
+    });
+    expect(failure.cleanupResources).toEqual([workspace]);
+    await provider.close();
+    expect(failure.cleanupIncomplete).toBe(false);
+    expect(failure.cleanupResources).toEqual([]);
+    expect(projectAnalysisError(failure)).toMatchObject({
+      code: "resource_constraint",
+      retryable: false,
+      remediation: { action: expect.stringContaining("REA_JADX_HEAP_MIB") },
+      details: {
+        resource: "memory",
+        reported_limits: { observed_max_heap_bytes: 67108864 },
+      },
+    });
+    await verifyCleanup(launches);
+  } finally {
+    rootClose.mockRestore();
+    fails = false;
+    await provider.close();
+  }
+});
 
 it("rejects bytes changed after target admission without launching an engine", async () => {
   const { provider, apk, launches } = await setup();
@@ -874,7 +1123,7 @@ it("retains the execution failure while cleanup is pending and resumes after cle
       error: {
         cleanupIncomplete: true,
         diagnostics: {
-          previous_error: {
+          primary_error: {
             details: {
               diagnostics: {
                 reason: "manifest decoder rejected malformed binary XML",
@@ -914,6 +1163,16 @@ it("retains the execution failure while cleanup is pending and resumes after cle
       },
     });
     expect(launches).toHaveLength(2);
+    expect(outcome.error.cleanupIncomplete).toBe(false);
+    expect(outcome.error.cleanupResources).toEqual([]);
+    expect(projectAnalysisError(outcome.error)).toMatchObject({
+      code: "execution_failure",
+      details: {
+        diagnostics: {
+          reason: "manifest decoder rejected malformed binary XML",
+        },
+      },
+    });
     await verifyCleanup(launches);
   } finally {
     cleanupFails = false;
@@ -921,27 +1180,31 @@ it("retains the execution failure while cleanup is pending and resumes after cle
   }
 });
 
-it("does not attribute upstream smali containing all overloads to the selected method", async () => {
-  const { service, apk, launches, provider } = await setup("overloaded-smali");
+it("accepts exact selected-overload smali from the bridge", async () => {
+  const { service, apk, launches, provider } = await setup(
+    "selected-overload-smali",
+  );
   const outcome = await service.execute("inspect_android_method", {
     path: apk,
     class_name: "fixture.Target",
     method_name: "choose",
     overload_index: 1,
   });
-  expect(outcome).toMatchObject({
-    ok: false,
-    error: {
-      _tag: "AnalysisCapabilityUnavailableError",
-      reason: expect.stringContaining("joins all same-name overloads"),
-    },
+  if (!outcome.ok) throw outcome.error;
+  const result = androidResultSchemas.inspect_android_method.parse(
+    outcome.value.normalized_result,
+  );
+  expect(result).toMatchObject({
+    method: { overload_index: 1, dex_descriptor: "(I)V" },
+    representation: "smali",
+    body_status: "available",
   });
   await provider.close();
   await verifyCleanup(launches);
 });
 
-it("reports missing native/abstract method source without claiming an empty implementation", async () => {
-  const { service, apk, launches, provider } = await setup("no-body");
+it("retains parsed native body absence without claiming an empty implementation", async () => {
+  const { service, apk, launches, provider } = await setup("native-method");
   const outcome = await service.execute("inspect_android_method", {
     path: apk,
     class_name: "fixture.Target",
@@ -952,7 +1215,8 @@ it("reports missing native/abstract method source without claiming an empty impl
     outcome.value.normalized_result,
   );
   expect(result.body_status).toBe("not_available");
-  expect(result.source.text).toContain("no decompiled body");
+  expect(result.source.text).toBe("");
+  expect(result.markers).toEqual(["native_method"]);
   await provider.close();
   await verifyCleanup(launches);
 });

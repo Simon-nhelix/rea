@@ -104,6 +104,7 @@ export const registerCodeReferenceCommands = (
             service,
             "rom-code-references",
             "find_code_references",
+            signal,
           ),
         ),
       ),

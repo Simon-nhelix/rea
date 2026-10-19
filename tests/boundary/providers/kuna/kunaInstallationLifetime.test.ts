@@ -1,32 +1,24 @@
-import { afterEach, expect, it, vi } from "vitest";
+import { regularFileCancellation } from "../../../../src/filesystem/OwnedRegularFile.js";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 const gates = vi.hoisted(() => {
-  let releaseHashClose!: () => void;
-  let releaseShebangRead!: () => void;
-  let hashCloseEntered!: () => void;
-  let shebangReadEntered!: () => void;
-  const hashClose = new Promise<void>((resolve) => {
-    releaseHashClose = resolve;
-  });
-  const shebangRead = new Promise<void>((resolve) => {
-    releaseShebangRead = resolve;
-  });
-  const hashCloseStarted = new Promise<void>((resolve) => {
-    hashCloseEntered = resolve;
-  });
-  const shebangReadStarted = new Promise<void>((resolve) => {
-    shebangReadEntered = resolve;
-  });
+  const createGate = () => {
+    let enter!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { started, hold, enter, release };
+  };
   return {
-    hashClose,
-    hashCloseStarted,
-    shebangRead,
-    shebangReadStarted,
-    releaseHashClose,
-    releaseShebangRead,
-    hashCloseEntered,
-    shebangReadEntered,
+    createGate,
+    hashClose: createGate(),
+    shebangRead: createGate(),
     opens: 0,
+    failClose: false,
   };
 });
 
@@ -49,16 +41,18 @@ vi.mock("../../../../src/filesystem/RegularFile.js", async (importOriginal) => {
             handle.stat(...statArgs),
           read: async (...readArgs: Parameters<typeof handle.read>) => {
             if (index === 1) {
-              gates.shebangReadEntered();
-              await gates.shebangRead;
+              gates.shebangRead.enter();
+              await gates.shebangRead.hold;
             }
             return handle.read(...readArgs);
           },
           close: async () => {
             if (index === 0) {
-              gates.hashCloseEntered();
-              await gates.hashClose;
+              gates.hashClose.enter();
+              await gates.hashClose.hold;
             }
+            if (gates.failClose)
+              throw new Error("controlled final close refusal");
             await handle.close();
           },
         } as unknown as typeof handle;
@@ -72,15 +66,26 @@ import type { FileCloseResourceOwner } from "../../../../src/application/Analysi
 import { inspectKunaInstallation } from "../../../../src/kuna/KunaInstallation.js";
 import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js";
 import { writeFakeKuna } from "./fakeKuna.js";
+import { session } from "./kunaSessionFixture.js";
 
-afterEach(() => {
-  gates.releaseHashClose();
-  gates.releaseShebangRead();
+beforeEach(() => {
+  gates.opens = 0;
+  gates.failClose = false;
+  gates.hashClose = gates.createGate();
+  gates.shebangRead = gates.createGate();
 });
 
-it.skipIf(process.platform === "win32")(
-  "keeps installation inspection inside the resource owner's lifetime through shebang reading",
-  async () => {
+afterEach(() => {
+  gates.failClose = false;
+  gates.hashClose.release();
+  gates.shebangRead.release();
+});
+
+it
+  .skipIf(process.platform === "win32")
+  .each(["hash-close", "shebang-read"] as const)(
+  "keeps installation cleanup waiting for its active phase when cancelled during %s",
+  async (phase) => {
     const root = await createTestTempDirectory("rea-kuna-inspection-lifetime-");
     const executable = await writeFakeKuna(root);
     const scope = new ArtifactResourceScope();
@@ -105,35 +110,109 @@ it.skipIf(process.platform === "win32")(
     );
     let cleanup: Promise<void> | undefined;
     try {
-      await gates.hashCloseStarted;
+      await gates.hashClose.started;
       cleanup = scope.retryCleanup();
-      controller.abort();
-      gates.releaseHashClose();
-      const reachedShebang = await Promise.race([
-        gates.shebangReadStarted.then(() => true),
-        inspection.then(
-          () => false,
-          () => false,
-        ),
-      ]);
-      expect(reachedShebang).toBe(true);
-
       let cleanupFinished = false;
       void cleanup.then(() => {
         cleanupFinished = true;
       });
       await Promise.resolve();
       expect(cleanupFinished).toBe(false);
+      if (phase === "hash-close") controller.abort();
+      gates.hashClose.release();
+      const reachedShebang = await Promise.race([
+        gates.shebangRead.started.then(() => true),
+        inspection.then(
+          () => false,
+          () => false,
+        ),
+      ]);
+      expect(reachedShebang).toBe(phase === "shebang-read");
+      if (phase === "shebang-read") {
+        controller.abort();
+        await Promise.resolve();
+        expect(cleanupFinished).toBe(false);
+      }
 
-      gates.releaseShebangRead();
-      await expect(inspection).rejects.toMatchObject({ name: "AbortError" });
+      gates.shebangRead.release();
+      const failure: unknown = await inspection.catch(
+        (cause: unknown) => cause,
+      );
+      const cancellation = regularFileCancellation(failure);
+      expect(cancellation).toBeDefined();
+      expect(cancellation?.reason).toBe(controller.signal.reason);
       await expect(cleanup).resolves.toBeUndefined();
+      expect(gates.opens).toBe(phase === "hash-close" ? 1 : 2);
+      expect(scope.hasPending).toBe(false);
     } finally {
-      gates.releaseHashClose();
-      gates.releaseShebangRead();
+      gates.hashClose.release();
+      gates.shebangRead.release();
       await inspectionOutcome;
       await cleanup;
       await scope.close();
+    }
+  },
+);
+
+it
+  .skipIf(process.platform === "win32")
+  .each(["hash-close", "shebang-read", "close-refusal"] as const)(
+  "joins session acquisition finalization and retains cleanup retry during %s cancellation",
+  async (phase) => {
+    gates.hashClose.release();
+    gates.shebangRead.release();
+    const fixture = await session("rea-kuna-session-finalization-");
+    gates.opens = 0;
+    gates.hashClose = gates.createGate();
+    gates.shebangRead = gates.createGate();
+    const client = fixture.open();
+    const controller = new AbortController();
+    const reason = { selected: "caller reason" };
+    const pending = client.execute("health", {}, { signal: controller.signal });
+    let finished = false;
+    let replacement: ReturnType<typeof client.execute> | undefined;
+    void pending.then(() => {
+      finished = true;
+    });
+    try {
+      await gates.hashClose.started;
+      if (phase === "shebang-read") {
+        gates.hashClose.release();
+        await gates.shebangRead.started;
+      }
+      controller.abort(reason);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(finished).toBe(false);
+      if (phase === "hash-close") replacement = client.execute("health", {});
+      gates.failClose = phase === "close-refusal";
+      gates.hashClose.release();
+      gates.shebangRead.release();
+      const result = await pending;
+      if (result.ok) throw new Error("Expected interrupted installation");
+      if (phase === "close-refusal") {
+        expect(result.error.cleanupIncomplete).toBe(true);
+        const retained = await client.execute("health", {});
+        if (retained.ok) throw new Error("Expected retained cleanup failure");
+        expect(retained.error).toBe(result.error);
+        expect((await client.close()).ok).toBe(false);
+        gates.failClose = false;
+        expect((await client.close()).ok).toBe(true);
+        expect(result.error.cleanupIncomplete).toBe(false);
+      } else {
+        expect(result.error._tag).toBe("AnalysisCancelledError");
+        expect(result.error.cause).toBe(reason);
+        expect(result.error.cleanupIncomplete).toBe(false);
+        if (replacement !== undefined)
+          expect((await replacement).ok).toBe(true);
+        expect((await client.close()).ok).toBe(true);
+      }
+    } finally {
+      gates.failClose = false;
+      gates.hashClose.release();
+      gates.shebangRead.release();
+      await pending;
+      await replacement;
+      expect((await client.close()).ok).toBe(true);
     }
   },
 );

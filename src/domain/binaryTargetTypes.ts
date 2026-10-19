@@ -29,8 +29,21 @@ export const BINARY_ARCHITECTURES = [
   "gekko",
   "riscv",
   "powerpc",
+  "m68k",
+  "hexagon",
 ] as const;
 export type BinaryArchitecture = (typeof BINARY_ARCHITECTURES)[number];
+
+/**
+ * Families admitted only by explicit raw-binary selection. Header detection
+ * never yields them, so detected targets and Evidence subjects exclude them.
+ */
+export const RAW_ONLY_ARCHITECTURES = [
+  "6502",
+  "huc6280",
+  "m68k",
+] as const satisfies readonly BinaryArchitecture[];
+export type RawOnlyArchitecture = (typeof RAW_ONLY_ARCHITECTURES)[number];
 
 /**
  * ELF header facts for a family whose ISA and ABI are not established by the
@@ -69,8 +82,7 @@ export const isElfMetadataArchitecture = (
 
 /** CPU architectures used only by raw-binary or console ROM targets. */
 export const CONSOLE_ONLY_ARCHITECTURES = [
-  "6502",
-  "huc6280",
+  ...RAW_ONLY_ARCHITECTURES,
   "65816",
   "sh2",
   "sh4",
@@ -89,7 +101,7 @@ export type ConsoleOnlyArchitecture =
 /** Recognized family with no ELF metadata member; the header alone is the fact. */
 export type HeaderArchitecture = Exclude<
   BinaryArchitecture,
-  ElfMetadataArchitecture | ConsoleOnlyArchitecture
+  ElfMetadataArchitecture | ConsoleOnlyArchitecture | "hexagon"
 >;
 
 /** Raw ELF facts; family recognition does not establish ISA or ABI support. */
@@ -199,6 +211,14 @@ export type BinaryTarget =
       readonly architecture: "powerpc";
       readonly availableArchitectures: readonly "powerpc"[];
       readonly powerpc: PowerPcElfMetadata;
+      readonly executableRole?: never;
+      readonly managed?: never;
+    })
+  | (BinaryTargetIdentity & {
+      readonly kind: "executable";
+      readonly format: "elf";
+      readonly architecture: "hexagon";
+      readonly availableArchitectures: readonly "hexagon"[];
       readonly executableRole?: never;
       readonly managed?: never;
     })

@@ -275,6 +275,7 @@ it.each([
   "tests/boundary/providers/RizinDebugSessionReviewRegressions.test.ts",
   "tests/boundary/mcp/gdbCancellationMcp.test.ts",
   "tests/boundary/mcp/rizinDebuggerCancellationMcp.test.ts",
+  "tests/boundary/mcp/rizinPendingOutput.test.ts",
   "tests/composition/reverseEngineeringAdmission.test.ts",
   "tests/support/reverseEngineeringMcpHarness.ts",
   "tests/support/reverseEngineeringCompositionEdgeCases.ts",
@@ -722,6 +723,39 @@ it.each([
   [
     "tests/boundary/filesystem/windowsNpxRegistration.test.ts",
     { code: true, package: true, runtime: true, apple: false },
+  ],
+  [
+    "scripts/verify-packed-bridge.mjs",
+    {
+      code: true,
+      package: true,
+      runtime: true,
+      apple: false,
+      evm: false,
+      browser: false,
+    },
+  ],
+  [
+    "scripts/verify-packed-bridge.d.mts",
+    {
+      code: true,
+      package: true,
+      runtime: true,
+      apple: false,
+      evm: false,
+      browser: false,
+    },
+  ],
+  [
+    "tests/boundary/process/packedBridgeVerification.test.ts",
+    {
+      code: true,
+      package: true,
+      runtime: true,
+      apple: false,
+      evm: false,
+      browser: false,
+    },
   ],
   [
     "src/process/ProcessOwnership.test.ts",

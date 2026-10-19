@@ -1,3 +1,7 @@
+import {
+  bindArtifactFileCleanup,
+  artifactFileCancellationCause,
+} from "../../artifacts/ArtifactFileOperation.js";
 import { access, mkdir, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -17,6 +21,7 @@ import {
   type RecordedCrash,
 } from "../../domain/native/recordedCrash.js";
 import { readStableArtifact } from "../../artifacts/readStableArtifact.js";
+import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
 import type { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
 import { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
@@ -46,6 +51,7 @@ const replySchema = z.discriminatedUnion("ok", [
 /** Add mapping candidates from an owned core-only debugger, using the existing snapshot. */
 export const inspectPwndbgCore = async ({
   environment,
+  architecture,
   rootPath,
   resources,
   diagnostics,
@@ -54,6 +60,7 @@ export const inspectPwndbgCore = async ({
   probePath,
 }: {
   readonly environment: Readonly<NodeJS.ProcessEnv>;
+  readonly architecture: RecordedCrash["architecture"];
   readonly rootPath: string;
   readonly resources: ArtifactResourceScope;
   readonly diagnostics: AnalysisCapturedOutput;
@@ -77,6 +84,7 @@ export const inspectPwndbgCore = async ({
   const checkCancelled = () => {
     if (options?.signal?.aborted)
       throw new AnalysisCancelledError(OPERATION, {
+        cause: options.signal.reason,
         capturedOutput: diagnostics,
       });
   };
@@ -105,7 +113,7 @@ export const inspectPwndbgCore = async ({
       }
       checkCancelled();
     } catch (cause: unknown) {
-      if (options?.signal?.aborted) checkCancelled();
+      if (cause instanceof AnalysisCancelledError) throw cause;
       throw unavailable(
         `${key} is unavailable at ${path}: ${cause instanceof Error ? cause.message : String(cause)}. Configure the requested core-only context, or omit include_debugger_context for basic recorded evidence.`,
         cause,
@@ -123,6 +131,7 @@ export const inspectPwndbgCore = async ({
       snapshot_path: join(rootPath, "object.snapshot"),
       reply_path: replyPath,
       gdb,
+      architecture,
       gdbinit: entry,
       venv,
     }),
@@ -144,7 +153,7 @@ export const inspectPwndbgCore = async ({
       failureContext,
     );
   try {
-    options?.signal?.throwIfAborted();
+    checkCancelled();
     const execution = await runCommand(
       {
         command: environment.REA_PWNTOOLS_PYTHON ?? "",
@@ -186,19 +195,34 @@ export const inspectPwndbgCore = async ({
       );
       reply = replySchema.parse(JSON.parse(raw.bytes.toString("utf8")));
     } catch (cause: unknown) {
-      if (options?.signal?.aborted)
-        throw new AnalysisCancelledError(OPERATION, {
-          cause,
+      if (
+        cause instanceof ArtifactReaderFailure &&
+        cause.reason === "cancelled"
+      ) {
+        const error = new AnalysisCancelledError(OPERATION, {
+          cause: artifactFileCancellationCause(cause),
           capturedOutput: recordedCrashStageOutput(diagnostics, output),
+          ...(cause instanceof ArtifactReaderFailure &&
+          cause.cleanup !== undefined
+            ? { cleanup: cause.cleanup }
+            : {}),
         });
-      throw new AnalysisOutputError(
+        bindArtifactFileCleanup(cause, error);
+        throw error;
+      }
+      const error = new AnalysisOutputError(
         OPERATION,
         `Core-only debugger reply failed: ${cause instanceof Error ? cause.message : String(cause)}`,
         {
           cause,
+          ...(cause instanceof ArtifactReaderFailure
+            ? { cleanup: cause.cleanup }
+            : {}),
           capturedOutput: recordedCrashStageOutput(diagnostics, output),
         },
       );
+      bindArtifactFileCleanup(cause, error);
+      throw error;
     }
     if (!reply.ok) {
       if (reply.reason === "unavailable" || reply.reason === "unsupported")
@@ -232,21 +256,14 @@ export const inspectPwndbgCore = async ({
     return { ...reply.value, diagnostics: output };
   } catch (cause: unknown) {
     if (cause instanceof AnalysisError && cause.cleanupIncomplete) throw cause;
-    const primary =
-      options?.signal?.aborted &&
-      (cause === options.signal.reason ||
-        (cause instanceof Error && cause.name === "AbortError"))
-        ? new AnalysisCancelledError(OPERATION, {
-            capturedOutput: recordedCrashStageOutput(diagnostics, output),
-          })
-        : pwntoolsDecoderFailure(
-            cause,
-            "debugger",
-            gdb,
-            environment.REA_PWNTOOLS_PYTHON ?? "",
-            await readPwntoolsFailureEvidence(cause, stage, resources),
-            failureContext,
-          );
+    const primary = pwntoolsDecoderFailure(
+      cause,
+      "debugger",
+      gdb,
+      environment.REA_PWNTOOLS_PYTHON ?? "",
+      await readPwntoolsFailureEvidence(cause, stage, resources),
+      failureContext,
+    );
     throw primary;
   }
 };

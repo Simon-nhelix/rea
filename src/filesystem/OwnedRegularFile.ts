@@ -1,11 +1,44 @@
 import type { FileHandle } from "node:fs/promises";
 
 import { OwnedFileHandle } from "./OwnedFileHandle.js";
-import { openRegularFile, RegularFileAdmissionFailure } from "./RegularFile.js";
+import {
+  openRegularFile,
+  RegularFileAdmissionFailure,
+  assertRegularFileActive,
+  RegularFileOperationCancelled,
+} from "./RegularFile.js";
 
 export type RegularFileOperationOutcome<Value> =
   | { readonly kind: "completed"; readonly value: Value }
   | { readonly kind: "failed"; readonly cause: unknown };
+
+type CompletedRegularFileOutcome<Value> = Extract<
+  RegularFileOperationOutcome<Value>,
+  { readonly kind: "completed" }
+>;
+
+/** Cancellation after confirmed close, retaining the completed physical read. */
+export class RegularFileCancelled<Value = unknown> extends Error {
+  readonly _tag = "RegularFileCancelled";
+  readonly outcome: CompletedRegularFileOutcome<Value>;
+  readonly reason: unknown;
+
+  constructor(
+    readonly path: string,
+    readonly owner: OwnedFileHandle,
+    completion: {
+      readonly outcome: CompletedRegularFileOutcome<Value>;
+      readonly reason: unknown;
+    },
+  ) {
+    super(`Regular file operation cancelled after closing ${path}`, {
+      cause: completion.reason,
+    });
+    this.name = this._tag;
+    this.outcome = completion.outcome;
+    this.reason = completion.reason;
+  }
+}
 
 /** A failed close transfers its exact descriptor owner and operation outcome. */
 export class RegularFileCleanupFailure<Value = unknown> extends Error {
@@ -20,6 +53,7 @@ export class RegularFileCleanupFailure<Value = unknown> extends Error {
       | { readonly kind: "callback_threw"; readonly cause: unknown } = {
       kind: "not_requested",
     },
+    readonly completionCancellation?: { readonly reason: unknown },
   ) {
     super(`Regular file cleanup failed for ${path}`, {
       cause: new AggregateError(
@@ -35,10 +69,33 @@ export class RegularFileCleanupFailure<Value = unknown> extends Error {
   }
 }
 
-export interface OwnedRegularFileOptions {
+export interface OwnedFileOperationOptions {
   readonly signal?: AbortSignal;
-  readonly symlinks?: "follow" | "reject";
   readonly retainFailedClose?: (owner: OwnedFileHandle) => void;
+}
+
+/** Read only cancellation facts recorded by the operation or its final close. */
+export const regularFileCancellation = (
+  cause: unknown,
+): { readonly reason: unknown } | undefined => {
+  const primary =
+    cause instanceof RegularFileCleanupFailure &&
+    cause.outcome.kind === "failed"
+      ? cause.outcome.cause
+      : cause;
+  if (
+    primary instanceof RegularFileOperationCancelled ||
+    primary instanceof RegularFileCancelled
+  )
+    return { reason: primary.reason };
+  return cause instanceof RegularFileCleanupFailure &&
+    cause.outcome.kind === "completed"
+    ? cause.completionCancellation
+    : undefined;
+};
+
+export interface OwnedRegularFileOptions extends OwnedFileOperationOptions {
+  readonly symlinks?: "follow" | "reject";
 }
 
 /** Run an operation while one admitted descriptor and its cleanup owner stay together. */
@@ -61,9 +118,25 @@ export const withOwnedRegularFile = async <Value>(
       retention,
     );
   });
-  const owner = new OwnedFileHandle(handle);
+  return withOwnedFileHandle(
+    path,
+    new OwnedFileHandle(handle),
+    options,
+    operation,
+  );
+};
+
+/** Own an already admitted descriptor through its operation and final close. */
+export const withOwnedFileHandle = async <Value>(
+  path: string,
+  owner: OwnedFileHandle,
+  options: OwnedFileOperationOptions,
+  operation: (handle: FileHandle) => Promise<Value>,
+): Promise<Value> => {
+  const handle = owner.handle;
   let outcome: RegularFileOperationOutcome<Value>;
   try {
+    assertRegularFileActive(options.signal);
     outcome = { kind: "completed", value: await operation(handle) };
   } catch (cause: unknown) {
     outcome = { kind: "failed", cause };
@@ -71,15 +144,27 @@ export const withOwnedRegularFile = async <Value>(
   try {
     await owner.close();
   } catch (cleanupCause: unknown) {
+    const completionCancellation =
+      outcome.kind === "completed" && options.signal?.aborted === true
+        ? { reason: options.signal.reason }
+        : undefined;
+    // Retain the physical read outcome even if the caller cancelled during
+    // close: consumers may need completed observations such as a file digest.
     throw new RegularFileCleanupFailure(
       path,
       owner,
       outcome,
       cleanupCause,
       retainOwner(options.retainFailedClose, owner),
+      completionCancellation,
     );
   }
   if (outcome.kind === "failed") throw outcome.cause;
+  if (options.signal?.aborted === true)
+    throw new RegularFileCancelled(path, owner, {
+      outcome,
+      reason: options.signal.reason,
+    });
   return outcome.value;
 };
 

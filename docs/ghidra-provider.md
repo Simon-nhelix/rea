@@ -65,6 +65,14 @@ PDB, or change analyzer settings.
 
 ## Loaded addresses and file offsets
 
+Ghidra computes overview procedure and string counts from the same inventories
+used by `list_procedures` and `list_strings`, without transporting those rows
+solely to count them. Counts include external functions and only Ghidra-defined
+strings; they do not establish discovery of unidentified functions or undefined
+string bytes. Complete inventories remain available through the list tools.
+Overview reuse follows the target/profile snapshot lifetime and is invalidated
+by session metadata edits.
+
 `rea analyze <path> --provider ghidra --json` and MCP `binary_overview` report
 the observed loaded `image_base` in `normalized_result`. They retain each
 segment's reported `image_base` and `address_space`. A provider that does not
@@ -144,6 +152,13 @@ Only the final departing caller abandons startup and waits for its cleanup.
 New attempts wait for that cleanup; failed cleanup retains its original error
 and owned directories until a successful close. Closing the provider reports a
 provider-state failure to live callers rather than cancelling their signals.
+
+Configured analysis extensions and seeds use owned file reads during profile
+resolution and launch snapshots. A changed read extent or descriptor state
+refuses the commitment. Failed source or snapshot descriptor closes remain
+owned and block new admission until cleanup succeeds; the physical failure
+and exact cancellation reason remain available. Provider shutdown joins all
+profile stages before retrying their retained descriptors.
 
 | Concern                 | Ghidra contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

@@ -90,6 +90,16 @@ type DirectAnalysisTool =
   | "discover_pointer_tables"
   | "find_code_caves";
 
+// These one-shot CLI questions require native utilities, not a deep engine.
+// Runtime observation retains the ordinary session and authority checks.
+const NATIVE_INSPECTION_OPERATIONS: ReadonlySet<string> = new Set([
+  "inspect_macho",
+  "inspect_signature",
+  "list_architectures",
+  "inspect_plist",
+  "demangle_swift",
+] satisfies readonly NativeToolName[]);
+
 const ARTIFACT_ANALYSIS_OPERATION_SET: ReadonlySet<string> = new Set(
   ARTIFACT_ANALYSIS_OPERATIONS,
 );
@@ -174,7 +184,9 @@ export const runProviderAnalysis = async (
       signal: operationSignal,
       ...(ARTIFACT_ANALYSIS_OPERATION_SET.has(tool)
         ? { createSession: dependencies.createArtifactBinarySession }
-        : {}),
+        : NATIVE_INSPECTION_OPERATIONS.has(tool)
+          ? { createSession: dependencies.createNativeBinarySession }
+          : {}),
     }),
   );
 };
@@ -306,7 +318,11 @@ const runAnalysis = async (
   } else {
     const config = dependencies.readConfiguration();
     if (!config.ok) return cliError(config.error);
-    session = await dependencies.createBinarySession(config.value, logger);
+    session = await (
+      tool === "inspect_native_dispatch_metadata" && snapshotPath === undefined
+        ? dependencies.createNativeDispatchBinarySession
+        : dependencies.createBinarySession
+    )(config.value, logger);
   }
   return withSessionCleanup(
     session,

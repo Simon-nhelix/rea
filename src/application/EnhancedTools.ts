@@ -1,3 +1,4 @@
+import { CALL_RELATIONSHIP_TRAVERSALS } from "./CallRelationshipTraversal.js";
 import { z } from "zod";
 
 import type {
@@ -6,8 +7,11 @@ import type {
   AnalysisOperationPort,
   ExecutionOptions,
 } from "./AnalysisProvider.js";
-import type { EnhancedToolName } from "../contracts/enhancedInputs.js";
-import { enhancedInputSchemas } from "../contracts/enhancedInputs.js";
+import {
+  enhancedInputSchemas,
+  type CallRelationshipDirection,
+  type EnhancedToolName,
+} from "../contracts/enhancedInputs.js";
 import {
   AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
@@ -16,13 +20,12 @@ import {
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import {
-  addressDistance,
   functionDossierSchema,
   parseFunctionDossier,
   parseListCount,
   parseRelatedAddresses,
   parseSegments,
-  parseSegmentImageBase,
+  projectBinaryOverview,
 } from "../domain/hopperValues.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
@@ -508,13 +511,12 @@ export class EnhancedTools {
   async #callGraph(
     input: {
       readonly address: string;
-      readonly direction: "forward" | "backward";
+      readonly direction: CallRelationshipDirection;
     },
     signal?: AbortSignal,
   ): EnhancedResult {
-    const relation = input.direction === "forward" ? "callees" : "callers";
-    const tool =
-      input.direction === "forward" ? "procedure_callees" : "procedure_callers";
+    const { relation, operation: tool } =
+      CALL_RELATIONSHIP_TRAVERSALS[input.direction];
     const limitations = new Set<string>();
     const resolved = await this.#observe(
       "procedure_address",
@@ -680,6 +682,17 @@ export class EnhancedTools {
   }
 
   async #binaryOverview(signal?: AbortSignal): EnhancedResult {
+    const direct = await this.#call(
+      "read_binary_inventory_summary",
+      {},
+      signal,
+    );
+    if (
+      direct.ok ||
+      !(direct.error instanceof AnalysisCapabilityUnavailableError) ||
+      direct.error.cleanupIncomplete
+    )
+      return direct;
     const document = await resolveAnalysisDocument(
       this.analysis,
       undefined,
@@ -710,33 +723,14 @@ export class EnhancedTools {
     const stringCount = parseListCount(stringsResult.value, "strings");
     if (!stringCount.ok) return stringCount;
 
-    const observedSegments = segments?.ok ? segments.value : undefined;
-    const imageBase =
-      observedSegments === undefined
-        ? undefined
-        : parseSegmentImageBase(observedSegments);
-
-    return ok({
-      document: document.value,
-      ...(imageBase === undefined ? {} : { image_base: imageBase }),
-      ...(observedSegments === undefined
-        ? {}
-        : {
-            segments: observedSegments.map(
-              ({ name, start, end, image_base, address_space }) => ({
-                name,
-                start,
-                end,
-                length: addressDistance(start, end),
-                ...(image_base === undefined ? {} : { image_base }),
-                ...(address_space === undefined ? {} : { address_space }),
-              }),
-            ),
-            segment_count: observedSegments.length,
-          }),
-      procedure_count: procedureCount.value,
-      string_count: stringCount.value,
-    });
+    return ok(
+      projectBinaryOverview({
+        document: document.value,
+        ...(segments?.ok ? { segments: segments.value } : {}),
+        procedure_count: procedureCount.value,
+        string_count: stringCount.value,
+      }),
+    );
   }
 
   async #allAddressed(
