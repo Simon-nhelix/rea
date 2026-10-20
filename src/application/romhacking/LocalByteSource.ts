@@ -24,6 +24,7 @@ import {
   type PlayStationSystemCnf,
   type SegaIpBin,
 } from "../../domain/discImage.js";
+import { detectN64ByteOrder, unswapN64Bytes } from "../../domain/consoleRom.js";
 import type { EvidenceSubjectTarget } from "../../domain/evidence.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import type { RomByteSourceDescription } from "../../domain/romHacking.js";
@@ -387,15 +388,29 @@ export const openLocalByteSource = async (
       }),
     );
   }
+  // Byteswapped and little-endian Nintendo 64 dumps are restored to the
+  // native big-endian bytes the ROM tools decode; the digest and reported
+  // file offsets still identify the original dump.
+  const n64Facts = detectN64ByteOrder(bytes.value);
+  const normalized =
+    n64Facts !== undefined && n64Facts.swap !== undefined
+      ? {
+          bytes: unswapN64Bytes(bytes.value, n64Facts.swap),
+          swap: n64Facts.swap,
+        }
+      : undefined;
   return ok({
     kind: "local-bytes",
     path: canonical,
     sha256: sha256(bytes.value),
-    bytes: bytes.value,
+    bytes: normalized?.bytes ?? bytes.value,
     description: {
       mode: "data",
       reason,
       byte_length: bytes.value.length,
+      ...(normalized === undefined
+        ? {}
+        : { byte_swap_undone: normalized.swap }),
       ...(hasIsoSectors(canonical, bytes.value.length)
         ? { sector_size: CD_USER_DATA_BYTES }
         : {}),

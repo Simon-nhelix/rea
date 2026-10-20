@@ -16,6 +16,7 @@ import {
 import {
   resolveConsoleFileOffset,
   resolveConsoleVirtualAddress,
+  unswapN64Bytes,
 } from "../../domain/consoleRom.js";
 import {
   computePointerSlotBudgets,
@@ -139,6 +140,15 @@ const readRomBytesCached = async (
     romBytes = await readFile(target.path);
   } catch {
     return undefined;
+  }
+  // Undo the byte permutation the console admission declared (byteswapped
+  // or little-endian dumps) so scans decode native bytes; the cache key
+  // still identifies the original file.
+  if (
+    isConsoleBinaryTarget(target) &&
+    target.consoleRom.fileByteSwap !== undefined
+  ) {
+    romBytes = unswapN64Bytes(romBytes, target.consoleRom.fileByteSwap);
   }
   romBytesCache.set(key, romBytes);
   while (romBytesCache.size > ROM_BYTES_CACHE_LIMIT) {

@@ -14,7 +14,9 @@ export const findGpInitializer = (region: {
   readonly fileOffset: number;
   readonly length: number;
   readonly address: number;
+  readonly littleEndian?: boolean;
 }): GpInitializer | undefined => {
+  const littleEndian = region.littleEndian ?? true;
   const view = new DataView(
     region.bytes.buffer,
     region.bytes.byteOffset,
@@ -22,13 +24,16 @@ export const findGpInitializer = (region: {
   );
   const skip = (4 - (region.address % 4)) % 4;
   for (let rel = skip; rel + 4 <= region.length; rel += 4) {
-    const word = view.getUint32(region.fileOffset + rel, true);
+    const word = view.getUint32(region.fileOffset + rel, littleEndian);
     if (word >>> 26 !== 0x0f || ((word >>> 21) & 31) !== 0) continue;
     const rt = (word >>> 16) & 31;
     const high = (word & 0xffff) << 16;
     if (rt === 28) {
       for (let k = 1; k <= 4 && rel + 4 * (k + 1) <= region.length; k++) {
-        const next = view.getUint32(region.fileOffset + rel + 4 * k, true);
+        const next = view.getUint32(
+          region.fileOffset + rel + 4 * k,
+          littleEndian,
+        );
         const op = next >>> 26;
         const sameGp =
           ((next >>> 21) & 31) === 28 && ((next >>> 16) & 31) === 28;
@@ -44,7 +49,10 @@ export const findGpInitializer = (region: {
       // PS2 crt0 pattern: lui $r, hi ... addiu/daddiu/ori $r, $r, lo ... move $gp, $r
       let formed: number | undefined;
       for (let k = 1; k <= 12 && rel + 4 * (k + 1) <= region.length; k++) {
-        const next = view.getUint32(region.fileOffset + rel + 4 * k, true);
+        const next = view.getUint32(
+          region.fileOffset + rel + 4 * k,
+          littleEndian,
+        );
         const op = next >>> 26;
         const nrs = (next >>> 21) & 31;
         const nrt = (next >>> 16) & 31;

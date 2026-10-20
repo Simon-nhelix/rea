@@ -99,6 +99,7 @@ const SUPPORTED_ARCHITECTURES = new Set([
   "cell-ppu",
   "xenon",
   "gekko",
+  "r4300",
   "riscv",
   "powerpc",
   "m68k",

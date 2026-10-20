@@ -159,6 +159,76 @@ describe("mapped raw and disc reads", () => {
   );
 });
 
+describe("Nintendo 64 local ROM reads", () => {
+  const buildRom = (): Buffer => {
+    const rom = Buffer.alloc(0x2000, 0);
+    rom.set([0x80, 0x37, 0x12, 0x40], 0);
+    rom.writeUInt32BE(0x80000400, 0x08);
+    rom.write("HELLO N64 WORLD", 0x1014, "ascii");
+    return rom;
+  };
+  const swapBytes16 = (bytes: Buffer): Buffer => {
+    const out = Buffer.from(bytes);
+    for (let i = 0; i + 1 < out.length; i += 2) {
+      const first = out[i]!;
+      out[i] = out[i + 1]!;
+      out[i + 1] = first;
+    }
+    return out;
+  };
+
+  it("scans admitted z64 and v64 dumps with identical coordinates", async () => {
+    const z64 = join(root, "game.z64");
+    const v64 = join(root, "game.v64");
+    await writeFile(z64, buildRom());
+    await writeFile(v64, swapBytes16(buildRom()));
+    for (const [path, normalized] of [
+      [z64, false],
+      [v64, true],
+    ] as const) {
+      const run = await runLocalRomTool({
+        path,
+        tool: "search_rom_strings",
+        arguments: { query: "HELLO N64", encoding: "ascii" },
+        signal,
+        localBytes: false,
+      });
+      expect(run?.ok).toBe(true);
+      if (run === undefined || !run.ok) return;
+      expect(run.value.result).toMatchObject({
+        matches: [
+          {
+            file_offset: 0x1014,
+            address: "0x80000414",
+            text: "HELLO N64 WORLD",
+          },
+        ],
+      });
+      expect(
+        run.value.limitations.join(" ").includes("normalized to native"),
+      ).toBe(normalized);
+    }
+  });
+
+  it("records the undone byte swap in the plain byte source", async () => {
+    const v64 = join(root, "plain.v64");
+    await writeFile(v64, swapBytes16(buildRom()));
+    const run = await runLocalRomTool({
+      path: v64,
+      tool: "search_rom_strings",
+      arguments: { query: "HELLO N64", encoding: "ascii" },
+      signal,
+      localBytes: true,
+    });
+    expect(run?.ok).toBe(true);
+    if (run === undefined || !run.ok) return;
+    expect(run.value.result).toMatchObject({
+      matches: [{ file_offset: 0x1014, text: "HELLO N64 WORLD" }],
+      source: { mode: "data", byte_swap_undone: 16 },
+    });
+  });
+});
+
 describe("local byte sources for ROM text tools", () => {
   it("falls back to plain bytes when the format is not recognized", async () => {
     const run = await runLocalRomTool({

@@ -341,6 +341,15 @@ sharing a load address cannot be resident together, so the hit's file matters
 (`overlapping_files`). This is a static scan: indirect addresses, `jr` jump
 tables, compressed or encrypted code, and absent overlays are not seen.
 
+Nintendo 64 software uses the big-endian variant of the same scanner
+(`--architecture mips-be`). A cartridge ROM (`.z64`, `.v64`, or `.n64`) needs
+no explicit load address: the cartridge image is scanned at the alignment
+IPL3 boots from, so file offset `0x1000` sits at the header boot address, and
+byteswapped or little-endian dumps are normalized to native big-endian bytes
+first (reported file offsets and digests still identify the original dump).
+DMA-loaded overlays keep cartridge-image coordinates here, not the RDRAM
+addresses the game loads them to.
+
 ## Processor prerequisites
 
 These are optional source corrections for an existing, caller-owned Ghidra

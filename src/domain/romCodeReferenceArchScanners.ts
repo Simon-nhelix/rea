@@ -796,7 +796,7 @@ export const scanArmOrThumbRegion = (
 };
 
 export const scanArchitectureRegion = (
-  architecture: Exclude<CodeReferenceArchitecture, "mips-le">,
+  architecture: Exclude<CodeReferenceArchitecture, "mips-le" | "mips-be">,
   region: ScanRegion,
   scanTargets: readonly ScanTarget[],
   kinds: ReadonlySet<CodeReferenceKind>,

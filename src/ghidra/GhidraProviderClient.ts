@@ -343,6 +343,11 @@ export const createGhidraProviderClient = (input: {
                 "SNES reset E/M/X context is established only at the actual reset-vector entry. Explicit processor-context seeds are caller assertions at their selected addresses, not runtime observations by Ghidra. Instruction widths downstream of unknown PLP, RTI or XCE status changes are not proven; validate them against instruction bytes and observed CPU status before relying on pseudocode. Cross-references contain analyzed Ghidra references only; no hits do not prove that code or data is unused.",
               ]
             : []),
+          ...(consoleRom.format === "n64"
+            ? [
+                "Nintendo 64 maps the whole cartridge image so file offset 0x1000 sits at the header boot address, matching the IPL3 DMA of the boot image into RDRAM. Beyond that initial image the game DMAs code and data into RDRAM itself, so shown addresses there are cartridge-image coordinates, not established runtime addresses. The cartridge PI DOM1 window (0xb0000000), TLB-mapped segments and RSP microcode are not modeled. Byteswapped (.v64) and little-endian (.n64) dumps are normalized to native big-endian bytes before analysis; reported file offsets still identify the original dump. The VR4300 is decoded with the 32-bit MIPS language most Nintendo 64 software runs in; 64-bit-mode register semantics are not separately modeled.",
+              ]
+            : []),
           ...(consoleRom.format === "gb"
             ? [
                 "Game Boy uses a dedicated SM83 language, not stock Z80. HALT/STOP and interrupt controls are abstract userops; hardware timing, STOP glitches and mapper bank transitions are not modeled. Complete CPU semantic and game-specific ABI validation has not been performed.",

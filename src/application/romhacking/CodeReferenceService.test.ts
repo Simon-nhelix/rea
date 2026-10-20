@@ -42,6 +42,54 @@ const resultOf = (evidence: {
 }): ReturnType<typeof findCodeReferencesResultSchema.parse> =>
   findCodeReferencesResultSchema.parse(evidence.normalized_result);
 
+describe("CodeReferenceService Nintendo 64", () => {
+  it("reuses N64 admission and normalizes byteswapped dumps for mips-be", async () => {
+    const buildRom = (): Buffer => {
+      const rom = Buffer.alloc(0x2000, 0);
+      rom.set([0x80, 0x37, 0x12, 0x40], 0);
+      rom.writeUInt32BE(0x80000400, 0x08); // IPL3 boot address
+      rom.writeUInt32BE(jal(0x80002000), 0x1000); // boot image start
+      rom.writeUInt32BE(0x80002000, 0x1008); // pointer word
+      return rom;
+    };
+    const z64 = join(directory, "game.z64");
+    const v64 = join(directory, "game.v64");
+    await writeFile(z64, buildRom());
+    const swapped = buildRom();
+    for (let k = 0; k + 1 < swapped.length; k += 2) {
+      const first = swapped[k]!;
+      swapped[k] = swapped[k + 1]!;
+      swapped[k + 1] = first;
+    }
+    await writeFile(v64, swapped);
+
+    for (const [path, normalized] of [
+      [z64, false],
+      [v64, true],
+    ] as const) {
+      const result = await new CodeReferenceService().find({
+        files: [{ path }],
+        architecture: "mips-be",
+        targets: [{ address: "0x80002000" }],
+        kinds: ["call", "pointer_word"],
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const report = resultOf(result.value);
+      expect(report.files[0]?.load_address_source).toBe("n64-rom-header");
+      expect(report.files[0]?.load_address).toBe("0x7ffff400");
+      expect(report.references.map((r) => [r.kind, r.file_offset])).toEqual([
+        ["call", 0x1000],
+        ["pointer_word", 0x1008],
+      ]);
+      expect(result.value.limitations.join(" ")).toContain("Nintendo 64 scan");
+      expect(
+        result.value.limitations.join(" ").includes("normalized to native"),
+      ).toBe(normalized);
+    }
+  });
+});
+
 describe("CodeReferenceService", () => {
   it("reuses NES admission for trainer offsets, PRG boundaries, and mirrored addresses", async () => {
     const path = join(directory, "trainer.nes");

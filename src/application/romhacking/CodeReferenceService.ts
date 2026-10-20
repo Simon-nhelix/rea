@@ -15,6 +15,7 @@ import {
   findCodeReferencesInputSchema,
   findCodeReferencesResultSchema,
   formatAddress32,
+  isMipsCodeReferenceArchitecture,
   parseAddress32,
   ROM_CODE_REFERENCE_PROVIDER_IDENTITY,
   scanCodeRegion,
@@ -28,7 +29,11 @@ import {
 import { codeReferenceLimitations } from "../../domain/romCodeReferenceLimitations.js";
 import { overlappingRegions } from "../../domain/romCodeReferenceRegions.js";
 import { findGpInitializer } from "../../domain/romGpInitializer.js";
-import { admitConsoleTarget } from "../../domain/consoleRom.js";
+import {
+  admitConsoleTarget,
+  detectN64ByteOrder,
+  unswapN64Bytes,
+} from "../../domain/consoleRom.js";
 
 const OPERATION = "find_code_references";
 const MAX_FILE_BYTES = 256 * 1024 * 1024;
@@ -232,6 +237,40 @@ const locateRegions = (
       },
     ]);
   }
+  // Nintendo 64 ROM (0x80371240 signature; scan bytes arrive normalized)
+  if (architecture === "mips-be" && bytes.length > 0x1000) {
+    const headerBytes = Buffer.from(
+      bytes.buffer,
+      bytes.byteOffset,
+      bytes.byteLength,
+    );
+    if (detectN64ByteOrder(headerBytes) !== undefined) {
+      const admitted = admitConsoleTarget({
+        format: "n64",
+        headerBytes,
+        fileBytes: bytes.length,
+      });
+      if (!admitted.ok)
+        return err(
+          new AnalysisInputError(OPERATION, {
+            userMessage: admitted.error.reason,
+          }),
+        );
+      return ok(
+        admitted.value.fileMappings
+          .filter((mapping) => mapping.executable)
+          .map((mapping) => ({
+            loadAddress: Number(BigInt(mapping.virtualAddress)),
+            loadAddressSource: "n64-rom-header" as const,
+            fileOffset: mapping.fileOffset,
+            length: mapping.byteLength,
+            notes: [
+              `${path}: Nintendo 64 scan maps the cartridge image so file offset 0x1000 sits at the header boot address; DMA-loaded overlays are not resolved.`,
+            ],
+          })),
+      );
+    }
+  }
   return err(
     new AnalysisInputError(OPERATION, {
       userMessage: `${path} has no PS-X EXE, ELF32-LE, or MWo3 header; give its load address as files[].load_address (CLI: --file ${path}:0x800D61D8).`,
@@ -273,7 +312,7 @@ const resolveGp = (
   architecture: CodeReferenceArchitecture,
   regions: readonly LoadedRegion[],
 ): GpResolution => {
-  if (!enabled || architecture !== "mips-le")
+  if (!enabled || !isMipsCodeReferenceArchitecture(architecture))
     return { value: undefined, source: null, file: null };
   const given = explicit === undefined ? undefined : parseAddress32(explicit);
   if (given !== undefined)
@@ -285,6 +324,7 @@ const resolveGp = (
       fileOffset: region.fileOffset,
       length: region.length,
       address: region.loadAddress,
+      littleEndian: architecture === "mips-le",
     });
     if (found !== undefined)
       return {
@@ -579,7 +619,7 @@ export class CodeReferenceService {
                 `$gp ${formatAddress32(gp.value ?? 0)} was inferred from the lui/addiu pair at ${formatAddress32(gp.address ?? 0)} in ${gp.file ?? ""} and applied to every file with use_gp; pass gp to override.`,
               ]
             : []),
-          ...(input.architecture === "mips-le" &&
+          ...(isMipsCodeReferenceArchitecture(input.architecture) &&
           input.gp_relative &&
           gp.value === undefined
             ? [
@@ -615,21 +655,42 @@ export class CodeReferenceService {
         }),
       );
     }
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    // Byteswapped and little-endian Nintendo 64 dumps are restored to the
+    // native big-endian byte order the scan decodes; file offsets and the
+    // file digest above still identify the original dump.
+    let scanBytes = bytes;
+    let byteOrderNote: string | undefined;
+    if (architecture === "mips-be") {
+      const facts = detectN64ByteOrder(
+        Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+      );
+      if (facts !== undefined && facts.swap !== undefined) {
+        scanBytes = unswapN64Bytes(
+          Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+          facts.swap,
+        );
+        byteOrderNote = `${path}: ${facts.order} Nintendo 64 dump normalized to native big-endian bytes for the scan; reported file offsets and sha256 still identify the original dump.`;
+      }
+    }
     const located = locateRegions(
       path,
-      bytes,
+      scanBytes,
       loadAddress === undefined ? undefined : parseAddress32(loadAddress),
       architecture,
     );
     if (!located.ok) return located;
-    const sha256 = createHash("sha256").update(bytes).digest("hex");
     return ok(
       located.value.map((region) => ({
+        ...region,
         path,
-        bytes,
+        bytes: scanBytes,
         sha256,
         useGp,
-        ...region,
+        notes:
+          byteOrderNote === undefined
+            ? region.notes
+            : [...region.notes, byteOrderNote],
       })),
     );
   }

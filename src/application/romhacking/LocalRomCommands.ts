@@ -168,6 +168,14 @@ export const runLocalRomTool = async (input: {
             );
       target = parsed.value;
       limitations.push(ROM_FAST_PATH_LIMITATION);
+      if (
+        isConsoleBinaryTarget(parsed.value) &&
+        parsed.value.consoleRom.fileByteSwap !== undefined
+      ) {
+        limitations.push(
+          "Byteswapped or little-endian dump normalized to native big-endian bytes for scanning; reported file offsets and digests identify the original dump.",
+        );
+      }
     } else if (
       input.formatHint === undefined &&
       parsed.error instanceof BinaryTargetError &&

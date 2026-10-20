@@ -23,6 +23,7 @@ export const CONSOLE_TARGET_FORMATS = [
   "nes",
   "gb",
   "wsc",
+  "n64",
 ] as const;
 
 export type ConsoleTargetFormat = (typeof CONSOLE_TARGET_FORMATS)[number];
@@ -50,6 +51,7 @@ export type ConsoleArchitecture =
   | "65816"
   | "6502"
   | "sm83"
+  | "r4300"
   | "x86";
 
 /** One file-backed segment mapping in the console's virtual address space. */
@@ -85,6 +87,14 @@ export interface ConsoleTargetAdmission {
   readonly romMetadata: Readonly<
     Record<string, string | number | boolean | null>
   >;
+  /**
+   * File byte permutation relative to the console's native byte order.
+   * `16` means adjacent byte pairs are swapped, `32` means each 4-byte word
+   * is stored reversed. Absent means file bytes are already native.
+   * Consumers that read file content must undo this permutation; file
+   * offsets and virtual addresses are unchanged by it.
+   */
+  readonly fileByteSwap?: 16 | 32;
 }
 
 const GBA_LOGO_PREFIX = Buffer.from([
@@ -96,6 +106,73 @@ const GB_LOGO_PREFIX = Buffer.from([
   0xce, 0xed, 0x66, 0x66, 0xcc, 0x0d, 0x00, 0x0b, 0x03, 0x73, 0x00, 0x83, 0x00,
   0x0c, 0x00, 0x0d,
 ]);
+
+/** Nintendo 64 cartridge byte order identified from the 0x80371240 signature. */
+export type N64ByteOrder = "big-endian" | "byteswapped-16" | "little-endian";
+
+/** Byte-order facts declared by the Nintendo 64 cartridge header signature. */
+export interface N64ByteOrderFacts {
+  readonly order: N64ByteOrder;
+  /** Permutation a consumer must undo to read native bytes, when swapped. */
+  readonly swap: 16 | 32 | undefined;
+}
+
+/**
+ * Identify the dump byte order of a Nintendo 64 ROM from its first four bytes:
+ * big-endian (.z64), 16-bit byteswapped (.v64), or little-endian (.n64).
+ */
+export const detectN64ByteOrder = (
+  bytes: Buffer,
+): N64ByteOrderFacts | undefined => {
+  if (bytes.length < 4) return undefined;
+  if (
+    bytes[0] === 0x80 &&
+    bytes[1] === 0x37 &&
+    bytes[2] === 0x12 &&
+    bytes[3] === 0x40
+  ) {
+    return { order: "big-endian", swap: undefined };
+  }
+  if (
+    bytes[0] === 0x37 &&
+    bytes[1] === 0x80 &&
+    bytes[2] === 0x40 &&
+    bytes[3] === 0x12
+  ) {
+    return { order: "byteswapped-16", swap: 16 };
+  }
+  if (
+    bytes[0] === 0x40 &&
+    bytes[1] === 0x12 &&
+    bytes[2] === 0x37 &&
+    bytes[3] === 0x80
+  ) {
+    return { order: "little-endian", swap: 32 };
+  }
+  return undefined;
+};
+
+/** Undo a Nintendo 64 file byte permutation; byte offsets are preserved. */
+export const unswapN64Bytes = (bytes: Buffer, swap: 16 | 32): Buffer => {
+  const out = Buffer.from(bytes);
+  if (swap === 16) {
+    for (let i = 0; i + 1 < out.length; i += 2) {
+      const first = out[i]!;
+      out[i] = out[i + 1]!;
+      out[i + 1] = first;
+    }
+    return out;
+  }
+  for (let i = 0; i + 3 < out.length; i += 4) {
+    const b0 = out[i]!;
+    const b1 = out[i + 1]!;
+    out[i] = out[i + 3]!;
+    out[i + 1] = out[i + 2]!;
+    out[i + 2] = b1;
+    out[i + 3] = b0;
+  }
+  return out;
+};
 
 /**
  * Inspect file prefix bytes and optional path suffix to auto-detect unambiguous
@@ -268,6 +345,22 @@ export const detectConsoleFormatFromHeader = (
     return "gb";
   }
 
+  // Nintendo 64 ROM (0x80371240 signature in any dump byte order, with an
+  // IPL3 boot address inside RDRAM KSEG0)
+  if (bytes.length >= 0x40 && fileSize > 0x1000) {
+    const byteOrder = detectN64ByteOrder(bytes);
+    if (byteOrder !== undefined) {
+      const header =
+        byteOrder.swap === undefined
+          ? bytes
+          : unswapN64Bytes(bytes.subarray(0, 0x40), byteOrder.swap);
+      const boot = header.readUInt32BE(0x08);
+      if (boot >= 0x80000000 && boot < 0x80800000 && boot % 4 === 0) {
+        return "n64";
+      }
+    }
+  }
+
   // 13. GameCube DOL (valid section table with entry in 0x80000000..0x817fffff)
   if (
     (lowerPath.endsWith(".dol") || bytes.length >= 0x100) &&
@@ -299,6 +392,15 @@ export const detectConsoleFormatFromHeader = (
   // 18. WonderSwan / WonderSwan Color (.ws / .wsc)
   if (lowerPath.endsWith(".ws") || lowerPath.endsWith(".wsc")) {
     return "wsc";
+  }
+
+  // 19. Nintendo 64 (.z64 / .v64 / .n64)
+  if (
+    lowerPath.endsWith(".z64") ||
+    lowerPath.endsWith(".v64") ||
+    lowerPath.endsWith(".n64")
+  ) {
+    return "n64";
   }
 
   // Raw SH-4 has no identifying magic. Only the conventional boot filename
@@ -415,6 +517,8 @@ export const admitConsoleTarget = (input: {
       return admitGb(headerBytes, fileBytes, explicitEntry);
     case "wsc":
       return admitWsc(trailerBytes, fileBytes, explicitEntry);
+    case "n64":
+      return admitN64(headerBytes, fileBytes, explicitEntry);
   }
 };
 
@@ -2369,6 +2473,108 @@ const admitWsc = (
   });
 };
 
+const admitN64 = (
+  headerBytes: Buffer,
+  fileBytes: number,
+  explicitEntry?: { canonical: string; source: string },
+): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
+  if (headerBytes.length < 0x40 || fileBytes <= 0x1000) {
+    return err({
+      reason:
+        "n64 ROM requires a 64-byte cartridge header, the 0x1000-byte IPL3 area, and at least one boot image byte",
+      constraint: "file_format_rejected",
+    });
+  }
+  const byteOrder = detectN64ByteOrder(headerBytes);
+  if (byteOrder === undefined) {
+    return err({
+      reason:
+        "n64 ROM does not start with the 0x80371240 cartridge signature in big-endian, 16-bit byteswapped, or little-endian order",
+      constraint: "file_format_rejected",
+    });
+  }
+  const header =
+    byteOrder.swap === undefined
+      ? headerBytes
+      : unswapN64Bytes(headerBytes.subarray(0, 0x40), byteOrder.swap);
+  // IPL3 DMAs the boot image from ROM offset 0x1000 to the header boot
+  // address; the static image keeps that alignment so file offset 0x1000
+  // sits exactly at the boot address.
+  const bootAddress = header.readUInt32BE(0x08);
+  if (bootAddress === 0 || bootAddress % 4 !== 0 || bootAddress < 0x1000) {
+    return err({
+      reason: `n64 header boot address ${hex32(bootAddress)} is not a word-aligned address IPL3 can load the boot image to`,
+      constraint: "file_format_rejected",
+    });
+  }
+  const loadBase = bootAddress - 0x1000;
+  if (loadBase + fileBytes > 0x100000000) {
+    return err({
+      reason:
+        "n64 ROM mapped at its header boot address exceeds the 32-bit address space",
+      constraint: "file_format_rejected",
+    });
+  }
+  const title = header
+    .subarray(0x20, 0x34)
+    .toString("ascii")
+    .replace(/[\0 ]+$/u, "");
+  const gameCode = header
+    .subarray(0x3b, 0x3f)
+    .toString("ascii")
+    .replace(/\0+$/u, "");
+  const entryPoint = explicitEntry?.canonical ?? hex32(bootAddress);
+  return ok({
+    format: "n64",
+    architecture: "r4300",
+    ghidraLanguageId: "MIPS:BE:32:default",
+    compilerSpecId: "default",
+    loader: "BinaryLoader",
+    loadBase: hex32(loadBase),
+    entryPoint,
+    entryPointSource: explicitEntry?.source ?? hex32(bootAddress),
+    fileMappings: [
+      {
+        name: "ROM",
+        virtualAddress: hex32(loadBase),
+        fileOffset: 0,
+        byteLength: fileBytes,
+        executable: true,
+        writable: false,
+      },
+    ],
+    memoryRegions: [
+      {
+        name: "SP_DMEM",
+        virtualAddress: "0xa4000000",
+        byteLength: 0x1000,
+        kind: "scratchpad",
+      },
+      {
+        name: "SP_IMEM",
+        virtualAddress: "0xa4001000",
+        byteLength: 0x1000,
+        kind: "scratchpad",
+      },
+      {
+        name: "RCP_IO",
+        virtualAddress: "0xa4040000",
+        byteLength: 0x8c0000,
+        kind: "mmio",
+      },
+    ],
+    romMetadata: {
+      game_title: title,
+      game_code: gameCode,
+      rom_version: header[0x3f]!,
+      clock_rate: header.readUInt32BE(0x04),
+      boot_address: hex32(bootAddress),
+      byte_order: byteOrder.order,
+    },
+    ...(byteOrder.swap === undefined ? {} : { fileByteSwap: byteOrder.swap }),
+  });
+};
+
 interface ParsedMappingInterval {
   readonly start: bigint;
   readonly end: bigint;
@@ -2587,6 +2793,9 @@ export const formatConsoleTargetSpecTsv = (
   const lines: string[] = [
     `meta\t${admission.format}\t${admission.ghidraLanguageId}\t${admission.entryPoint}\t${admission.loader}`,
   ];
+  if (admission.fileByteSwap !== undefined) {
+    lines.push(`swap\t${admission.fileByteSwap}`);
+  }
   const entry = (() => {
     try {
       return BigInt(admission.entryPoint);

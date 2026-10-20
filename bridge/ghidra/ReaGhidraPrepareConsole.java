@@ -123,6 +123,7 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
         String expectedLanguage = null;
         String entryHex = null;
         String loader = null;
+        int swapMode = 0;
         List<FileMapSpec> fileMaps = new ArrayList<>();
         List<MemoryRegionSpec> memRegions = new ArrayList<>();
 
@@ -167,6 +168,18 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
                         rwx.indexOf('w') >= 0,
                         rwx.indexOf('x') >= 0
                     ));
+                }
+                case "swap" -> {
+                    if (fields.length != 2) {
+                        throw new IllegalArgumentException("Malformed swap record in console spec");
+                    }
+                    int parsed = Integer.parseInt(fields[1]);
+                    if (parsed != 16 && parsed != 32) {
+                        throw new IllegalArgumentException(
+                            "Unsupported console spec byte swap: " + fields[1]
+                        );
+                    }
+                    swapMode = parsed;
                 }
                 default -> throw new IllegalArgumentException(
                     "Unknown console spec record kind: " + fields[0]
@@ -250,6 +263,9 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
                 created.setRead(map.readable);
                 created.setWrite(map.writable);
                 created.setExecute(map.executable);
+                if (swapMode != 0) {
+                    unswapBlockBytes(memory, start, map.byteLength, swapMode);
+                }
             }
 
         }
@@ -322,6 +338,12 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
             "REA console entry",
             String.format("0x%x", rawEntryOffset)
         );
+        if (swapMode != 0) {
+            currentProgram.getOptions(Program.PROGRAM_INFO).setString(
+                "REA console file byte swap",
+                Integer.toString(swapMode)
+            );
+        }
         currentProgram.getOptions(Program.PROGRAM_INFO).setBoolean("REA console prepared", true);
     }
 
@@ -511,6 +533,46 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
                 }
                 cursor = chunkEnd + 1;
             }
+        }
+    }
+
+    /**
+     * Restore native byte order in a mapped block whose dump stores bytes
+     * permuted in swapMode-bit groups. File offsets are unchanged; the chunk
+     * size is a multiple of both group sizes so groups never straddle chunks.
+     */
+    private void unswapBlockBytes(Memory memory, Address start, long byteLength, int swapMode)
+            throws Exception {
+        final int chunkBytes = 1 << 20;
+        byte[] buffer = new byte[chunkBytes];
+        long done = 0;
+        while (done < byteLength) {
+            monitor.checkCancelled();
+            int n = (int) Math.min(chunkBytes, byteLength - done);
+            Address chunkStart = start.add(done);
+            if (memory.getBytes(chunkStart, buffer, 0, n) != n) {
+                throw new IllegalStateException(
+                    "Could not read mapped bytes for byte-order normalization"
+                );
+            }
+            if (swapMode == 16) {
+                for (int i = 0; i + 1 < n; i += 2) {
+                    byte first = buffer[i];
+                    buffer[i] = buffer[i + 1];
+                    buffer[i + 1] = first;
+                }
+            } else {
+                for (int i = 0; i + 3 < n; i += 4) {
+                    byte b0 = buffer[i];
+                    byte b1 = buffer[i + 1];
+                    buffer[i] = buffer[i + 3];
+                    buffer[i + 1] = buffer[i + 2];
+                    buffer[i + 2] = b1;
+                    buffer[i + 3] = b0;
+                }
+            }
+            memory.setBytes(chunkStart, buffer, 0, n);
+            done += n;
         }
     }
 

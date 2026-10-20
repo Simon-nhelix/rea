@@ -646,6 +646,7 @@ const tryAutoDetectConsoleBinaryTarget = async (input: {
         "saturn",
         "nds",
         "md",
+        "n64",
       ].includes(detectedFormat)
     ) {
       return err(

@@ -200,7 +200,7 @@ explicit path or endpoint and do not need it.
   `inspect_pe_resources` with an explicit path. This portable operation requires
   no active target or engine; opaque payloads retain file ranges and SHA-256.
 - Console ROM or console executable (`psx-exe`, `ps2-elf`, `psp`, `ps3`, `xbox`,
-  `gc-dol`, `gba`, `nds`, `saturn`, `md`, `snes`, `pce`, `nes`, `gb`, `wsc`):
+  `gc-dol`, `gba`, `nds`, `saturn`, `md`, `snes`, `pce`, `nes`, `gb`, `wsc`, `n64`):
   use `search_rom_strings`, `discover_pointer_tables`, `scan_pointer_table`, and
   `find_code_caves` for string/table/cave workflows (these run directly on local
   ROM bytes by default; pass `resolve_xrefs: true` only when cross-references

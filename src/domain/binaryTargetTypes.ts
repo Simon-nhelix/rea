@@ -27,6 +27,7 @@ export const BINARY_ARCHITECTURES = [
   "cell-ppu",
   "xenon",
   "gekko",
+  "r4300",
   "riscv",
   "powerpc",
   "m68k",
@@ -94,6 +95,7 @@ export const CONSOLE_ONLY_ARCHITECTURES = [
   "cell-ppu",
   "xenon",
   "gekko",
+  "r4300",
 ] as const satisfies readonly BinaryArchitecture[];
 export type ConsoleOnlyArchitecture =
   (typeof CONSOLE_ONLY_ARCHITECTURES)[number];

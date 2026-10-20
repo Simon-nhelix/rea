@@ -58,7 +58,7 @@ export const registerCodeReferenceCommands = (
         .enum(CODE_REFERENCE_ARCHITECTURES)
         .default("mips-le")
         .describe(
-          "Instruction set to scan (mips-le, sh2-be, sh4-le, 65816, 6502, huc6280, arm-le, thumb-le)",
+          "Instruction set to scan (mips-le, mips-be, sh2-be, sh4-le, 65816, 6502, huc6280, arm-le, thumb-le)",
         ),
       gp: z
         .string()

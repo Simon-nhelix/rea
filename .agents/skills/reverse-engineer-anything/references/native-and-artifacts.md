@@ -300,9 +300,9 @@ Evidence in `rea compare-wasm-interfaces input.json --json`.
 
 ## Console ROMs and game localization
 
-REA admits 16 console ROM and executable formats (`psx-exe`, `ps2-elf`,
+REA admits 17 console ROM and executable formats (`psx-exe`, `ps2-elf`,
 `psp`, `ps3`, `xbox`, `gc-dol`, `gba`, `nds`, `saturn`, `md`, `snes`, `pce`,
-`nes`, `gb`, `wsc`, `dc-bin`) and configures architecture/bank memory maps (plus GBA
+`nes`, `gb`, `wsc`, `dc-bin`, `n64`) and configures architecture/bank memory maps (plus GBA
 hardware IO register symbols `REG_*`) when opening in headless Ghidra.
 Raw Dreamcast binaries other than `1ST_READ.BIN` need explicit `dc-bin` selection.
 
@@ -323,6 +323,17 @@ load address and entry. Keep capture SHA-256, source disc/BIOS identities,
 PC/frame/cycle, MPR values and debugger source offsets separately. Snapshot-file
 offsets are not disc offsets. The map stays frozen; `TAM` does not remap it.
 REA neither captures emulator memory nor validates the external capture.
+
+Nintendo 64 images (`.z64`, `.v64`, `.n64`) are admitted from the
+`0x80371240` cartridge signature in any of the three dump byte orders;
+byteswapped and little-endian dumps are normalized to native big-endian bytes
+for analysis while file offsets and digests keep identifying the original
+dump. The whole cartridge is mapped so file offset `0x1000` sits at the header
+boot address (the IPL3 DMA target); code beyond that boot image is shown at
+cartridge-image coordinates, not the RDRAM addresses the game later DMAs it
+to. The PI cartridge window (`0xb0000000`), TLB segments and RSP microcode are
+not modeled. Code-reference scans of N64 software use the `mips-be` scanner
+variant; local string/table tools take big-endian pointer settings.
 
 Four specialized workflows support console ROM string extraction, pointer table
 analysis, and code cave discovery:

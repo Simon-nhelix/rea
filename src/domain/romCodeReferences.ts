@@ -1,9 +1,10 @@
 import { z } from "zod";
 
 /**
- * Static search for references to addresses inside MIPS little-endian code and
- * data files (PS1 R3000; PS2/PSP use the same encoding for the instructions
- * decoded here). Pure byte logic: file access and Evidence live elsewhere.
+ * Static search for references to addresses inside MIPS code and data files
+ * (little-endian for PS1 R3000 and PS2/PSP, big-endian for Nintendo 64 VR4300;
+ * the decoded instruction encodings are the same). Pure byte logic: file
+ * access and Evidence live elsewhere.
  */
 
 const HEX_ADDRESS = /^(?:0[xX])?[0-9a-fA-F]{1,8}$/u;
@@ -70,6 +71,7 @@ import {
 
 export const CODE_REFERENCE_ARCHITECTURES = [
   "mips-le",
+  "mips-be",
   "sh2-be",
   "sh4-le",
   "65816",
@@ -85,6 +87,12 @@ export const codeReferenceArchitectureSchema = z.enum(
 export type CodeReferenceArchitecture = z.infer<
   typeof codeReferenceArchitectureSchema
 >;
+
+/** MIPS scanner variants; the decoder is shared, only the word order differs. */
+export const isMipsCodeReferenceArchitecture = (
+  architecture: CodeReferenceArchitecture,
+): architecture is "mips-le" | "mips-be" =>
+  architecture === "mips-le" || architecture === "mips-be";
 
 export const findCodeReferencesInputSchema = z.strictObject({
   files: z
@@ -175,6 +183,7 @@ export const LOAD_ADDRESS_SOURCES = [
   "sega-ip-header",
   "ines-header",
   "gba-rom-header",
+  "n64-rom-header",
   "caller",
 ] as const;
 
@@ -352,8 +361,8 @@ export interface RawReference {
   readonly callerSignature?: string | undefined;
 }
 
-const bytesOf = (word: number): string =>
-  [0, 8, 16, 24]
+const bytesOf = (word: number, littleEndian: boolean): string =>
+  (littleEndian ? [0, 8, 16, 24] : [24, 16, 8, 0])
     .map((shift) => ((word >>> shift) & 0xff).toString(16).padStart(2, "0"))
     .join(" ");
 
@@ -590,6 +599,7 @@ export const scanMipsRegion = (
   scanTargets: readonly ScanTarget[],
   kinds: ReadonlySet<CodeReferenceKind>,
   options?: ScanOptions,
+  littleEndian = true,
 ): RawReference[] => {
   const targets: Target[] = scanTargets.map((target, index) => ({
     start: target.address >>> 0,
@@ -634,7 +644,7 @@ export const scanMipsRegion = (
       fileOffset: current.fileOffset,
       address: current.pc,
       instruction,
-      bytes: bytesOf(current.word),
+      bytes: bytesOf(current.word, littleEndian),
       register,
       targetAddress: formed >>> 0,
       targetIndex: target.index,
@@ -662,7 +672,7 @@ export const scanMipsRegion = (
   const skip = (4 - (region.address % 4)) % 4;
   for (let rel = skip; rel + 4 <= region.length; rel += 4) {
     const fileOffset = region.fileOffset + rel;
-    const word = view.getUint32(fileOffset, true);
+    const word = view.getUint32(fileOffset, littleEndian);
     current = decode(word, (region.address + rel) >>> 0, fileOffset);
 
     // Aligned pointer words: any 32-bit value equal to a target address.
@@ -726,8 +736,14 @@ export const scanCodeRegion = (
     includeCallerSignatures:
       options?.includeCallerSignatures ?? region.includeCallerSignatures,
   };
-  return architecture === "mips-le"
-    ? scanMipsRegion(region, scanTargets, kinds, mergedOptions)
+  return isMipsCodeReferenceArchitecture(architecture)
+    ? scanMipsRegion(
+        region,
+        scanTargets,
+        kinds,
+        mergedOptions,
+        architecture === "mips-le",
+      )
     : scanArchitectureRegion(
         architecture,
         region,

@@ -531,6 +531,64 @@ describe("call argument provenance", () => {
   });
 });
 
+describe("mips-be scanCodeRegion", () => {
+  it("scans big-endian MIPS (mips-be) with the shared MIPS decoder", () => {
+    const beBytesOf = (words: readonly number[]): Uint8Array => {
+      const out = new Uint8Array(words.length * 4);
+      const view = new DataView(out.buffer);
+      words.forEach((word, index) => view.setUint32(index * 4, word, false));
+      return out;
+    };
+    const words = [
+      lui(R.a0, 0x800d),
+      addiu(R.a0, R.a0, -0x2e8),
+      jal(0x800cba44),
+      nop,
+      0x800cfd18, // aligned pointer word in data
+    ];
+    const region = {
+      file: "game.z64",
+      bytes: beBytesOf(words),
+      fileOffset: 0,
+      length: words.length * 4,
+      address: 0x80000400,
+    };
+    const targets = [
+      { address: 0x800cfd18, length: 1 },
+      { address: 0x800cba44, length: 1 },
+    ];
+    const hits = scanCodeRegion("mips-be", region, targets, ALL);
+    expect(hits.map((h) => [h.kind, h.address])).toEqual([
+      ["address_pair", 0x80000404],
+      ["call", 0x80000408],
+      ["pointer_word", 0x80000410],
+    ]);
+    // Instruction bytes are printed in file order.
+    expect(hits[1]?.bytes).toBe("0c 03 2e 91");
+
+    // Big-endian $gp initializer recovery follows the same decoder.
+    const gpBytes = beBytesOf([lui(28, 0x8006), addiu(28, 28, -0x3e58)]);
+    expect(
+      findGpInitializer({
+        bytes: gpBytes,
+        fileOffset: 0,
+        length: gpBytes.length,
+        address: 0x80000400,
+        littleEndian: false,
+      }),
+    ).toEqual({ value: 0x8005c1a8, address: 0x80000400, fileOffset: 0 });
+    // The same bytes read little-endian find nothing.
+    expect(
+      findGpInitializer({
+        bytes: gpBytes,
+        fileOffset: 0,
+        length: gpBytes.length,
+        address: 0x80000400,
+      }),
+    ).toBeUndefined();
+  });
+});
+
 describe("multi-architecture scanCodeRegion", () => {
   it("scans SuperH sh2-be mov.l @(disp,PC) literal pool loads, jsr @Rn, and bsr", () => {
     // PC at 0x06004000:

@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   admitConsoleTarget,
   detectConsoleFormatFromHeader,
+  detectN64ByteOrder,
   formatConsoleTargetSpecTsv,
   resolveConsoleFileOffset,
   resolveConsoleVirtualAddress,
+  unswapN64Bytes,
 } from "./consoleRom.js";
 
 describe("consoleRom", () => {
@@ -662,5 +664,177 @@ describe("PCE reset mapping provenance", () => {
     if (!ovAdmitted.ok) return;
     expect(ovAdmitted.value.entryPoint).toBe("0x814e40");
     expect(resolveConsoleFileOffset(ovAdmitted.value, 0x00815e40)).toBe(0x1040);
+  });
+});
+
+const buildN64Rom = (bootAddress = 0x80000400): Buffer => {
+  const rom = Buffer.alloc(0x2000, 0);
+  rom.set([0x80, 0x37, 0x12, 0x40], 0);
+  rom.writeUInt32BE(0x0000000f, 0x04); // clock rate
+  rom.writeUInt32BE(bootAddress, 0x08); // IPL3 boot address
+  rom.write("TEST GAME", 0x20, "ascii");
+  for (let i = 0x20 + "TEST GAME".length; i < 0x34; i++) rom[i] = 0x20;
+  rom.write("NTST", 0x3b, "ascii");
+  rom[0x3f] = 1; // ROM version
+  // lui $t0, 0x8000 at the boot image start (file offset 0x1000)
+  rom.writeUInt32BE(0x3c088000, 0x1000);
+  return rom;
+};
+
+const swapBytes16 = (bytes: Buffer): Buffer => {
+  const out = Buffer.from(bytes);
+  for (let i = 0; i + 1 < out.length; i += 2) {
+    const first = out[i]!;
+    out[i] = out[i + 1]!;
+    out[i + 1] = first;
+  }
+  return out;
+};
+
+const swapWords32 = (bytes: Buffer): Buffer => {
+  const out = Buffer.from(bytes);
+  for (let i = 0; i + 3 < out.length; i += 4) {
+    const word = out.readUInt32BE(i);
+    out.writeUInt32LE(word, i);
+  }
+  return out;
+};
+
+describe("consoleRom Nintendo 64", () => {
+  const buildRom = buildN64Rom;
+  const swap16 = swapBytes16;
+  const swap32 = swapWords32;
+
+  it("identifies all three dump byte orders from the signature", () => {
+    const rom = buildRom();
+    expect(detectN64ByteOrder(rom)).toEqual({
+      order: "big-endian",
+      swap: undefined,
+    });
+    expect(detectN64ByteOrder(swap16(rom))).toEqual({
+      order: "byteswapped-16",
+      swap: 16,
+    });
+    expect(detectN64ByteOrder(swap32(rom))).toEqual({
+      order: "little-endian",
+      swap: 32,
+    });
+    expect(detectN64ByteOrder(Buffer.alloc(16))).toBeUndefined();
+    expect(detectN64ByteOrder(Buffer.alloc(3))).toBeUndefined();
+    // Unswap is its own inverse in both modes.
+    expect(unswapN64Bytes(swap16(rom), 16).equals(rom)).toBe(true);
+    expect(unswapN64Bytes(swap32(rom), 32).equals(rom)).toBe(true);
+  });
+
+  it("auto-detects and admits a big-endian .z64 image at the boot alignment", () => {
+    const rom = buildRom();
+    expect(
+      detectConsoleFormatFromHeader(rom, rom.length, "/roms/game.bin"),
+    ).toBe("n64");
+    const admitted = admitConsoleTarget({
+      format: "n64",
+      headerBytes: rom,
+      fileBytes: rom.length,
+    });
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    expect(admitted.value.format).toBe("n64");
+    expect(admitted.value.architecture).toBe("r4300");
+    expect(admitted.value.ghidraLanguageId).toBe("MIPS:BE:32:default");
+    expect(admitted.value.entryPoint).toBe("0x80000400");
+    expect(admitted.value.loadBase).toBe("0x7ffff400");
+    expect(admitted.value.fileByteSwap).toBeUndefined();
+    expect(admitted.value.romMetadata).toMatchObject({
+      game_title: "TEST GAME",
+      game_code: "NTST",
+      rom_version: 1,
+      byte_order: "big-endian",
+      boot_address: "0x80000400",
+    });
+    // IPL3 loads file offset 0x1000 to the boot address.
+    expect(resolveConsoleVirtualAddress(admitted.value, 0x1000)).toBe(
+      "0x80000400",
+    );
+    expect(resolveConsoleFileOffset(admitted.value, 0x80000400)).toBe(0x1000);
+    const tsv = formatConsoleTargetSpecTsv(admitted.value);
+    expect(tsv).toContain("meta\tn64\tMIPS:BE:32:default\t0x80000400");
+    expect(tsv).not.toContain("swap\t");
+  });
+
+  it("admits byteswapped and little-endian dumps with the same facts", () => {
+    for (const [dump, swap, order] of [
+      [swap16(buildRom()), 16, "byteswapped-16"],
+      [swap32(buildRom()), 32, "little-endian"],
+    ] as const) {
+      expect(
+        detectConsoleFormatFromHeader(dump, dump.length, "/roms/game.rom"),
+      ).toBe("n64");
+      const admitted = admitConsoleTarget({
+        format: "n64",
+        headerBytes: dump,
+        fileBytes: dump.length,
+      });
+      expect(admitted.ok).toBe(true);
+      if (!admitted.ok) return;
+      expect(admitted.value.entryPoint).toBe("0x80000400");
+      expect(admitted.value.romMetadata.game_title).toBe("TEST GAME");
+      expect(admitted.value.romMetadata.byte_order).toBe(order);
+      expect(admitted.value.fileByteSwap).toBe(swap);
+      const tsv = formatConsoleTargetSpecTsv(admitted.value);
+      expect(tsv).toContain(`swap\t${swap}`);
+      // The layout matches the big-endian dump exactly.
+      expect(admitted.value.fileMappings).toEqual([
+        {
+          name: "ROM",
+          virtualAddress: "0x7ffff400",
+          fileOffset: 0,
+          byteLength: dump.length,
+          executable: true,
+          writable: false,
+        },
+      ]);
+    }
+  });
+
+  it("needs the suffix channel when the boot address is outside RDRAM", () => {
+    const rom = buildRom(0x90000400);
+    expect(
+      detectConsoleFormatFromHeader(rom, rom.length, "/roms/game.bin"),
+    ).toBeUndefined();
+    expect(
+      detectConsoleFormatFromHeader(rom, rom.length, "/roms/game.z64"),
+    ).toBe("n64");
+  });
+
+  it("rejects non-cartridge bytes and unusable boot addresses", () => {
+    expect(
+      admitConsoleTarget({
+        format: "n64",
+        headerBytes: Buffer.alloc(0x2000, 0),
+        fileBytes: 0x2000,
+      }).ok,
+    ).toBe(false);
+    expect(
+      admitConsoleTarget({
+        format: "n64",
+        headerBytes: buildRom(0),
+        fileBytes: 0x2000,
+      }).ok,
+    ).toBe(false);
+    expect(
+      admitConsoleTarget({
+        format: "n64",
+        headerBytes: buildRom(0x80000402),
+        fileBytes: 0x2000,
+      }).ok,
+    ).toBe(false);
+    // Header and IPL3 alone carry no boot image byte.
+    expect(
+      admitConsoleTarget({
+        format: "n64",
+        headerBytes: buildRom(),
+        fileBytes: 0x1000,
+      }).ok,
+    ).toBe(false);
   });
 });

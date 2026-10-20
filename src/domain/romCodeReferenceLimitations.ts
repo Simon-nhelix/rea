@@ -1,4 +1,7 @@
-import type { CodeReferenceArchitecture } from "./romCodeReferences.js";
+import {
+  isMipsCodeReferenceArchitecture,
+  type CodeReferenceArchitecture,
+} from "./romCodeReferences.js";
 
 /** What the static MIPS reference scan cannot see or assumes. */
 const MIPS_LIMITATIONS: readonly string[] = [
@@ -13,7 +16,7 @@ const MIPS_LIMITATIONS: readonly string[] = [
 export const codeReferenceLimitations = (
   architecture: CodeReferenceArchitecture,
 ): readonly string[] => {
-  if (architecture === "mips-le") return MIPS_LIMITATIONS;
+  if (isMipsCodeReferenceArchitecture(architecture)) return MIPS_LIMITATIONS;
   const decoder =
     architecture === "sh2-be" || architecture === "sh4-le"
       ? "Static aligned 16-bit SuperH sweep with selected PC-literal loads, moves, immediate additions and branches. Call arguments require an available decoded delay slot. Unmodelled instructions discard register constants."

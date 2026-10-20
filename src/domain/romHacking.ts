@@ -1697,6 +1697,8 @@ export type RomByteSourceDescription = {
   readonly reason: "requested" | "format_not_recognized";
   readonly byte_length: number;
   readonly sector_size?: number;
+  /** Dump byte permutation undone while reading; file offsets are unchanged. */
+  readonly byte_swap_undone?: 16 | 32;
   readonly disc?: RomDiscSourceDescription;
 };
 
@@ -1710,6 +1712,8 @@ export const romByteSourceSchema = z.strictObject({
   byte_length: z.number().int().min(0),
   /** User-data sector size; file offsets divide into sectors of this size. */
   sector_size: z.number().int().min(1).optional(),
+  /** Dump byte permutation undone while reading; file offsets are unchanged. */
+  byte_swap_undone: z.union([z.literal(16), z.literal(32)]).optional(),
   disc: z
     .strictObject({
       track: z.number().int().min(1),
