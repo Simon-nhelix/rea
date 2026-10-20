@@ -25,6 +25,7 @@ import {
 } from "./jsonValue.js";
 import {
   freezeJsonSnapshot,
+  canBorrowParsedJsonSnapshot,
   isImmutableJsonSnapshot,
 } from "./immutableJson.js";
 import { digestSchema } from "./../domain/digests.js";
@@ -59,6 +60,7 @@ const subjectFormatSchema = z.enum([
   "hsp",
   "app-pack",
   "asar",
+  "godot-pck",
   "dmg",
   "pkg",
   "plist",
@@ -297,8 +299,12 @@ export const parseEvidence = (input: unknown): Evidence => {
 };
 
 /** Authenticate and seal a ledger-owned snapshot; external mutable values are copied first. */
-export const immutableEvidence = (input: unknown): Evidence =>
-  rememberImmutableEvidence(parseEvidence(input));
+export const immutableEvidence = (input: unknown): Evidence => {
+  const parsed = parseEvidence(input);
+  return rememberImmutableEvidence(
+    canBorrowParsedJsonSnapshot(input, parsed) ? input : parsed,
+  );
+};
 
 /** Rebind display path metadata when an authenticated record names this target. */
 export const rebindEvidenceToTargetPath = (

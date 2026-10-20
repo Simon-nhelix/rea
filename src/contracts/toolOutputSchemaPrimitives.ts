@@ -64,6 +64,7 @@ export const targetFormatSchema = z.enum([
   ...CONSOLE_TARGET_FORMATS,
   ...ZIP_PACKAGE_FORMATS,
   "asar",
+  "godot-pck",
   "dmg",
   "pkg",
   "plist",

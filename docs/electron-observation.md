@@ -33,6 +33,12 @@ encoded path separators, ASAR directories or links, and nonexistent paths are
 rejected. The endpoint exposes every eligible target and its local path
 metadata.
 
+Cancellation stops further file authorization after an already-started filesystem
+operation settles. ASAR descriptor-close failures remain typed incomplete cleanup
+with an exact retryable owner; they are not treated as a missing or unauthorized
+page. A later authorization and provider shutdown retry retained descriptors
+before reporting their release.
+
 ## Workflow
 
 `list_electron_targets` returns every eligible target served by the supplied endpoint in one inline array.
@@ -68,7 +74,12 @@ Script metadata retains its execution-context frame ID when CDP supplies one. Th
 inventories worker, service-worker, and shared-worker targets with
 validated opener-target and parent-frame IDs. Worker discovery uses passive
 target metadata; REA does not attach to or execute code in those targets.
-Collection counts and aggregate script-source bytes are not capped. Like every
+Script-source collection retains at most 32 MiB of UTF-8 text across scripts
+and shares a 20-second collection deadline. Omitted sources retain their script
+metadata and an explicit reason; later smaller sources may still fit after an
+oversized source is omitted. The separate 64 MiB CDP response limit bounds one
+wire message before retention admission, rather than total transient memory.
+The source budget adds no script-count cap. Like every
 target, frame, script, and resource, a worker URL must resolve to a local
 file before it is retained. Relationship IDs improve
 attribution but do not prove which static module started a worker or that its
@@ -193,8 +204,25 @@ Caller-defined `.listener` properties can change the identity exposed by
 wrapper recognition. Re-registering a raw recording wrapper on another channel
 retains the original registration's channel attribution.
 Mutating `.listener` on a raw recording wrapper can also prevent removal through
-application decorators; the reproduced identity conflict is tracked in
-[#4513](https://github.com/morluto/rea/issues/4513).
+application decorators that bypass the hook's removal methods. When a removal
+request reaches the hook's methods and its registration order is known, private
+callback ownership preserves removal by the original function and the newest
+matching registration when public metadata is changed or deleted. Native removal
+still determines getter execution, exceptions and removal meta-events.
+
+If registration or removal methods differ from the Node methods captured at hook
+initialization, the hook leaves listener callbacks unwrapped and records a
+`listener-registration` observation gap. The application keeps its original
+callback and receiver; callback execution remains unobserved. This comparison
+assumes Node's EventEmitter prototype has not itself been globally decorated
+before hook initialization. The provider loads the hook before the application
+and excludes `NODE_OPTIONS` from the child environment.
+
+An opaque later listener or unsupported emitter state can prevent proof of
+removal order. The hook then delegates removal
+to the native method and records a `listener-removal` gap rather than claiming
+which registration was removed. These gaps are distinct from dropped records
+and do not establish IPC delivery or successful removal.
 
 ### Target fuse prerequisites
 
