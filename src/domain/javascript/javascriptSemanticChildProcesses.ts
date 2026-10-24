@@ -2,11 +2,16 @@ import * as t from "@babel/types";
 
 import type {
   JavaScriptSemanticCallable,
+  JavaScriptSemanticProjectedResultBinding,
   JavaScriptSemanticChildProcessInteraction,
   JavaScriptSemanticChildProcessSpawn,
 } from "./javascriptSemanticIr.js";
 import { createSemanticCallableIdStack } from "./javascriptSemanticCallableStack.js";
-import { createSemanticExpressionShapeResolver } from "./javascriptSemanticExpressionShapes.js";
+import {
+  createSemanticExpressionShapeResolver,
+  optionsAfterOptionalArgv,
+  type JavaScriptExpressionShapeResolver,
+} from "./javascriptSemanticExpressionShapes.js";
 import {
   semanticStaticPropertyName,
   staticObjectProperty,
@@ -40,20 +45,14 @@ interface ChildProcessAnalysis {
   readonly childProcessInteractions: readonly JavaScriptSemanticChildProcessInteraction[];
 }
 
-type ChildSpawnContext = ReturnType<
-  typeof createSemanticExpressionShapeResolver
->;
+type ChildSpawnContext = JavaScriptExpressionShapeResolver;
 
 interface SpawnCandidate {
   readonly node: t.CallExpression | t.OptionalCallExpression;
   readonly method: JavaScriptSemanticChildProcessSpawn["method"];
   readonly ownerCallableId: string | null;
   readonly resultBindingId: string | null;
-  readonly projectedResultBindings: readonly {
-    readonly bindingId: string;
-    readonly projectionPath: readonly (string | number | null)[];
-    readonly resolution: "complete" | "partial";
-  }[];
+  readonly projectedResultBindings: readonly JavaScriptSemanticProjectedResultBinding[];
 }
 
 interface ChildInteractionContext {
@@ -384,22 +383,15 @@ const spawnArguments = (
   const args = candidate.node.arguments;
   if (t.isSpreadElement(args[0])) return { options: args[0], argvCount: null };
   const second = args[1] && unwrapJavaScriptExpression(args[1]).node;
-  const third = args[2] && unwrapJavaScriptExpression(args[2]).node;
-  const expressionShape = context;
   const argv =
     candidate.method !== "exec" && t.isArrayExpression(second)
       ? second
       : undefined;
-  // Only a proven argv array or nullish placeholder admits third-slot options.
-  // Otherwise the second argument may itself be options, ignoring the third.
+  // exec(command[, options][, callback]) has no argv slot.
   const options =
-    candidate.method === "exec" || second === undefined
+    candidate.method === "exec"
       ? second
-      : argv !== undefined ||
-          expressionShape.isArray(second) ||
-          expressionShape.isNullish(second)
-        ? third
-        : second;
+      : optionsAfterOptionalArgv(args, context);
   return {
     options,
     argvCount:

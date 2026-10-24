@@ -16,6 +16,7 @@ export interface ResponseBodyCandidate {
 
 /** Event accumulator that validates and normalizes payloads at ingestion. */
 export class CdpCaptureEvents implements CdpCaptureEventsState {
+  readonly #coverageStarts = new Map<"Network" | "Runtime", string>();
   #scriptMetadataBudgetExclusionsRecorded = false;
   readonly #networkRequestOccurrences = new Map<string, number>();
   readonly #responseBodyExaminedOccurrences = new Map<string, number>();
@@ -29,6 +30,7 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
   readonly network = new Map<string, NetworkState>();
   readonly networkRequestTimestamps = new Map<string, number>();
   readonly malformedRedirectRequestIds = new Set<string>();
+  readonly missingRequestBodyShapeIds = new Set<string>();
   readonly webSocketConnectionsById = new Map<
     string,
     WebPageInspection["network"]["websocket_connections"][number]
@@ -45,6 +47,7 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
   ]);
   originViolation = false;
   navigationDuringCapture = false;
+  unknownRootIdentity = false;
   mainFrameId: string | undefined = undefined;
   committedDocument: string | undefined = undefined;
 
@@ -58,8 +61,10 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
 
   beginAuthorizedFrame(frameId: string): void {
     this.mainFrameId = frameId;
+    this.#coverageStarts.clear();
     this.originViolation = false;
     this.navigationDuringCapture = false;
+    this.unknownRootIdentity = false;
     this.committedDocument = undefined;
     this.scripts.clear();
     this.scriptMetadataBudgetOmissionsById.clear();
@@ -74,6 +79,7 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
     this.#networkRequestOccurrences.clear();
     this.#responseBodyExaminedOccurrences.clear();
     this.malformedRedirectRequestIds.clear();
+    this.missingRequestBodyShapeIds.clear();
     this.webSocketConnectionsById.clear();
     this.console.length = 0;
     this.responseMetadata.length = 0;
@@ -85,6 +91,19 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
       this.completeness.exclude("json_body_shapes", "not_approved", null);
     if (!this.input.include_websocket_shapes)
       this.completeness.exclude("websocket_shapes", "not_approved", null);
+  }
+
+  /** The first observed domain event or successful enable reply proves activity. */
+  markDomainEnabled(domain: "Network" | "Runtime"): void {
+    if (!this.#coverageStarts.has(domain))
+      this.#coverageStarts.set(domain, new Date().toISOString());
+  }
+
+  coverageStartedAt(domain: "Network" | "Runtime"): string {
+    const started = this.#coverageStarts.get(domain);
+    if (started === undefined)
+      throw new Error(`${domain} observation has not been enabled`);
+    return started;
   }
 
   beginFinalCapture(frameId: string): void {
@@ -122,6 +141,16 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
   }
 
   ingest(event: CdpEvent): void {
+    if (this.mainFrameId !== undefined) {
+      if (event.method.startsWith("Network."))
+        this.markDomainEnabled("Network");
+      if (event.method.startsWith("Runtime."))
+        this.markDomainEnabled("Runtime");
+    }
+    if (event.method === "Page.frameNavigated") {
+      handlers.handleFrameNavigated(this, event.params);
+      return;
+    }
     const params = recordValue(event.params);
     if (params === undefined) return;
     switch (event.method) {
@@ -157,9 +186,6 @@ export class CdpCaptureEvents implements CdpCaptureEventsState {
         break;
       case "Runtime.consoleAPICalled":
         handlers.handleConsoleAPICalled(this, params);
-        break;
-      case "Page.frameNavigated":
-        handlers.handleFrameNavigated(this, params);
         break;
       case "Network.webSocketCreated":
         handlers.handleWebSocketCreated(this, params);

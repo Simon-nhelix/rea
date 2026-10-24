@@ -571,6 +571,49 @@ describe("artifact comparison completeness", () => {
 });
 
 describe("artifact source-map relationship coverage", () => {
+  it("reports when an unchanged map points to changed source content", async () => {
+    const root = await createTestTempDirectory("rea-map-target-change-");
+    const leftPath = join(root, "left");
+    const rightPath = join(root, "right");
+    await Promise.all([mkdir(leftPath), mkdir(rightPath)]);
+    await Promise.all([
+      writeFile(join(leftPath, "main.js"), "/* first source */\n"),
+      writeFile(join(rightPath, "main.js"), "/* second source */\n"),
+      writeFile(
+        join(leftPath, "main.js.map"),
+        '{"version":3,"sources":[],"names":[],"mappings":""}',
+      ),
+      writeFile(
+        join(rightPath, "main.js.map"),
+        '{"version":3,"sources":[],"names":[],"mappings":""}',
+      ),
+    ]);
+    const [left, right] = await Promise.all([
+      observe(leftPath),
+      observe(rightPath),
+    ]);
+
+    const comparison = compareArtifacts(left, right);
+    const leftInventory = parseArtifactInventoryEvidence(left).inventory;
+    const rightInventory = parseArtifactInventoryEvidence(right).inventory;
+    const leftMap = leftInventory.occurrences.find(
+      ({ logical_path }) => logical_path === "main.js.map",
+    );
+    const rightMap = rightInventory.occurrences.find(
+      ({ logical_path }) => logical_path === "main.js.map",
+    );
+    expect(leftMap?.artifact_id).toBe(rightMap?.artifact_id);
+    expect(comparison.changes).toContainEqual(
+      expect.objectContaining({
+        logical_path: "main.js.map",
+        classification: "changed",
+        dimensions: ["relations"],
+        left_artifact_id: leftMap?.artifact_id,
+        right_artifact_id: rightMap?.artifact_id,
+      }),
+    );
+  });
+
   it("preserves unknown source-map relationships for duplicate ZIP paths", async () => {
     const root = await createTestTempDirectory("rea-duplicate-source-map-");
     const path = join(root, "duplicate-source-map.zip");
@@ -830,7 +873,13 @@ describe("artifact comparison fragment integrity", () => {
         [conflictingScope, ...leftFragments.slice(1)],
         rightFragments,
       ),
-    ).toThrow(/coverage declaration/u);
+    ).toThrowError(
+      expect.objectContaining({
+        _tag: "AnalysisInputError",
+        userMessage: expect.stringContaining("coverage declaration"),
+        issues: [expect.objectContaining({ path: ["left"] })],
+      }),
+    );
   }, 15_000);
 
   it("rejects non-inventory and tampered Evidence", async () => {
@@ -844,8 +893,12 @@ describe("artifact comparison fragment integrity", () => {
       parameters: {},
       result: evidence.normalized_result,
     });
-    expect(() => compareArtifacts(wrongOperation, evidence)).toThrow(
-      /inspect_artifact/u,
+    expect(() => compareArtifacts(wrongOperation, evidence)).toThrowError(
+      expect.objectContaining({
+        _tag: "AnalysisInputError",
+        userMessage: expect.stringContaining("inspect_artifact"),
+        issues: [expect.objectContaining({ path: ["left"] })],
+      }),
     );
     const mismatchedSubject = createEvidence(
       { path: root, sha256: "f".repeat(64), format: "directory" },
@@ -896,7 +949,7 @@ describe("ZIP non-entry coverage", () => {
       left.normalized_result,
     );
     expect(inventory.limitations).toContain(
-      "ZIP inventory lists central-directory entries only. Non-entry bytes, including an APK Signing Block before the central directory or a ZIP comment after it, are not occurrences.",
+      "ZIP inventory lists central-directory entries only. Non-entry bytes, including leading bytes before the first entry such as a self-extractor stub, an APK Signing Block before the central directory or a ZIP comment after it, are not occurrences.",
     );
     expect(
       inventory.occurrences.map(({ logical_path }) => logical_path).sort(),

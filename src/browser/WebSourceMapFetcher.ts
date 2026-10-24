@@ -1,8 +1,5 @@
 import * as t from "@babel/types";
-import {
-  decodeValidatedSourceMapLeaves,
-  isBeforeSourceMapLeafStop,
-} from "../javascript/sourceMaps/DecodedSourceMap.js";
+import { decodeValidatedSourceMapLeaves } from "../javascript/sourceMaps/DecodedSourceMap.js";
 
 import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
 import { AnalysisResourceConstraintError } from "../domain/analysisErrorCore.js";
@@ -27,12 +24,17 @@ import { createWebTextArtifact } from "../domain/webContentArtifact.js";
 import { safeParseJson } from "../domain/safeJson.js";
 import { sourceMapJsonText } from "../domain/sourceMapEnvelope.js";
 import { resolveJavaScriptSourceMapUrl } from "../domain/javascript/javascriptSourceMapPaths.js";
-import { jsonParts } from "../domain/jsonSerialization.js";
+import { jsonByteLength } from "../domain/jsonSerialization.js";
 import {
   inspectSourceMapValue,
   SourceMapFormatFailure,
   type SourceMapLeaf,
 } from "../javascript/sourceMaps/SourceMapFormat.js";
+import {
+  noRuntimeOverrideSentence,
+  selectedBrowserDeadlineMs,
+} from "../domain/browserDeadline.js";
+import { DEFAULT_SOURCE_MAP_FETCH_TIMEOUT_MS } from "../domain/webBundleAnalysis.js";
 import { WEB_SOURCE_MAP_LIMITS } from "../domain/webSourceLocation.js";
 
 export interface WebSourceMapRequest {
@@ -53,21 +55,23 @@ interface SourceMapFetchHost {
 // Bound a stalled server to 30 seconds and bound raw map input retained for
 // parsing to 64 MiB per inspection. Both limits apply at the network boundary;
 // hitting either produces an explicit fetch_failed item, never truncated data.
-const SOURCE_MAP_FETCH_TIMEOUT_MS = 30_000;
+const SOURCE_MAP_FETCH_TIMEOUT_MS = DEFAULT_SOURCE_MAP_FETCH_TIMEOUT_MS;
+
+const sourceMapFetchDeadlineLimitation = (timeoutMs: number): string =>
+  `Source-map fetch exceeded its ${String(timeoutMs)} ms source_map_fetch_timeout_ms deadline (fetch_failed). This is an item limitation, not a thrown analysis timeout, and not the source-map decode deadline. ${noRuntimeOverrideSentence(`The ${String(SOURCE_MAP_RESPONSE_BYTES)}-byte response budget stays fixed.`, "source_map_fetch_timeout_ms")}`;
 const SOURCE_MAP_RESPONSE_BYTES = 64 * 1024 * 1024;
 const SOURCE_MAP_OUTPUT_BYTES = WEB_SOURCE_MAP_LIMITS.outputBytes;
 const SOURCE_MAP_FAILURE_LIMITATION_RESERVE = 512;
 const SOURCE_MAP_COLLECTION_ENVELOPE_RESERVE = 1_024;
 
-type SourceMaps = WebSourceMaps;
-type SourceMapItem = WebSourceMapItem;
 type ParsedSourceMapItem = Extract<
-  SourceMapItem,
+  WebSourceMapItem,
   { status: "included" | "partial" }
 >;
 interface SourceMapDecodeContext {
   readonly signal: AbortSignal | undefined;
   readonly deadlineAt: number;
+  readonly deadlineLimitation: string;
   readonly budget: {
     records: number;
     expandedBytes: number;
@@ -81,7 +85,7 @@ export const fetchWebSourceMaps = async (
   input: AnalyzeWebBundleInput,
   signal?: AbortSignal,
   host: SourceMapFetchHost = { fetch: globalThis.fetch },
-): Promise<SourceMaps> => {
+): Promise<WebSourceMaps> => {
   throwIfAborted(signal);
   if (requests.length === 0)
     return webSourceMapsSchema.parse({
@@ -90,20 +94,31 @@ export const fetchWebSourceMaps = async (
       processed: 0,
       items: [],
     });
-  const items: SourceMapItem[] = [];
+  const items: WebSourceMapItem[] = [];
   const operationController = new AbortController();
+  const fetchTimeoutMs =
+    host.timeoutMs ??
+    selectedBrowserDeadlineMs(
+      input.source_map_fetch_timeout_ms,
+      SOURCE_MAP_FETCH_TIMEOUT_MS,
+    );
+  const fetchDeadlineLimitation =
+    sourceMapFetchDeadlineLimitation(fetchTimeoutMs);
   const timeout = setTimeout(
-    () => operationController.abort(new SourceMapDeadlineError()),
-    host.timeoutMs ?? SOURCE_MAP_FETCH_TIMEOUT_MS,
+    () =>
+      operationController.abort(
+        new SourceMapDeadlineError(fetchDeadlineLimitation),
+      ),
+    fetchTimeoutMs,
   );
   const abortFromCaller = (): void => operationController.abort(signal?.reason);
   signal?.addEventListener("abort", abortFromCaller, { once: true });
   const operationSignal = operationController.signal;
-  const deadlineAt =
-    performance.now() + (host.timeoutMs ?? SOURCE_MAP_FETCH_TIMEOUT_MS);
+  const deadlineAt = performance.now() + fetchTimeoutMs;
   const budget = {
     retainedBytes: 0,
     deadlineAt,
+    deadlineLimitation: fetchDeadlineLimitation,
     decodedRecords: {
       records: 0,
       expandedBytes: SOURCE_MAP_COLLECTION_ENVELOPE_RESERVE,
@@ -126,11 +141,7 @@ export const fetchWebSourceMaps = async (
       budget.decodedRecords.expandedBytes += reservation;
       if (operationSignal.aborted || performance.now() >= deadlineAt) {
         items.push(
-          emptySourceMapItem(
-            request,
-            "fetch_failed",
-            "Source-map fetching exceeded its operation deadline.",
-          ),
+          emptySourceMapItem(request, "fetch_failed", fetchDeadlineLimitation),
         );
         continue;
       }
@@ -187,9 +198,9 @@ const sourceMapOutputLimitation = (unprocessed: number): string =>
   `source-map output budget could not retain results for ${String(unprocessed)} requested map${unprocessed === 1 ? "" : "s"}. their results are unknown.`;
 
 const sourceMapsStatus = (
-  items: readonly SourceMapItem[],
+  items: readonly WebSourceMapItem[],
   omitted: boolean,
-): SourceMaps["status"] => {
+): WebSourceMaps["status"] => {
   const retained = items.filter(
     ({ status }) => status === "included" || status === "partial",
   ).length;
@@ -202,15 +213,17 @@ const sourceMapsStatus = (
 };
 
 class SourceMapDeadlineError extends Error {
-  constructor() {
-    super("Source-map fetching exceeded its operation deadline.");
+  constructor(message: string) {
+    super(message);
     this.name = "SourceMapDeadlineError";
   }
 }
 
 class SourceMapSizeLimitError extends Error {
   constructor() {
-    super("Source-map response exceeded the retained-byte budget.");
+    super(
+      `Source-map response exceeded the ${String(SOURCE_MAP_RESPONSE_BYTES)}-byte retained budget. ${noRuntimeOverrideSentence("That response budget stays fixed.", "source_map_fetch_timeout_ms")}`,
+    );
     this.name = "SourceMapSizeLimitError";
   }
 }
@@ -239,13 +252,14 @@ const fetchOne = async (
   budget: {
     retainedBytes: number;
     deadlineAt: number;
+    deadlineLimitation: string;
     decodedRecords: {
       records: number;
       expandedBytes: number;
       resolvedSourceBytes: number;
     };
   },
-): Promise<SourceMapItem> => {
+): Promise<WebSourceMapItem> => {
   if (!approvedUrl(request.fetchUrl, input.allowed_origins))
     return emptySourceMapItem(
       request,
@@ -273,7 +287,10 @@ const fetchOne = async (
     const { response, fetchedUrl } = fetched;
     try {
       // Admit the resolution identity before reading or retaining its body.
-      consumeExpandedBytes(budget.decodedRecords, jsonBytes(fetchedUrl) - 4);
+      consumeExpandedBytes(
+        budget.decodedRecords,
+        jsonByteLength(fetchedUrl) - 4,
+      );
     } catch (cause: unknown) {
       try {
         await response.body?.cancel();
@@ -303,7 +320,12 @@ const fetchOne = async (
         fetchedUrl,
       );
     }
-    checkOperation(undefined, signal, budget.deadlineAt);
+    checkOperation(
+      undefined,
+      signal,
+      budget.deadlineAt,
+      budget.deadlineLimitation,
+    );
     return normalizeSourceMap(
       request,
       await readBoundedText(
@@ -316,6 +338,7 @@ const fetchOne = async (
       {
         signal,
         deadlineAt: budget.deadlineAt,
+        deadlineLimitation: budget.deadlineLimitation,
         budget: budget.decodedRecords,
       },
     );
@@ -497,7 +520,6 @@ const promiseWithAbort = (
   signal: AbortSignal | undefined,
 ): Promise<Response> => {
   if (signal === undefined) return promise;
-  if (signal.aborted) return Promise.reject(signal.reason);
   return new Promise((resolve, reject) => {
     let settled = false;
     const cleanup = (): void => signal.removeEventListener("abort", abort);
@@ -530,6 +552,7 @@ const promiseWithAbort = (
         reject(cause);
       },
     );
+    if (signal.aborted) abort();
   });
 };
 
@@ -538,7 +561,7 @@ const normalizeSourceMap = (
   text: string,
   fetchedUrl: string,
   context: SourceMapDecodeContext,
-): SourceMapItem => {
+): WebSourceMapItem => {
   const parsedJson = safeParseJson(sourceMapJsonText(text));
   if (!parsedJson.ok)
     return emptySourceMapItem(
@@ -550,7 +573,12 @@ const normalizeSourceMap = (
   const retainedBytesBeforeMap = context.budget.expandedBytes;
   try {
     const check = (): void =>
-      checkOperation(undefined, context.signal, context.deadlineAt);
+      checkOperation(
+        undefined,
+        context.signal,
+        context.deadlineAt,
+        context.deadlineLimitation,
+      );
     const inspected = inspectSourceMapValue(parsedJson.value, {
       profile: "browser-collection",
       budget: context.budget,
@@ -562,17 +590,15 @@ const normalizeSourceMap = (
       SOURCE_MAP_SUCCESS_ENVELOPE_BYTES;
     consumeExpandedBytes(
       context.budget,
-      jsonBytes(text) +
+      jsonByteLength(text) +
         artifactMetadataBytes("application/source-map+json", text) -
         4,
     );
     const sourcesByRaw = new Map<string, string>();
-    const resolvedByRoot = new Map<string | null, Map<string, string>>();
-    preflightResolvedSourceBytes(
+    const resolvedByRoot = prepareResolvedSources(
       inspected.leaves,
       fetchedUrl,
       context.budget,
-      resolvedByRoot,
       sourcesByRaw,
       check,
     );
@@ -586,14 +612,16 @@ const normalizeSourceMap = (
     const nameJsonBytes = new Map<string, number>();
     const originalSources: ParsedSourceMapItem["original_sources"] = [];
     let declarationIndex = 0;
-    for (const { leaf, resolvedSources } of decoded) {
+    for (const { leaf } of decoded) {
+      const resolvedSources = resolvedByRoot.get(leaf.map.sourceRoot ?? null);
       for (const [index, rawSource] of leaf.map.sources.entries()) {
         if ((index & 255) === 0) check();
         const resolved =
-          rawSource === null ? null : (resolvedSources[index] ?? null);
+          rawSource === null ? null : (resolvedSources?.get(rawSource) ?? null);
         const sanitized =
           resolved === null ? null : cachedSanitized(sourcesByRaw, resolved);
         const content = leaf.map.sourcesContent?.[index] ?? null;
+        const mediaType = sourceMediaType(resolved ?? rawSource);
         consumeExpandedBytes(
           context.budget,
           (sanitized === null
@@ -603,8 +631,8 @@ const normalizeSourceMap = (
             (originalSources.length === 0 ? 0 : 1) +
             (content === null
               ? 0
-              : jsonBytes(content) +
-                artifactMetadataBytes(sourceMediaType(rawSource), content) -
+              : jsonByteLength(content) +
+                artifactMetadataBytes(mediaType, content) -
                 4),
         );
         originalSources.push({
@@ -612,26 +640,26 @@ const normalizeSourceMap = (
           declaration_index: declarationIndex++,
           source: sanitized,
           artifact:
-            content === null
-              ? null
-              : createWebTextArtifact(content, sourceMediaType(rawSource)),
+            content === null ? null : createWebTextArtifact(content, mediaType),
         });
       }
     }
     const mappings: ParsedSourceMapItem["mappings"] = [];
     declarationIndex = 0;
-    for (const { leaf, rows, resolvedSources } of decoded) {
+    for (const { leaf, rows } of decoded) {
+      const resolvedSources = resolvedByRoot.get(leaf.map.sourceRoot ?? null);
       const declarationBase = declarationIndex;
       declarationIndex += leaf.map.sources.length;
       for (const [line, row] of rows.entries()) {
         if ((line & 255) === 0) check();
         for (const segment of row) {
-          if (!isBeforeSourceMapLeafStop(leaf, line, segment[0])) continue;
           if (segment.length === 1) continue;
           const rawSource = leaf.map.sources[segment[1]];
           if (rawSource === undefined) continue;
           const resolved =
-            rawSource === null ? null : (resolvedSources[segment[1]] ?? null);
+            rawSource === null
+              ? null
+              : (resolvedSources?.get(rawSource) ?? null);
           const source =
             resolved === null ? null : cachedSanitized(sourcesByRaw, resolved);
           const name =
@@ -676,7 +704,7 @@ const normalizeSourceMap = (
     if (modules.incomplete.length > 0)
       consumeExpandedBytes(
         context.budget,
-        jsonBytes(
+        jsonByteLength(
           `Module edges are incomplete: ${modules.incomplete.length} of ${originalSources.filter(({ artifact }) => artifact !== null).length} original sources could not be parsed in full (${modules.incomplete.join(", ")}).`,
         ) - 4,
       );
@@ -714,7 +742,10 @@ const normalizeSourceMap = (
     return emptySourceMapItem(
       request,
       "invalid",
-      "Source-map JSON mappings could not be decoded safely.",
+      cause instanceof SourceMapFormatFailure &&
+        cause.reason === "section-overlap"
+        ? cause.message
+        : "Source-map JSON mappings could not be decoded safely.",
       fetchedUrl,
     );
   }
@@ -748,7 +779,7 @@ const originalModuleEdges = (
     }
     const parsed = parseJavaScriptSource(
       source.artifact.text,
-      sourceParserPath(sourceName),
+      originalSourcePath(sourceName),
     );
     check();
     if (parsed === null) {
@@ -803,8 +834,8 @@ const originalModuleEdges = (
   return { edges, incomplete };
 };
 
-/** Select parser semantics from the source URL path, excluding query/fragment. */
-const sourceParserPath = (source: string): string => {
+/** Select source language from the URL path, excluding query/fragment. */
+const originalSourcePath = (source: string): string => {
   try {
     return new URL(source).pathname;
   } catch (cause: unknown) {
@@ -818,10 +849,12 @@ const checkOperation = (
   callerSignal: AbortSignal | undefined,
   operationSignal: AbortSignal | undefined,
   deadlineAt: number,
+  deadlineLimitation: string,
 ): void => {
   if (callerSignal?.aborted === true) throw callerSignal.reason;
   if (operationSignal?.aborted === true) throw operationSignal.reason;
-  if (performance.now() >= deadlineAt) throw new SourceMapDeadlineError();
+  if (performance.now() >= deadlineAt)
+    throw new SourceMapDeadlineError(deadlineLimitation);
 };
 
 const approvedUrl = (
@@ -854,10 +887,10 @@ const sourceMapContext = (
 
 const emptySourceMapItem = (
   request: WebSourceMapRequest,
-  status: Extract<SourceMapItem, { readonly artifact: null }>["status"],
+  status: Extract<WebSourceMapItem, { readonly artifact: null }>["status"],
   limitation: string,
   effectiveUrl: string | null = null,
-): Extract<SourceMapItem, { readonly artifact: null }> => ({
+): Extract<WebSourceMapItem, { readonly artifact: null }> => ({
   ...sourceMapContext(request, effectiveUrl),
   status,
   artifact: null,
@@ -877,14 +910,15 @@ const sanitizeSource = (value: string): string => {
   }
 };
 
-const preflightResolvedSourceBytes = (
+/** Resolve and admit source identities once, before allocating public mapping rows. */
+const prepareResolvedSources = (
   leaves: readonly SourceMapLeaf[],
   mapUrl: string,
   budget: { readonly expandedBytes: number; resolvedSourceBytes: number },
-  resolvedByRoot: Map<string | null, Map<string, string>>,
   sanitizedByResolved: Map<string, string>,
   check: () => void,
-): void => {
+): ReadonlyMap<string | null, ReadonlyMap<string, string>> => {
+  const resolvedByRoot = new Map<string | null, Map<string, string>>();
   let estimate = budget.expandedBytes;
   let resolvedBytes = budget.resolvedSourceBytes;
   for (const { map } of leaves) {
@@ -898,24 +932,28 @@ const preflightResolvedSourceBytes = (
       if (source === null) continue;
       const sourceKey = source;
       let resolved = sourcesForRoot.get(sourceKey);
-      if (resolved === undefined)
-        resolved = resolveJavaScriptSourceMapUrl(
+      if (resolved === undefined) {
+        const candidate = resolveJavaScriptSourceMapUrl(
           source,
           map.sourceRoot,
           mapUrl,
         );
+        if (candidate === null) continue;
+        resolved = candidate;
+      }
       const bytes = Buffer.byteLength(resolved, "utf8");
       if (bytes > SOURCE_MAP_RESPONSE_BYTES - resolvedBytes)
         throw resolvedSourceLimitFailure();
       resolvedBytes += bytes;
       sourcesForRoot.set(sourceKey, resolved);
       const sanitized = cachedSanitized(sanitizedByResolved, resolved);
-      estimate += jsonBytes(sanitized);
+      estimate += jsonByteLength(sanitized);
       if (estimate > WEB_SOURCE_MAP_LIMITS.outputBytes)
         throw expandedOutputFailure();
     }
   }
   budget.resolvedSourceBytes = resolvedBytes;
+  return resolvedByRoot;
 };
 
 const consumeExpandedBytes = (
@@ -930,7 +968,7 @@ const consumeExpandedBytes = (
 const expandedOutputFailure = (): SourceMapFormatFailure =>
   new SourceMapFormatFailure(
     "limit",
-    `Expanded source-map evidence exceeds the ${WEB_SOURCE_MAP_LIMITS.outputBytes / (1024 * 1024)} MiB public representation budget.`,
+    `Expanded source-map evidence exceeds the ${String(WEB_SOURCE_MAP_LIMITS.outputBytes)}-byte public representation budget. ${noRuntimeOverrideSentence("That representation budget stays fixed.", "source_map_fetch_timeout_ms")}`,
   );
 
 const sourceMapOutputError = (
@@ -948,14 +986,8 @@ const sourceMapOutputError = (
 const resolvedSourceLimitFailure = (): SourceMapFormatFailure =>
   new SourceMapFormatFailure(
     "limit",
-    `Resolved source-map identities exceed the ${SOURCE_MAP_RESPONSE_BYTES / (1024 * 1024)} MiB decoder representation budget.`,
+    `Resolved source-map identities exceed the ${String(SOURCE_MAP_RESPONSE_BYTES / (1024 * 1024))} MiB decoder representation budget. ${noRuntimeOverrideSentence("That representation budget stays fixed.", "source_map_fetch_timeout_ms")}`,
   );
-
-const jsonBytes = (value: string): number => {
-  let bytes = 0;
-  for (const part of jsonParts(value)) bytes += Buffer.byteLength(part, "utf8");
-  return bytes;
-};
 
 const artifactMetadataBytes = (mediaType: string, text: string): number =>
   Buffer.byteLength(
@@ -991,22 +1023,22 @@ const sourceMapFailureReservation = (
   effectiveUrl: string | null = null,
   limitation?: string,
   status: Extract<
-    SourceMapItem,
+    WebSourceMapItem,
     { readonly artifact: null }
   >["status"] = "fetch_failed",
 ): number =>
   SOURCE_MAP_FAILURE_ENVELOPE_BYTES +
-  jsonBytes(request.declaredUrl) +
-  jsonBytes(request.scriptKey) +
-  (effectiveUrl === null ? 0 : jsonBytes(effectiveUrl) - 4) +
+  jsonByteLength(request.declaredUrl) +
+  jsonByteLength(request.scriptKey) +
+  (effectiveUrl === null ? 0 : jsonByteLength(effectiveUrl) - 4) +
   Math.max(
     0,
-    (limitation === undefined ? 0 : jsonBytes(limitation)) -
+    (limitation === undefined ? 0 : jsonByteLength(limitation)) -
       SOURCE_MAP_FAILURE_LIMITATION_RESERVE -
       2,
   ) +
-  jsonBytes(status) -
-  jsonBytes("fetch_failed");
+  jsonByteLength(status) -
+  jsonByteLength("fetch_failed");
 
 const sourceEntryOverheadBytes = (
   sourceIndex: number,
@@ -1019,7 +1051,7 @@ const sourceEntryOverheadBytes = (
 const cachedJsonBytes = (cache: Map<string, number>, value: string): number => {
   const cached = cache.get(value);
   if (cached !== undefined) return cached;
-  const bytes = jsonBytes(value);
+  const bytes = jsonByteLength(value);
   cache.set(value, bytes);
   return bytes;
 };
@@ -1058,13 +1090,15 @@ const resolveOriginalSource = (
   }
 };
 
-const sourceMediaType = (source: string | null): string =>
-  source?.endsWith(".ts") ||
-  source?.endsWith(".tsx") ||
-  source?.endsWith(".mts") ||
-  source?.endsWith(".cts")
+const sourceMediaType = (source: string | null): string => {
+  const path = source === null ? null : originalSourcePath(source);
+  return path?.endsWith(".ts") ||
+    path?.endsWith(".tsx") ||
+    path?.endsWith(".mts") ||
+    path?.endsWith(".cts")
     ? "text/typescript"
     : "text/javascript";
+};
 
 const originalDependency = (
   node: t.Node,

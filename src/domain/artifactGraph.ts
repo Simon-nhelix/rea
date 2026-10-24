@@ -83,6 +83,7 @@ const artifactFormatSchema = z.enum([
   "entitlements",
   "directory",
   "file",
+  "pyinstaller",
   "unknown",
 ]);
 
@@ -103,8 +104,8 @@ const artifactContentFormatSchema = artifactFormatSchema.extract([
 
 /** File byte interval for an artifact derived without writing it to disk. */
 const artifactByteRangeSchema = z.object({
-  offset: z.number().int().min(0),
-  length: z.number().int().min(0),
+  offset: z.int().min(0),
+  length: z.int().min(0),
 });
 
 /** External command provenance, including observable side effects. */
@@ -113,7 +114,7 @@ const artifactCommandSchema = z.object({
   arguments: z.array(z.string()),
   tool_version: z.string().nullable(),
   executable_sha256: sha256Schema.nullable(),
-  exit_code: z.number().int().nullable(),
+  exit_code: z.int().nullable(),
   effects: z.array(z.enum(["read", "write", "mount"])),
 });
 
@@ -125,7 +126,7 @@ export const artifactNodeSchema = z.object({
   artifact_id: artifactIdSchema,
   format: artifactContentFormatSchema,
   sha256: sha256Schema,
-  size: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  size: z.int().min(0).max(Number.MAX_SAFE_INTEGER),
   media_type: z.string().min(1).nullable(),
   architecture: z.string().min(1).nullable(),
   content_state: z.enum(["materialized", "embedded", "virtual"]),
@@ -138,25 +139,19 @@ export const artifactOccurrenceSchema = z.object({
   artifact_id: artifactIdSchema.nullable(),
   parent_occurrence_id: occurrenceIdSchema.nullable(),
   logical_path: boundedRelativePathSchema,
-  entry_kind: z.enum(["file", "directory", "symlink", "slice"]),
+  entry_kind: z.enum(["file", "directory", "symlink", "slice", "metadata"]),
   artifact_kind: artifactKindSchema,
   artifact_format: artifactFormatSchema,
-  declared_size: z
-    .number()
-    .int()
-    .min(0)
-    .max(Number.MAX_SAFE_INTEGER)
-    .nullable(),
-  compressed_size: z
-    .number()
-    .int()
-    .min(0)
-    .max(Number.MAX_SAFE_INTEGER)
-    .nullable(),
+  declared_size: z.int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
+  compressed_size: z.int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
   executable: z.boolean(),
   encrypted: z.boolean(),
+  /** Positive ASAR companion declaration; older inventories may not record it. */
+  unpacked: z.literal(true).exactOptional(),
   hash_status: z.enum(["verified", "mismatched", "not-hashed", "unavailable"]),
   source_location: artifactByteRangeSchema.nullable(),
+  /** Original path within this occurrence's reader when normalization changed its spelling. */
+  source_path: z.string().min(1).exactOptional(),
   declared_integrity: artifactIntegrityClaimSchema.exactOptional(),
   format_metadata: artifactFormatMetadataSchema.exactOptional(),
   limitations: z.array(z.string()),
@@ -187,7 +182,7 @@ export const integrityContradictionSchema = z.union([
  */
 export const artifactEdgeSchema = z.object({
   edge_id: edgeIdSchema,
-  ordinal: z.number().int().min(0),
+  ordinal: z.int().min(0),
   parent_artifact_id: artifactIdSchema,
   relation: z.enum([
     "contains",
@@ -209,9 +204,9 @@ export const artifactGraphManifestSchema = z.object({
   root_sha256: sha256Schema,
   root_format: artifactFormatSchema,
   graph_sha256: sha256Schema,
-  node_count: z.number().int().min(1),
-  occurrence_count: z.number().int().min(1),
-  edge_count: z.number().int().min(0),
+  node_count: z.int().min(1),
+  occurrence_count: z.int().min(1),
+  edge_count: z.int().min(0),
 });
 
 /** Producer-owned traversal coverage; content certainty remains on each occurrence. */
@@ -240,7 +235,7 @@ const extractedArtifactSchema = z.object({
   artifact_id: artifactIdSchema,
   relative_path: boundedRelativePathSchema,
   sha256: sha256Schema,
-  bytes_written: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  bytes_written: z.int().min(0).max(Number.MAX_SAFE_INTEGER),
   created: z.boolean(),
 });
 
@@ -265,6 +260,7 @@ export const artifactExtractionResultSchema = z.object({
     verified: z.boolean(),
     residual_paths: z.array(boundedRelativePathSchema),
   }),
+  coverage: artifactInventoryCoverageSchema,
   provenance: z.array(artifactCommandSchema),
   integrity_contradictions: z.array(integrityContradictionSchema),
   limitations: z.array(z.string()),

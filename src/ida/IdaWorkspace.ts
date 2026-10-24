@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { open, realpath } from "node:fs/promises";
+import { open, realpath, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, normalize } from "node:path";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import { AnalysisProtocolError } from "../domain/analysisErrorCore.js";
+import { ConfigurationError } from "../domain/configurationErrors.js";
+import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
 
 /** Read a file digest with bounded memory rather than retaining binary bytes. */
@@ -19,6 +21,16 @@ export const sameIdaHostPath = (left: string, right: string): boolean =>
   process.platform === "win32"
     ? normalize(left).toLowerCase() === normalize(right).toLowerCase()
     : normalize(left) === normalize(right);
+
+/** Admit the selected lookup before canonicalizing it for readiness and allocation.
+ * Native realpath can collapse file/.. without rejecting the non-directory.
+ */
+export const resolveIdaWorkspaceParent = async (
+  root = tmpdir(),
+): Promise<string> => {
+  await stat(root);
+  return realpath(root);
+};
 
 /** Private input copy isolates upstream database and sidecar writes from the original. */
 export class IdaWorkspace {
@@ -47,10 +59,28 @@ export class IdaWorkspace {
   ): Promise<IdaWorkspace> {
     // Upstream reports canonical paths (macOS /var -> /private/var), so the
     // private input path must already be canonical for identity checks.
-    const runtime = await PrivateRuntimeRoot.create({
-      parent: await realpath(normalize(root)),
-      prefix: "rea-ida-",
-    });
+    let runtime: PrivateRuntimeRoot;
+    try {
+      runtime = await PrivateRuntimeRoot.create({
+        parent: await resolveIdaWorkspaceParent(root),
+        prefix: "rea-ida-",
+      });
+    } catch (cause: unknown) {
+      if (cause instanceof AnalysisError) throw cause;
+      throw new ConfigurationError(
+        "IDA workspaceRoot is not a usable private workspace parent.",
+        {
+          cause,
+          settings: [
+            {
+              setting: "workspaceRoot",
+              constraint: `Select an existing writable and searchable directory: ${cause instanceof Error ? cause.message : String(cause)}`,
+            },
+          ],
+          diagnostics: { workspace_root: root },
+        },
+      );
+    }
     const inputPath = join(runtime.path, basename(target.path));
     return new IdaWorkspace(runtime, inputPath, target);
   }

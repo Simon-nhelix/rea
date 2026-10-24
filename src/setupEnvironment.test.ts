@@ -182,8 +182,17 @@ it.each([
     name: "registration-only settings",
     environment: {
       REA_ANALYSIS_PROVIDER: "auto",
+      REA_BRIDGE_MAX_REQUEST_BYTES: "33554432",
       REA_GHIDRA_STARTUP_TIMEOUT_MS: "2700000",
+      REA_HOPPER_STARTUP_TIMEOUT_MS: "120000",
       REA_MCP_INPUT_SCHEMA_PROFILE: "full",
+      REA_CAPTURE_DECODER_OLD_GENERATION_MIB: "256",
+      REA_REGEX_MATCHING_DEADLINE_MS: "10000",
+      REA_REGEX_WORKER_HEAP_REQUEST_MIB: "256",
+      REA_MCP_INITIALIZE_BUDGET_MS: "16000",
+      REA_MCP_TOOLS_LIST_BUDGET_MS: "6000",
+      REA_MCP_FIRST_CATALOG_BUDGET_MS: "21000",
+      REA_MCP_DOCTOR_DEADLINE_MS: "31000",
     },
     providerConfigured: false,
     installHopper: true,
@@ -213,9 +222,31 @@ it.each([
       if ("REA_MCP_INPUT_SCHEMA_PROFILE" in environment) {
         expect(initial.providerEnvironment).toMatchObject({
           REA_ANALYSIS_PROVIDER: "auto",
+          REA_BRIDGE_MAX_REQUEST_BYTES: "33554432",
           REA_GHIDRA_STARTUP_TIMEOUT_MS: "2700000",
+          REA_HOPPER_STARTUP_TIMEOUT_MS: "120000",
           REA_MCP_INPUT_SCHEMA_PROFILE: "full",
+          REA_CAPTURE_DECODER_OLD_GENERATION_MIB: "256",
+          REA_REGEX_MATCHING_DEADLINE_MS: "10000",
+          REA_REGEX_WORKER_HEAP_REQUEST_MIB: "256",
+          REA_MCP_INITIALIZE_BUDGET_MS: "16000",
+          REA_MCP_TOOLS_LIST_BUDGET_MS: "6000",
+          REA_MCP_FIRST_CATALOG_BUDGET_MS: "21000",
+          REA_MCP_DOCTOR_DEADLINE_MS: "31000",
         });
+      } else {
+        expect(initial.providerEnvironment).not.toHaveProperty(
+          "REA_BRIDGE_MAX_REQUEST_BYTES",
+        );
+        expect(initial.providerEnvironment).not.toHaveProperty(
+          "REA_REGEX_MATCHING_DEADLINE_MS",
+        );
+        expect(initial.providerEnvironment).not.toHaveProperty(
+          "REA_REGEX_WORKER_HEAP_REQUEST_MIB",
+        );
+        expect(initial.providerEnvironment).not.toHaveProperty(
+          "REA_MCP_INITIALIZE_BUDGET_MS",
+        );
       }
       const discovery = await discoverSetupState({
         host: setupHost,
@@ -265,6 +296,55 @@ it.each([
     expect(withoutPackageRunnerIdentity(environment, "win32")).toEqual({
       NPM_CONFIG_USER_AGENT: userAgent,
     });
+  },
+);
+
+it.each([
+  {
+    architecture: "x64",
+    hopperSetupSupported: true,
+    code: "download_failed",
+    downloads: 1,
+  },
+  {
+    architecture: "arm64",
+    hopperSetupSupported: false,
+    code: "unsupported_host",
+    downloads: 0,
+  },
+] as const)(
+  "installs Linux Hopper from the selected doctor host's $architecture classification",
+  async ({ architecture, hopperSetupSupported, code, downloads }) => {
+    // Installation must follow the doctor host's facts, never the ambient
+    // os-release and process.arch. A refused download keeps the supported case
+    // from writing or invoking a package manager.
+    const fetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 403 }));
+    const host = systemSetupHost(
+      createDoctorHostFixture({
+        platform: "linux",
+        architecture,
+        linuxDistribution: () =>
+          Promise.resolve({
+            id: "ubuntu",
+            versionId: "24.04",
+            packageFamily: "deb",
+            hopperSetupSupported,
+          }),
+      }),
+      { HOME: "/fixture/home" },
+    );
+    try {
+      expect(await host.installHopper(false)).toMatchObject({
+        status: "failed",
+        code,
+      });
+      expect(fetch).toHaveBeenCalledTimes(downloads);
+    } finally {
+      fetch.mockRestore();
+      await host.close?.();
+    }
   },
 );
 

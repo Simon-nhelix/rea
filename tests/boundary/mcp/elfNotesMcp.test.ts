@@ -1,0 +1,128 @@
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { expect } from "vitest";
+import { toolContract } from "../../../src/contracts/toolContracts.js";
+import { createServer } from "../../../src/server/createServer.js";
+import { createTestBinarySession } from "../../fixtures/binarySession.js";
+import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
+import {
+  elfExtendedSectionCountFixture,
+  compressedElfNoteSectionFixture,
+  elfNoteFixture,
+} from "../../../src/native/elf/ElfNotes.fixture.js";
+import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { mcpTest, type TestMcp } from "../../support/mcp/mcpFixture.js";
+
+const connect = async (mcp: TestMcp) => {
+  const session = createTestBinarySession(() => {
+    throw new Error("ELF note inspection must not start a deep provider");
+  });
+  const client = await mcp.connect(createServer({ kind: "session", session }));
+  return { client, session };
+};
+
+mcpTest(
+  "advertises inspect_elf_notes and reads a GNU build-id",
+  async ({ mcp }) => {
+    const { client, session } = await connect(mcp);
+    try {
+      const advertised = (await client.listTools()).tools.find(
+        (tool) => tool.name === "inspect_elf_notes",
+      );
+      expect(advertised?.annotations).toMatchObject({
+        readOnlyHint: false,
+        idempotentHint: true,
+      });
+      const root = await createTestTempDirectory("rea-elf-notes-mcp-");
+      const path = join(root, "program");
+      await writeFile(path, elfNoteFixture({ bits: 32, ownership: "section" }));
+      const response = await client.callTool({
+        name: "inspect_elf_notes",
+        arguments: { path },
+      });
+      expect(response.isError, JSON.stringify(response.content)).not.toBe(true);
+      const evidence = toolContract("inspect_elf_notes").outputSchema.parse(
+        response.structuredContent,
+      );
+      expect(evidence.normalized_result.format).toBe("elf32");
+      expect(
+        evidence.normalized_result.entries.find(
+          (entry) => entry.type_name === "gnu_build_id",
+        )?.gnu?.build_id_hex,
+      ).toBe("0123456789abcdef0123456789abcdef01234567");
+    } finally {
+      await session.close();
+    }
+  },
+);
+
+mcpTest("requires an absolute path for inspect_elf_notes", async ({ mcp }) => {
+  const { client, session } = await connect(mcp);
+  try {
+    const response = await client.callTool({
+      name: "inspect_elf_notes",
+      arguments: { path: "program" },
+    });
+    expect(response.isError).toBe(true);
+    expect(parseMcpToolError(response).error).toMatchObject({
+      code: "invalid_request",
+      details: { operation: "inspect_elf_notes" },
+    });
+  } finally {
+    await session.close();
+  }
+});
+
+mcpTest(
+  "reports compressed note storage as unsupported without mutation",
+  async ({ mcp }) => {
+    const { client, session } = await connect(mcp);
+    try {
+      const root = await createTestTempDirectory("rea-elf-notes-storage-mcp-");
+      const path = join(root, "debug-notes.o");
+      const bytes = compressedElfNoteSectionFixture();
+      await writeFile(path, bytes);
+      const response = await client.callTool({
+        name: "inspect_elf_notes",
+        arguments: { path },
+      });
+      expect(response.isError).toBe(true);
+      expect(parseMcpToolError(response).error).toMatchObject({
+        code: "unsupported_target",
+        message: expect.stringContaining(
+          "Compressed ELF note sections are unsupported",
+        ),
+      });
+      expect(await readFile(path)).toEqual(bytes);
+    } finally {
+      await session.close();
+    }
+  },
+);
+
+mcpTest(
+  "reports valid extended numbering as unsupported without mutation",
+  async ({ mcp }) => {
+    const { client, session } = await connect(mcp);
+    try {
+      const root = await createTestTempDirectory("rea-elf-notes-extended-mcp-");
+      const path = join(root, "extended-count.elf");
+      await writeFile(path, elfExtendedSectionCountFixture());
+      const before = await readFile(path);
+      const response = await client.callTool({
+        name: "inspect_elf_notes",
+        arguments: { path },
+      });
+      expect(response.isError).toBe(true);
+      expect(parseMcpToolError(response).error).toMatchObject({
+        code: "unsupported_target",
+        message: expect.stringContaining(
+          "ELF extended numbering is unsupported",
+        ),
+      });
+      expect(await readFile(path)).toEqual(before);
+    } finally {
+      await session.close();
+    }
+  },
+);

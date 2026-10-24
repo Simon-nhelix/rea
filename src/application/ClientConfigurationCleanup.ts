@@ -6,11 +6,11 @@ import {
 import type { AnalysisCleanupLease } from "../artifacts/AnalysisCleanupLease.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import type { AnalysisCleanupObservation } from "../domain/analysisErrorBase.js";
-import type { RegularFileOperationOutcome } from "../filesystem/OwnedRegularFile.js";
 import {
   RegularFileCleanupFailure,
-  retryRegularFileCleanupFailures,
-} from "./RegularFileRead.js";
+  type RegularFileOperationOutcome,
+} from "../filesystem/OwnedRegularFile.js";
+import { retryRegularFileCleanupFailures } from "./RegularFileRead.js";
 
 /** Completion and exact staging owner retained when publication cleanup fails. */
 export class ClientConfigurationPublicationFailure<
@@ -74,7 +74,10 @@ export const retryClientConfigurationCleanup = async (
       if (retried.cleanup !== undefined) observations.push(retried.cleanup);
       primary = retried.primary;
       const last = retried.failures.at(-1)!;
-      nested = last.outcome.kind === "failed" ? last.outcome.cause : undefined;
+      nested =
+        last.operationFailure === undefined && last.outcome.kind === "failed"
+          ? last.outcome.cause
+          : undefined;
     } else {
       const released = await resources.release({
         kind: "lease",

@@ -12,6 +12,11 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { writeElectronApiAliasApplication } from "../../fixtures/electronApiAliasApplication.js";
+import {
+  createCliCommandSession,
+  type CliCommandSession,
+} from "../../support/cli/cliCommandSession.js";
+import { definedCliEnvironment } from "../../support/cli/cliFixture.js";
 
 import {
   JAVASCRIPT_FEATURE_TRACE_EXAMPLE,
@@ -25,6 +30,7 @@ import {
   javascriptApplicationAnalysisResultSchema,
   type JavaScriptApplicationAnalysisResult,
 } from "../../../src/domain/javascript/javascriptApplicationAnalysis.js";
+import { applicationVersionComparisonResultSchema } from "../../../src/domain/javascript/javascriptApplicationVersionComparisonSchemas.js";
 import { parseJavaScriptApplicationGraph } from "../../../src/domain/javascript/javascriptApplicationGraph.js";
 import { z } from "zod";
 
@@ -33,6 +39,7 @@ import { javaScriptSemanticTraceResultSchema } from "../../../src/domain/javascr
 import type { JavaScriptSemanticQueryInput } from "../../../src/domain/javascript/javascriptSemanticQuerySchemas.js";
 
 const execute = promisify(execFile);
+let cliSession: CliCommandSession | undefined;
 const requireFixture = createRequire(import.meta.url);
 // Analysis requests are stateless; retain one compiled server and its SDK
 // validators while every scenario still owns a separate application directory.
@@ -56,9 +63,13 @@ const connectedMcpClient = async (): Promise<Client> => {
 
 afterAll(async () => {
   try {
-    await mcpClient.close();
+    try {
+      await mcpClient.close();
+    } finally {
+      await mcpTransport.close();
+    }
   } finally {
-    await mcpTransport.close();
+    await cliSession?.close();
   }
 });
 const WEBPACK_FACTORY_BODY = `
@@ -186,23 +197,31 @@ const expectSelfImportEvidence = (
 const analyzeThroughStdioMcp = async (
   inputPath: string,
 ): Promise<JavaScriptApplicationAnalysisResult> => {
+  const evidence = await analyzeEvidenceThroughStdioMcp(inputPath);
+  const result = javascriptApplicationAnalysisResultSchema.parse(
+    evidence.normalized_result,
+  );
+  expect(result).toMatchObject({ input_path: inputPath, format: "directory" });
+  return result;
+};
+
+const analyzeEvidenceThroughStdioMcp = async (
+  inputPath: string,
+  sourcePaths?: readonly string[],
+) => {
   const client = await connectedMcpClient();
   const response = await client.callTool({
     name: "analyze_javascript_application",
-    arguments: { input_path: inputPath },
+    arguments: {
+      input_path: inputPath,
+      ...(sourcePaths === undefined ? {} : { source_paths: [...sourcePaths] }),
+    },
   });
   expect(response.isError).not.toBe(true);
   expect(response.content).toEqual(
     expect.arrayContaining([expect.objectContaining({ type: "text" })]),
   );
-  const result = z
-    .object({ normalized_result: javascriptApplicationAnalysisResultSchema })
-    .parse(response.structuredContent).normalized_result;
-  expect(result).toMatchObject({
-    input_path: inputPath,
-    format: "directory",
-  });
-  return result;
+  return parseEvidence(response.structuredContent);
 };
 
 const expectCliAnalysisParity = async (
@@ -815,6 +834,7 @@ describe("application workflow CLI parity", () => {
       }),
       "--json",
     ]);
+    await assertSourceFileView(sourceCompared);
     expect(sourceCompared).toMatchObject({
       operation: "compare_source_to_bundle",
       predicate_type: "rea.source-to-bundle-comparison",
@@ -1216,7 +1236,74 @@ describe("application workflow CLI input", () => {
       }),
       "--json",
     ]);
-    expect(result).toMatchObject({ code: "invalid_request" });
+    expect(result).toMatchObject({ code: "evidence_integrity_mismatch" });
+  });
+});
+
+describe("application version source-scope MCP comparison", () => {
+  it("keeps unselected parse scopes unknown through stdio MCP", async () => {
+    const root = await createTestTempDirectory("rea-version-scope-mcp-");
+    await Promise.all([
+      writeFile(
+        join(root, "lib.js"),
+        "export function shared() { return 1; }\n",
+      ),
+      writeFile(join(root, "main.js"), 'export const name = "one";\n'),
+    ]);
+    const full = await analyzeEvidenceThroughStdioMcp(root);
+    const selected = await analyzeEvidenceThroughStdioMcp(root, ["main.js"]);
+    const selectedAnalysis = javascriptApplicationAnalysisResultSchema.parse(
+      selected.normalized_result,
+    );
+    const scope = selectedAnalysis.graph.nodes.find(
+      ({ kind, observations }) =>
+        kind === "unknown" &&
+        observations.some(
+          ({ properties }) =>
+            properties.path === "lib.js" &&
+            properties.operation === "select-javascript-sources",
+        ),
+    );
+    expect(scope?.observations[0]?.evidence).toMatchObject({
+      state: "unavailable",
+      limitations: [
+        "Source is outside the caller-selected source_paths; it was inventoried but not analyzed.",
+      ],
+    });
+    const client = await connectedMcpClient();
+    const compare = async (left: unknown, right: unknown) => {
+      const response = await client.callTool({
+        name: "compare_application_versions",
+        arguments: { left, right },
+      });
+      expect(response.isError).not.toBe(true);
+      return applicationVersionComparisonResultSchema.parse(
+        parseEvidence(response.structuredContent).normalized_result,
+      );
+    };
+    const forward = await compare(full, selected);
+    const reverse = await compare(selected, full);
+
+    expect(
+      forward.items.find(
+        ({ right_node_id }) => right_node_id === scope?.node_id,
+      ),
+    ).toMatchObject({
+      status: "unknown",
+      dimensions: ["availability"],
+      limitations: [
+        "Source is outside the caller-selected source_paths; it was inventoried but not analyzed.",
+      ],
+      evidence_links: expect.arrayContaining([
+        full.evidence_id,
+        selected.evidence_id,
+      ]),
+    });
+    expect(
+      reverse.items.find(({ left_node_id }) => left_node_id === scope?.node_id),
+    ).toMatchObject({ status: "unknown", dimensions: ["availability"] });
+    expect(forward.summary).toMatchObject({ added: 0, removed: 0 });
+    expect(reverse.summary).toMatchObject({ added: 0, removed: 0 });
   });
 });
 
@@ -1604,7 +1691,7 @@ describe("application workflow CLI validation", () => {
     ]);
     expect(malformed).toMatchObject({
       code: "invalid_request",
-      retryable: true,
+      retryable: false,
       details: {
         issues: [{ path: [], reason: "invalid_format", expected: "JSON" }],
       },
@@ -1733,27 +1820,19 @@ const runCli = async (
   arguments_: readonly string[],
   environment: Readonly<Record<string, string>> = {},
 ): Promise<unknown> => {
-  try {
-    const { stdout } = await execute(
-      process.execPath,
-      ["scripts/rea.mjs", ...arguments_],
-      {
-        cwd: process.cwd(),
-        env: { ...process.env, ...environment },
-        maxBuffer: 16 * 1_024 * 1_024,
-      },
-    );
-    return JSON.parse(stdout);
-  } catch (cause: unknown) {
-    if (
-      typeof cause === "object" &&
-      cause !== null &&
-      "stdout" in cause &&
-      typeof cause.stdout === "string"
-    )
-      return JSON.parse(cause.stdout);
-    throw cause;
-  }
+  cliSession ??= createCliCommandSession();
+  const result = await cliSession.run({
+    arguments: arguments_,
+    cwd: process.cwd(),
+    environment: definedCliEnvironment({ ...process.env, ...environment }),
+  });
+  const stdout = result.stdout.trim();
+  if (stdout.length > 0) return JSON.parse(stdout) as unknown;
+  throw new Error(
+    result.stderr.trim().length > 0
+      ? result.stderr
+      : `Compiled CLI command failed with status ${String(result.exitCode)}`,
+  );
 };
 
 /**
@@ -1770,4 +1849,68 @@ const runCliWithRequestFile = async (
   const requestPath = join(root, "request.json");
   await writeFile(requestPath, JSON.stringify(request));
   return runCli([command, requestPath, "--json"]);
+};
+
+const assertSourceFileView = async (sourceCompared: unknown) => {
+  const wrongApplication = await runCli([
+    "compare-source-to-bundle",
+    JSON.stringify({
+      reference: SOURCE_TO_BUNDLE_COMPARISON_EXAMPLE.reference,
+      application: sourceCompared,
+    }),
+    "--json",
+  ]);
+  expect(wrongApplication).toMatchObject({
+    error: "Application workflow failed",
+  });
+
+  const sourceViewRoot = await createTestTempDirectory("rea-cli-source-view-");
+  const referencePath = join(sourceViewRoot, "reference.json");
+  const sourceComparisonPath = join(sourceViewRoot, "comparison.json");
+  await writeFile(
+    referencePath,
+    JSON.stringify(SOURCE_TO_BUNDLE_COMPARISON_EXAMPLE.reference),
+  );
+  const requestedPath = relative(process.cwd(), referencePath);
+  const fileParent = parseEvidence(
+    await runCli([
+      "compare-source-to-bundle",
+      JSON.stringify({
+        reference: { kind: "file", path: requestedPath },
+        application: JAVASCRIPT_FEATURE_TRACE_EXAMPLE.application,
+      }),
+      "--json",
+    ]),
+  );
+  expect(fileParent.normalized_result).toEqual(
+    parseEvidence(sourceCompared).normalized_result,
+  );
+  expect(fileParent.parameters.reference_source).toEqual({
+    kind: "file",
+    path: absoluteCallerPath(requestedPath),
+    requested_path: requestedPath,
+  });
+  await writeFile(sourceComparisonPath, JSON.stringify(fileParent));
+  const selectedSource = await runCli([
+    "inspect-analysis-view",
+    JSON.stringify({
+      source: { kind: "evidence-file", path: sourceComparisonPath },
+      view: {
+        kind: "source-to-bundle",
+        collection: "mappings",
+        source_paths: ["src/main.ts"],
+        fields: ["status"],
+      },
+    }),
+    "--json",
+  ]);
+  expect(selectedSource).toMatchObject({
+    normalized_result: {
+      parent_operation: "compare_source_to_bundle",
+      items: [
+        { source_path: "src/main.ts", source_index: 0, status: "removed" },
+      ],
+      coverage: { total: 1, exhausted: true },
+    },
+  });
 };

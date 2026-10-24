@@ -307,7 +307,13 @@ it("rejects malformed Rizin requests before touching the provider", async () => 
 
   expect(result).toMatchObject({
     ok: false,
-    error: { _tag: "AnalysisInputError", operation: "execute_rizin_command" },
+    error: {
+      _tag: "AnalysisInputError",
+      operation: "execute_rizin_command",
+      issues: [
+        { path: ["command"], reason: "missing_argument", expected: "string" },
+      ],
+    },
   });
   expect(run).not.toHaveBeenCalled();
 });
@@ -386,7 +392,7 @@ it("rejects work after reaching the concurrent provider-operation limit", async 
           active_operations: 8,
         });
       expect(rejected.error.message).toContain(
-        "Concurrent reverse-engineering operation capacity reached.",
+        "Concurrent reverse-engineering operation capacity reached (8 operations).",
       );
     }
     expect(providerCalls).toBe(0);
@@ -1041,6 +1047,34 @@ it.each([
           `Captured ${streams} bytes contain invalid or incomplete UTF-8; replacement characters in the text capture do not preserve the original bytes.`,
         );
     } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+it.each(["objdump", "rizin"] as const)(
+  "preserves successful %s output-loss facts independently of process completion",
+  async (provider) => {
+    const { directory, path } = await createArtifact();
+    const service = new ReverseEngineeringService({
+      runOwned: async () => providerSnapshot({ diagnosticTruncated: true }),
+    });
+    try {
+      const result =
+        provider === "objdump"
+          ? await service.inspectWithObjdump({ path, operation: "symbols" })
+          : await service.executeRizinCommand({ path, command: "iI" });
+      if (!result.ok) throw result.error;
+      expect(result.value.normalized_result).toMatchObject({
+        exit_code: 0,
+        output_truncated: true,
+        completion_status: "complete",
+      });
+      expect(result.value.limitations).toContain(
+        "Captured provider output is partial because bytes were omitted; process completion is reported separately.",
+      );
+    } finally {
+      await service.close();
       await rm(directory, { recursive: true, force: true });
     }
   },

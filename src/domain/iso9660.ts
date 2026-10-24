@@ -1,3 +1,4 @@
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
 import { CD_USER_DATA_BYTES } from "./discImage.js";
 
 export type SegaIpBin = {
@@ -350,7 +351,8 @@ const walkIsoDirectories = (
     problems.add("Directory traversal reached its file limit.");
   return {
     files: files.sort(
-      (a, b) => a.extent_lba - b.extent_lba || a.path.localeCompare(b.path),
+      (a, b) =>
+        a.extent_lba - b.extent_lba || compareUnicodeCodePoints(a.path, b.path),
     ),
     metadata,
     limitations: [...problems],

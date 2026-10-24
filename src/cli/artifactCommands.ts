@@ -5,7 +5,7 @@ import {
 } from "./analysisEvidenceDelivery.js";
 import { withCommandCancellation } from "./commandCancellation.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
-import { ARTIFACT_GRAPH_PROVIDER } from "../application/InvestigationProviders.js";
+import { ARTIFACT_GRAPH_PROVIDER } from "../domain/investigationProviders.js";
 import { z } from "incur";
 
 import type { DirectAnalysis } from "../composition/directAnalysis.js";
@@ -199,7 +199,8 @@ const registerExtractionCommand = (
   runProviderAnalysis: DirectAnalysis["runProviderAnalysis"],
 ): void => {
   cli.command(CLI_COMMANDS.extractArtifact, {
-    description: "Extract all regular artifact contents safely",
+    description:
+      "Extract regular contents of supported artifacts; DMG extraction is unavailable",
     args: z.object({
       path: z.string().describe("Application or package path"),
     }),

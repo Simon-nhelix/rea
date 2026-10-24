@@ -308,8 +308,9 @@ describe("web capture dimension uncertainty", () => {
       changes: [expect.objectContaining({ change: "removed" })],
     });
     expect(result.dimensions.network).toMatchObject({
-      status: "changed",
-      changes: [expect.objectContaining({ change: "modified" })],
+      status: "unknown",
+      total_changes: 0,
+      changes: [],
     });
     expect(result.dimensions.webmcp).toMatchObject({
       status: "unknown",
@@ -1006,7 +1007,7 @@ describe("web capture diff incomplete inventories", () => {
       if (script === undefined) throw new Error("Missing captured script");
       script.url = `${script.url}?revision=2`;
       expect(compare(complete, modified).changes).toEqual([
-        expect.objectContaining({ change: "modified" }),
+        expect.objectContaining({ change: "added" }),
       ]);
     },
   );

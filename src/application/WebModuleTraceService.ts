@@ -1,6 +1,5 @@
 import { closeOwnedWebResources } from "./closeOwnedWebResources.js";
 import { isDeepStrictEqual } from "node:util";
-import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import {
@@ -95,15 +94,6 @@ export class WebModuleTraceService {
       );
     const input = parsed.data;
     for (const [path, value] of [
-      ["manifest_path", input.manifest_path],
-      ["import_map.path", input.import_map?.path],
-    ] as const)
-      if (value !== undefined && !isAbsolute(value))
-        return invalid(
-          path.split("."),
-          "Expected an absolute filesystem path on this host.",
-        );
-    for (const [path, value] of [
       ["importer_url", input.importer_url],
       ["import_map.base_url", input.import_map?.base_url],
     ] as const)
@@ -139,7 +129,7 @@ export class WebModuleTraceService {
     const importerUrl = input.importer_url ?? selected.url;
     const importerAdmission = admitContext(importerUrl, ["importer_url"]);
     if (!importerAdmission.ok) return importerAdmission;
-    const syntax = collectWebModuleImports(data.source);
+    const syntax = collectWebModuleImports(data.source, data.sourceFile.path);
     const literals = syntax.imports
       .filter((reference) => reference.specifier !== null)
       .map((reference) => reference.specifier ?? "");

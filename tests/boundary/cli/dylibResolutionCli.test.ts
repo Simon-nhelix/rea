@@ -17,7 +17,11 @@ import {
 import { dylibResolutionResultSchema } from "../../../src/domain/apple/dylibResolution.js";
 import { parseEvidence } from "../../../src/domain/evidence.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
-import { cliTest, type TestCli } from "../../support/cli/cliFixture.js";
+import {
+  cliTest,
+  runFileCli,
+  type TestCli,
+} from "../../support/cli/cliFixture.js";
 
 const ENVIRONMENT = { REA_LOG_LEVEL: "silent", REA_ANALYSIS_PROVIDER: "auto" };
 
@@ -46,7 +50,7 @@ const expectRootInputError = async (
     readonly message: string;
   },
 ): Promise<void> => {
-  const rejected = await cli.run({
+  const rejected = await runFileCli(cli, {
     arguments: ["trace-dylib-resolution", app, "--root", root, "--json"],
     environment: ENVIRONMENT,
   });
@@ -106,6 +110,54 @@ const withBrokenHelper = async (app: string): Promise<void> => {
   await writeFiles(app, { "Contents/Helpers/broken": broken });
 };
 
+cliTest.skipIf(process.platform !== "linux")(
+  "keeps unrepresentable bundle entries from establishing complete executable-root coverage",
+  async ({ cli }) => {
+    const app = await fixtureApp();
+    await writeFile(
+      Buffer.concat([
+        Buffer.from(`${app}/Contents/Helpers/`),
+        Buffer.from([0xff]),
+      ]),
+      machoImage({}),
+    );
+    const observed = await runFileCli(cli, {
+      arguments: ["trace-dylib-resolution", app, "--json"],
+      environment: ENVIRONMENT,
+    });
+    expect(observed.exitCode, observed.stderr).toBe(0);
+    const result = dylibResolutionResultSchema.parse(
+      parseEvidence(observed.json).normalized_result,
+    );
+    expect(result.coverage.status).toBe("partial");
+    expect(result.limitations).toContainEqual(
+      expect.stringContaining("not valid UTF-8"),
+    );
+  },
+);
+
+cliTest(
+  "reports skipped executable-root symlink subtrees as partial discovery",
+  async ({ cli }) => {
+    const app = await fixtureApp();
+    await symlink("unexamined", join(app, "Contents", "LinkedResources"));
+    const observed = await runFileCli(cli, {
+      arguments: ["trace-dylib-resolution", app, "--json"],
+      environment: ENVIRONMENT,
+    });
+    expect(observed.exitCode, observed.stderr).toBe(0);
+    const result = dylibResolutionResultSchema.parse(
+      parseEvidence(observed.json).normalized_result,
+    );
+    expect(result.coverage.status).toBe("partial");
+    expect(result.limitations).toContainEqual(
+      expect.stringContaining(
+        "their root roles and possible descendants are unknown",
+      ),
+    );
+  },
+);
+
 cliTest(
   "does not turn U+FEFF-prefixed strings into dyld path tokens",
   async ({ cli }) => {
@@ -127,7 +179,7 @@ cliTest(
         ],
       }),
     });
-    const output = await cli.run({
+    const output = await runFileCli(cli, {
       arguments: ["trace-dylib-resolution", app, "--json"],
       environment: ENVIRONMENT,
     });
@@ -157,10 +209,72 @@ cliTest(
   },
 );
 
+cliTest(
+  "resolves dependency names and rpaths containing Unicode line separators",
+  async ({ cli }) => {
+    const app = await fixtureApp();
+    const library = "lib\u2028core.dylib";
+    const directory = "Libraries\u2029Nested";
+    await writeFiles(app, {
+      "Contents/MacOS/App": machoImage({
+        commands: [
+          buildVersionCommand(1),
+          dylibCommand(LC.LOAD_DYLIB, `@loader_path/${library}`),
+          rpathCommand(`@executable_path/${directory}`),
+          dylibCommand(LC.LOAD_DYLIB, "@rpath/libsearch.dylib"),
+        ],
+      }),
+      [`Contents/MacOS/${library}`]: machoImage({
+        fileType: FILE_TYPE.dylib,
+        commands: [buildVersionCommand(1)],
+      }),
+      [`Contents/MacOS/${directory}/libsearch.dylib`]: machoImage({
+        fileType: FILE_TYPE.dylib,
+        commands: [buildVersionCommand(1)],
+      }),
+    });
+    const output = await cli.run({
+      arguments: [
+        "trace-dylib-resolution",
+        app,
+        "--root",
+        "Contents/MacOS/App",
+        "--json",
+      ],
+      environment: ENVIRONMENT,
+    });
+    expect(output.exitCode, output.stderr).toBe(0);
+    const trace = dylibResolutionResultSchema.parse(
+      parseEvidence(output.json).normalized_result,
+    );
+    expect(
+      trace.edges.map(({ install_name, resolution }) => ({
+        install_name,
+        resolution,
+      })),
+    ).toEqual([
+      {
+        install_name: `@loader_path/${library}`,
+        resolution: {
+          status: "resolved",
+          image: `Contents/MacOS/${library}`,
+        },
+      },
+      {
+        install_name: "@rpath/libsearch.dylib",
+        resolution: {
+          status: "resolved",
+          image: `Contents/MacOS/${directory}/libsearch.dylib`,
+        },
+      },
+    ]);
+  },
+);
+
 describe("trace-dylib-resolution CLI", () => {
   cliTest("traces every executable root of an app bundle", async ({ cli }) => {
     const app = await fixtureApp();
-    const result = await cli.run({
+    const result = await runFileCli(cli, {
       arguments: ["trace-dylib-resolution", app, "--json"],
       environment: ENVIRONMENT,
     });
@@ -211,7 +325,7 @@ describe("trace-dylib-resolution CLI", () => {
     "narrows roots and architecture, and rejects escaping roots",
     async ({ cli }) => {
       const app = await fixtureApp();
-      const narrowed = await cli.run({
+      const narrowed = await runFileCli(cli, {
         arguments: [
           "trace-dylib-resolution",
           app,
@@ -267,7 +381,7 @@ describe("trace-dylib-resolution CLI", () => {
         }),
         "unrelated.txt": "not traversed",
       });
-      const result = await cli.run({
+      const result = await runFileCli(cli, {
         arguments: [
           "trace-dylib-resolution",
           join(directory, "tool"),
@@ -292,7 +406,7 @@ describe("trace-dylib-resolution CLI", () => {
     async ({ cli }) => {
       const app = await fixtureApp();
       await withBrokenHelper(app);
-      const result = await cli.run({
+      const result = await runFileCli(cli, {
         arguments: ["trace-dylib-resolution", app, "--json"],
         environment: ENVIRONMENT,
       });
@@ -343,7 +457,7 @@ cliTest(
       });
     }
 
-    const result = await cli.run({
+    const result = await runFileCli(cli, {
       arguments: ["trace-dylib-resolution", app, "--json"],
       environment: ENVIRONMENT,
     });
@@ -400,7 +514,7 @@ cliTest(
         commands: [buildVersionCommand(1)],
       }),
     });
-    const result = await cli.run({
+    const result = await runFileCli(cli, {
       arguments: ["trace-dylib-resolution", join(directory, "tool"), "--json"],
       environment: ENVIRONMENT,
     });
@@ -450,7 +564,7 @@ describe.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
         });
         await chmod(join(directory, "libsecret.dylib"), 0o000);
         try {
-          const result = await cli.run({
+          const result = await runFileCli(cli, {
             arguments: [
               "trace-dylib-resolution",
               join(directory, "tool"),
@@ -498,7 +612,7 @@ cliTest(
           ],
         }),
       });
-      const result = await cli.run({
+      const result = await runFileCli(cli, {
         arguments: [
           "trace-dylib-resolution",
           app,
@@ -559,7 +673,7 @@ cliTest(
           { cpu: CPU.x86_64, bytes: machoImage({ cpu: CPU.x86_64 }) },
         ]),
       });
-      const result = await cli.run({
+      const result = await runFileCli(cli, {
         arguments: [
           "trace-dylib-resolution",
           app,
@@ -609,7 +723,7 @@ cliTest(
         commands: [buildVersionCommand(1)],
       }),
     });
-    const result = await cli.run({
+    const result = await runFileCli(cli, {
       arguments: [
         "trace-dylib-resolution",
         app,
@@ -663,7 +777,7 @@ cliTest(
           ],
         }),
       );
-      const result = await cli.run({
+      const result = await runFileCli(cli, {
         arguments: ["trace-dylib-resolution", path, "--json"],
         environment: ENVIRONMENT,
       });
@@ -711,7 +825,7 @@ describe("trace-dylib-resolution root enumeration", () => {
     "classifies every Mach-O among more files than one batch of magic reads",
     async ({ cli }) => {
       const app = await crowdedApp();
-      const result = await cli.run({
+      const result = await runFileCli(cli, {
         arguments: ["trace-dylib-resolution", app, "--json"],
         environment: ENVIRONMENT,
       });
@@ -742,7 +856,7 @@ describe("trace-dylib-resolution root enumeration", () => {
       await writeFile(secret, "x");
       await chmod(secret, 0o000);
       try {
-        const result = await cli.run({
+        const result = await runFileCli(cli, {
           arguments: ["trace-dylib-resolution", app, "--json"],
           environment: ENVIRONMENT,
         });

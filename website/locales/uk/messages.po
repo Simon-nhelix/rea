@@ -138,8 +138,8 @@ msgid ""
 "REA — Find out how software works. Reverse engineering with your coding "
 "agent."
 msgstr ""
-"REA-Дізнайтеся, як працює програмне забезпечення. Зворотне проектування за "
-"допомогою вашого програміста."
+"REA — Дізнайтеся, як працює програмне забезпечення. Зворотне проектування за "
+"допомогою вашого ШІ-помічника для програмування."
 
 #: website/public/blog/index.html:112
 #: website/public/blog/reverse-engineering-models/index.html:112
@@ -3357,10 +3357,10 @@ msgstr ""
 #, python-brace-format
 msgctxt "page:get-started/index.html"
 msgid ""
-"Your distribution's own {ph0} package is often older than 22.19, so check "
+"Your distribution's own {ph0} package is often older than 22.23.4, so check "
 "{ph1} if you use it instead."
 msgstr ""
-"Власний пакет {ph0} ваш дистрибутив часто старший за версію 22.19, тому "
+"Власний пакет {ph0} ваш дистрибутив часто старший за версію 22.23.4, тому "
 "перевірте {ph1}, якщо ви використовуєте його замість цього."
 
 #. {ph0}: <a href="https://nodejs.org/en/download">
@@ -4421,7 +4421,7 @@ msgstr "Налаштування REA"
 #: website/public/guides/index.html:211
 msgctxt "page:guides/index.html"
 msgid "Connect your coding agent or use REA from the terminal."
-msgstr "Підключіть свій кодер або використовуйте REA з терміналу."
+msgstr "Підключіть свого ШІ-помічника для програмування або використовуйте REA в терміналі."
 
 #: website/public/guides/index.html:212
 msgctxt "page:guides/index.html"
@@ -6325,7 +6325,7 @@ msgstr "Маєте запитання?"
 #: website/public/index.html:6
 msgctxt "page:index.html"
 msgid "REA — Reverse Engineering for Your Coding Agent"
-msgstr "REA-реверс-інжиніринг для вашого програміста"
+msgstr "REA — Реверс-інжиніринг з вашим ШІ-помічником для програмування"
 
 #: website/public/index.html:7
 msgctxt "page:index.html"
@@ -6334,7 +6334,7 @@ msgid ""
 " Follow clear guides and try interactive examples with REA."
 msgstr ""
 "Реінжиніринг програм, двійкових файлів та поведінки браузера за допомогою "
-"агента кодування. Дотримуйтесь чітких інструкцій та спробуйте інтерактивні "
+"ШІ-помічника для програмування. Дотримуйтесь чітких інструкцій та спробуйте інтерактивні "
 "приклади з REA."
 
 #: website/public/index.html:259
@@ -8086,7 +8086,7 @@ msgid ""
 "available. The investigation below shows the REA queries and evidence behind"
 " the answer."
 msgstr ""
-"Приклад запиту для вашого coding agent з доступним локальним виконуваним "
+"Приклад запиту для вашого ШІ-помічника для програмування з доступним локальним виконуваним "
 "файлом. У наведеному нижче дослідженні Показані запити REA та докази, що "
 "лежать в основі відповіді."
 
@@ -9102,7 +9102,7 @@ msgid ""
 "coding agent."
 msgstr ""
 "Приклад запиту з локальним пакетом додатків Notion, доступним вашому "
-"програмісту."
+"ШІ-помічнику для програмування."
 
 #: website/public/showcase/notion/index.html:299
 msgctxt "page:showcase/notion/index.html"
@@ -11707,9 +11707,9 @@ msgstr ""
 #, python-brace-format
 msgctxt "page:get-started/index.html"
 msgid ""
-"You'll need {ph0} 22 (22.19+), 24 (24.11+) or 26+. npm comes with {ph1}."
+"You'll need {ph0} 22 (22.23.4+), 24 (24.22.1+) or 26+ (>=26.12.1). npm comes with {ph1}."
 msgstr ""
-"Вам знадобиться {ph0}22 (22.19+), 24 (24.11+) або 26+.  У комплект поставки "
+"Вам знадобиться {ph0}22 (22.23.4+), 24 (24.22.1+) або 26+ (>=26.12.1).  У комплект поставки "
 "входить {ph1}npm ."
 
 #. {ph0}: <span translate="no">Node.js</span>
@@ -11725,11 +11725,11 @@ msgstr "У вас немає {ph0} або ви не впевнені?"
 #, python-brace-format
 msgctxt "page:get-started/index.html"
 msgid ""
-"If {ph0} prints v22.19+, v24.11+ or v26+, you're ready. If it prints an "
+"If {ph0} prints v22.23.4+, v24.22.1+ or v26.12.1+, you're ready. If it prints an "
 "older version or \"not recognized\" / \"command not found\", install {ph1} "
 "24 LTS:"
 msgstr ""
-"Якщо {ph0} друкує версії v22.19+, v24.11+ або v26+, все готово. Якщо він "
+"Якщо {ph0} друкує версії v22.23.4+, v24.22.1+ або v26.12.1+, все готово. Якщо він "
 "видає стару версію або \"не розпізнається\" / \"команда не знайдена\", "
 "встановіть {ph1} 24 LTS:"
 

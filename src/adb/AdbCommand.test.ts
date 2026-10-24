@@ -1,4 +1,5 @@
 import { expect, it, vi } from "vitest";
+import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import {
   ExecFileOutputCancelledError,
   execFileBytes,
@@ -181,6 +182,77 @@ it("does not infer cancellation from a foreign ABORT_ERR code", async () => {
     ok: false,
     error: { _tag: "AnalysisProtocolError" },
   });
+});
+
+it.each([true, false])(
+  "projects a truncated adb capture as retryable only for volatile output (%s)",
+  async (volatileOutput) => {
+    vi.mocked(execFileBytes).mockRejectedValueOnce(
+      Object.assign(new Error("too much"), {
+        code: 1,
+        stdout: "",
+        stderr: "",
+        signal: null,
+        killed: false,
+        outputTruncated: true,
+      }),
+    );
+    const result = await runAdbCapture(
+      volatileOutput ? "read_adb_logcat" : "install_adb_package",
+      { device: "device" },
+      "/host/adb",
+      volatileOutput ? ["logcat", "-d"] : ["install", "app.apk"],
+      { timeoutMs: 100, maxOutputBytes: 1024, volatileOutput },
+      undefined,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("Expected a capture allowance refusal");
+    const projected = projectAnalysisError(result.error);
+    expect(projected.retryable).toBe(volatileOutput);
+    expect(projected.remediation.action).toContain(
+      "The adb output capture allowance",
+    );
+    expect(projected.remediation.action).toContain(
+      volatileOutput
+        ? "live output may change between requests"
+        : "Repeating the unchanged request fails the same way.",
+    );
+    expect(projected.remediation.action).toContain("1024 bytes");
+    expect(projected.remediation.action).toContain("no runtime override");
+  },
+);
+
+it("names the effective adb deadline and says it has no runtime override", async () => {
+  vi.mocked(execFileBytes).mockRejectedValueOnce(
+    Object.assign(new Error("deadline"), {
+      code: "ETIMEDOUT",
+      stdout: "",
+      stderr: "",
+      signal: null,
+      killed: true,
+    }),
+  );
+  const result = await runAdbCapture(
+    "pull_adb_file",
+    { device: "device" },
+    "/host/adb",
+    ["pull", "/remote"],
+    { timeoutMs: 600_000, maxOutputBytes: 1024 },
+    undefined,
+  );
+  expect(result.ok).toBe(false);
+  if (result.ok) throw new Error("Expected an adb deadline");
+  const projected = projectAnalysisError(result.error);
+  expect(projected).toMatchObject({
+    code: "provider_timeout",
+    details: { timeout_ms: 600_000 },
+  });
+  expect(projected.message).toContain("600000 ms");
+  expect(projected.message).toContain("no runtime override");
+  expect(projected.remediation.action).toContain("no runtime override");
+  expect(projected.remediation.action).not.toContain(
+    "REA_JADX_OPERATION_TIMEOUT_MS",
+  );
 });
 
 it("keeps a physical failure even when the later abort reason is that same error", async () => {

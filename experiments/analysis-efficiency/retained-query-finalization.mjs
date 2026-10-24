@@ -40,6 +40,7 @@ export const finalizeRetainedQueryReceipt = async ({
   serverLog,
   serverLogFinished,
   output,
+  transcript,
   stdout = process.stdout,
 }) => {
   report.cleanup_failures = [];
@@ -57,7 +58,21 @@ export const finalizeRetainedQueryReceipt = async ({
     );
   if (report.cleanup_failures.length > 0) report.retained_workspace = account;
 
+  return publishRetainedQueryReceipt({ report, output, transcript, stdout });
+};
+
+/** Share atomic publication and failure accounting with non-MCP phase probes. */
+export const publishRetainedQueryReceipt = async ({
+  report,
+  output,
+  transcript,
+  stdout = process.stdout,
+}) => {
   report.receipt_failures = [];
+  if (transcript !== undefined)
+    await attempt(report.receipt_failures, "transcript-file", () =>
+      writeFile(join(output, "transcript.json"), JSON.stringify(transcript)),
+    );
   let publication = 0;
   const saveReport = async () => {
     // Keep failed publications in the owned output directory for inspection.

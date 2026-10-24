@@ -7,18 +7,27 @@ import { resolveJavaScriptSourceMapReferences } from "../../domain/javascript/ja
 import { analyzeParsedJavaScriptStaticSourceSteps } from "../../domain/javascript/javascriptStaticAnalysis.js";
 import { analyzeParsedJavaScriptSemanticsSteps } from "../../domain/javascript/javascriptSemanticAnalysis.js";
 import type { JavaScriptSemanticIr } from "../../domain/javascript/javascriptSemanticIr.js";
-import { projectJavaScriptModuleSemantics } from "../../domain/javascript/javascriptModuleSemanticIr.js";
+import {
+  type JavaScriptModuleSemanticIr,
+  projectJavaScriptModuleSemantics,
+} from "../../domain/javascript/javascriptModuleSemanticIr.js";
 import { parseJavaScriptSource } from "../../domain/javascript/javascriptSourceParser.js";
 import { hasValidSourceMapContents } from "../../domain/sourceMapContents.js";
 import {
-  flattenSourceMapLeaves,
+  inspectSourceMapEnvelope,
   sourceMapJsonText,
+  sourceMapMappingsSchema,
 } from "../../domain/sourceMapEnvelope.js";
+import type { SourceMapLeaf } from "../../domain/sourceMapEnvelope.js";
 import type { JavaScriptStaticAnalysis } from "../../domain/javascript/javascriptStaticAnalysisTypes.js";
 import { failedJavaScriptStaticAnalysis } from "../../domain/javascript/javascriptStaticAnalysisHelpers.js";
 import type {
   JavaScriptArtifactFile,
   JavaScriptArtifactFileSet,
+} from "../../domain/javascript/javascriptArtifactFiles.js";
+import {
+  javaScriptArtifactTextExclusion,
+  javaScriptSemanticSourceExclusion,
 } from "../../domain/javascript/javascriptArtifactFiles.js";
 import type {
   AnalyzedJavaScriptArtifactFile,
@@ -26,7 +35,6 @@ import type {
   JavaScriptArtifactAnalysisScope,
   JavaScriptArtifactAnalysis,
   JavaScriptModuleArtifactAnalysis,
-  JavaScriptModuleSemanticIr,
   JavaScriptHtmlInlineScriptsObservation,
   JavaScriptHtmlScriptObservation,
   JavaScriptJsonModuleObservation,
@@ -36,11 +44,17 @@ import type {
 } from "./JavaScriptArtifactAnalysisTypes.js";
 import { javascriptArtifactAnalysisScopes } from "./JavaScriptArtifactAnalysisTypes.js";
 import { analyzeJavaScriptJsonModule } from "./JavaScriptJsonModules.js";
+import {
+  JavaScriptJsonDocuments,
+  type JavaScriptJsonDocumentFacts,
+} from "./JavaScriptJsonDocuments.js";
 import { completeJavaScriptAnalysisSteps } from "./JavaScriptAnalysisControl.js";
 import { htmlArtifactReferences } from "../../domain/javascript/htmlArtifactReferences.js";
 import type { JavaScriptSourceAnalysisPort } from "../../domain/javascript/javascriptSourceAnalysis.js";
 import type { JavaScriptSemanticGraphProjection } from "./JavaScriptSemanticGraphBuilder.js";
 import { AnalysisError } from "../../domain/analysisErrorBase.js";
+import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
+import { translateArtifactFailure } from "../../artifacts/ArtifactOperationFailure.js";
 import { projectAnalysisError } from "../../domain/analysisErrorProjection.js";
 import {
   AnalysisCancelledError,
@@ -51,6 +65,7 @@ import {
 interface MutableArtifactAnalysis<
   SemanticIr extends JavaScriptModuleSemanticIr,
 > {
+  readonly jsonDocuments: JavaScriptJsonDocuments;
   readonly files: AnalyzedJavaScriptArtifactFile<SemanticIr>[];
   readonly packages: JavaScriptPackageObservation[];
   readonly jsonModules: JavaScriptJsonModuleObservation[];
@@ -83,46 +98,6 @@ export const analyzeJavaScriptArtifactFiles = (
     return ir;
   });
 
-/**
- * Project each file's full IR immediately, retaining only later module facts.
- * Parsing, analysis and each projection pass run as separate steps, so control
- * messages and cancellation are handled within one large file as well.
- */
-export const analyzeAndProjectJavaScriptArtifactFiles = async (
-  fileSet: JavaScriptArtifactFileSet,
-  projectSemantics: (
-    file: JavaScriptArtifactFile,
-    ir: JavaScriptSemanticIr,
-  ) => Iterator<void, void> | void,
-  beforeFile?: (
-    file: JavaScriptArtifactFile,
-    completed: number,
-    total: number,
-  ) => Promise<void>,
-  signal?: AbortSignal,
-): Promise<JavaScriptModuleArtifactAnalysis> => {
-  const state = emptyArtifactAnalysis<JavaScriptModuleSemanticIr>();
-  const projectFileSemantics = function* (
-    file: JavaScriptArtifactFile,
-    ir: JavaScriptSemanticIr,
-  ): Generator<void, JavaScriptModuleSemanticIr> {
-    const projection = projectSemantics(file, ir);
-    if (projection !== undefined) while (projection.next().done !== true) yield;
-    return projectJavaScriptModuleSemantics(ir);
-  };
-  const context = { state, projectSemantics: projectFileSemantics };
-  for (const [index, file] of fileSet.files.entries()) {
-    // Let progress, cancellation and garbage collection run between files.
-    await setImmediate();
-    await beforeFile?.(file, index, fileSet.files.length);
-    await completeJavaScriptAnalysisSteps(
-      analyzeArtifactFileSteps(file, context),
-      signal,
-    );
-  }
-  return finalizeArtifactAnalysis(state);
-};
-
 /** Analyze sources behind a hard heap boundary, retaining collected facts on interruption. */
 export const analyzeAndAdoptJavaScriptArtifactFiles = async (
   fileSet: JavaScriptArtifactFileSet,
@@ -134,6 +109,7 @@ export const analyzeAndAdoptJavaScriptArtifactFiles = async (
     total: number,
   ) => Promise<void>,
   signal?: AbortSignal,
+  onPhase?: (file: JavaScriptArtifactFile, phase: string) => Promise<void>,
 ): Promise<{
   readonly analysis: JavaScriptModuleArtifactAnalysis;
   readonly interruption: AnalysisError | null;
@@ -147,17 +123,20 @@ export const analyzeAndAdoptJavaScriptArtifactFiles = async (
     let analysisStarted = false;
     try {
       await setImmediate();
-      if (classifyOutsideAnalysisScope(file, state, projection)) {
+      if (classifyUnavailableSource(file, state, projection)) {
         if (signal?.aborted === true) {
           interruption = new AnalysisCancelledError(
             "analyze_javascript_application",
+            { cause: signal.reason },
           );
           break;
         }
         continue;
       }
       if (signal?.aborted === true)
-        throw new AnalysisCancelledError("analyze_javascript_application");
+        throw new AnalysisCancelledError("analyze_javascript_application", {
+          cause: signal.reason,
+        });
       await beforeFile(file, selectedFileIndex++, selectedFileCount);
       analysisStarted = true;
       if (file.kind !== "javascript" || !file.text.included) {
@@ -175,6 +154,7 @@ export const analyzeAndAdoptJavaScriptArtifactFiles = async (
         file,
         projection.remainingFileCapacity(),
         signal,
+        onPhase === undefined ? undefined : (phase) => onPhase(file, phase),
       );
       const facts = result.ok ? result.value : result.error;
       const applicationProjectionFailure = facts.applicationProjectionFailure;
@@ -212,11 +192,17 @@ export const analyzeAndAdoptJavaScriptArtifactFiles = async (
               },
             }),
       });
-      if (failure !== undefined && facts.projection === null)
+      const semanticUnavailableReason =
+        failure?.reason ??
+        javaScriptSemanticSourceExclusion(
+          file,
+          facts.javascript?.parse_status ?? null,
+        );
+      if (facts.projection === null && semanticUnavailableReason !== null)
         projection.recordUnavailableFile(
           file,
-          failure.reason,
-          failure.limits,
+          semanticUnavailableReason,
+          failure?.limits ?? null,
           error instanceof AnalysisResourceConstraintError ||
             error instanceof AnalysisTimeoutError
             ? "resource-limit"
@@ -243,39 +229,44 @@ export const analyzeAndAdoptJavaScriptArtifactFiles = async (
         break;
       }
     } catch (cause: unknown) {
-      if (signal?.aborted !== true && !(cause instanceof AnalysisError))
-        throw cause;
-      interruption =
-        signal?.aborted === true
-          ? new AnalysisCancelledError("analyze_javascript_application")
-          : cause instanceof AnalysisError
-            ? cause
-            : null;
-      if (interruption !== null) {
-        const scope = javascriptArtifactAnalysisScopes[file.kind];
-        state.files.push({
-          file,
-          javascript: null,
-          semantic: null,
-          ...(scope === null
-            ? {}
-            : {
-                analysis_failure: {
-                  scope,
-                  status: analysisStarted ? "interrupted" : "not-started",
-                  reason: `${file.path}: ${interruption.message}`,
-                  error: projectAnalysisError(interruption),
-                  limits: null,
-                },
-              }),
-        });
-        projection.recordUnavailableFile(
-          file,
-          interruption.message,
-          null,
-          "incomplete-module",
+      if (cause instanceof AnalysisError) interruption = cause;
+      else if (
+        cause instanceof ArtifactReaderFailure &&
+        cause.reason === "cancelled"
+      )
+        interruption = translateArtifactFailure(
+          "analyze_javascript_application",
+          cause,
         );
-      }
+      else if (signal?.aborted === true && cause === signal.reason)
+        interruption = new AnalysisCancelledError(
+          "analyze_javascript_application",
+          { cause },
+        );
+      else throw cause;
+      const scope = javascriptArtifactAnalysisScopes[file.kind];
+      state.files.push({
+        file,
+        javascript: null,
+        semantic: null,
+        ...(scope === null
+          ? {}
+          : {
+              analysis_failure: {
+                scope,
+                status: analysisStarted ? "interrupted" : "not-started",
+                reason: `${file.path}: ${interruption.message}`,
+                error: projectAnalysisError(interruption),
+                limits: null,
+              },
+            }),
+      });
+      projection.recordUnavailableFile(
+        file,
+        interruption.message,
+        null,
+        "incomplete-module",
+      );
       break;
     }
   }
@@ -299,7 +290,7 @@ export const analyzeAndAdoptJavaScriptArtifactFiles = async (
     >();
     for (const file of fileSet.files) {
       if (analyzedPaths.has(file.path)) continue;
-      if (classifyOutsideAnalysisScope(file, state, projection)) continue;
+      if (classifyUnavailableSource(file, state, projection)) continue;
       const scope = javascriptArtifactAnalysisScopes[file.kind];
       let unavailable = scope === null ? undefined : failures.get(scope);
       if (scope !== null && unavailable === undefined) {
@@ -345,6 +336,7 @@ const finalizeArtifactAnalysis = <
   state: MutableArtifactAnalysis<SemanticIr>,
 ): JavaScriptArtifactAnalysis<SemanticIr> => {
   return {
+    jsonDocuments: state.jsonDocuments,
     files: state.files,
     packages: state.packages,
     json_modules: state.jsonModules,
@@ -382,7 +374,7 @@ function* analyzeArtifactFileSteps<
   context: ArtifactAnalysisContext<SemanticIr>,
 ): Generator<void, void> {
   const { state } = context;
-  if (classifyOutsideAnalysisScope(file, state)) return;
+  if (classifyUnavailableSource(file, state)) return;
   addStructuredObservations(file, state);
   if (file.kind === "html" && file.text.included) {
     const html = parseHtmlScripts(file.path, file.text.value);
@@ -438,22 +430,17 @@ function* analyzeArtifactFileSteps<
   if (analysis.parse_status === "failed") state.parseFailures += 1;
 }
 
-const classifyOutsideAnalysisScope = <
+const classifyUnavailableSource = <
   SemanticIr extends JavaScriptModuleSemanticIr,
 >(
   file: JavaScriptArtifactFile,
   state: MutableArtifactAnalysis<SemanticIr>,
   projection?: JavaScriptSemanticGraphProjection,
 ): boolean => {
-  if (file.text.included || file.text.reason !== "outside-analysis-scope")
-    return false;
+  const reason = javaScriptArtifactTextExclusion(file);
+  if (reason === null) return false;
   state.files.push({ file, javascript: null, semantic: null });
-  projection?.recordUnavailableFile(
-    file,
-    "Source was not analyzed because it is outside the caller-selected source_paths.",
-    null,
-    "incomplete-module",
-  );
+  projection?.recordUnavailableFile(file, reason, null, "incomplete-module");
   return true;
 };
 
@@ -468,6 +455,7 @@ const addSourceMap = (
 const emptyArtifactAnalysis = <
   SemanticIr extends JavaScriptModuleSemanticIr,
 >(): MutableArtifactAnalysis<SemanticIr> => ({
+  jsonDocuments: new JavaScriptJsonDocuments(),
   files: [],
   packages: [],
   jsonModules: [],
@@ -484,27 +472,25 @@ const addStructuredObservations = (
   file: JavaScriptArtifactFile,
   state: MutableArtifactAnalysis<JavaScriptModuleSemanticIr>,
 ): void => {
-  if (file.kind === "package-json") state.packages.push(parsePackage(file));
+  if (file.kind === "package-json")
+    state.packages.push(parsePackage(file, state.jsonDocuments.read(file)));
   if (file.kind !== "json") return;
-  const json = analyzeJavaScriptJsonModule(file);
+  const json = analyzeJavaScriptJsonModule(file, state.jsonDocuments);
   state.jsonModules.push(json);
   if (json.status === "invalid") state.parseFailures += 1;
 };
 
 const parsePackage = (
   file: JavaScriptArtifactFile,
+  document: JavaScriptJsonDocumentFacts,
 ): JavaScriptPackageObservation => {
-  if (!file.text.included)
+  if (document.status === "unavailable")
     return unavailablePackage(file, "Package metadata text was unavailable.");
-  let value: unknown;
-  try {
-    value = JSON.parse(file.text.value);
-  } catch (cause: unknown) {
-    void cause;
+  if (document.status === "invalid")
     return invalidPackage(file, "package.json is not valid JSON.");
-  }
-  if (!isRecord(value))
+  if (document.packageFields === null)
     return invalidPackage(file, "package.json root is not an object.");
+  const value = document.packageFields;
   return {
     path: file.path,
     sha256: file.sha256,
@@ -512,6 +498,13 @@ const parsePackage = (
     name: optionalString(value.name),
     version: optionalString(value.version),
     main: optionalString(value.main),
+    main_status:
+      value.main === undefined || value.main === ""
+        ? "default"
+        : typeof value.main === "string"
+          ? "declared"
+          : "invalid",
+    main_entrypoint: typeof value.main === "string" ? value.main : "",
     renderer:
       optionalString(value.renderer) ??
       optionalString(value.browser) ??
@@ -538,6 +531,8 @@ const unavailablePackage = (
   name: null,
   version: null,
   main: null,
+  main_status: "unavailable",
+  main_entrypoint: null,
   renderer: null,
   limitation,
 });
@@ -583,60 +578,109 @@ const parseSourceMap = (
     void cause;
     return invalidSourceMap(file, "Source map is not valid JSON.");
   }
-  const maps = flattenSourceMapLeaves(value);
-  if (maps === undefined)
-    return invalidSourceMap(file, "Source map is not a version 3 map.");
-  return collectSourceMapOriginals(file, maps);
+  const envelope = inspectSourceMapEnvelope(value);
+  if (envelope.status === "invalid")
+    return invalidSourceMap(file, envelope.reason);
+  const observation = collectSourceMapOriginals(file, envelope.leaves);
+  if (envelope.status === "included") return observation;
+  const envelopeLimitations = [
+    ...envelope.invalid_sections.map(
+      ({ section_path, reason }) =>
+        `Indexed source-map section at [${section_path.join(",")}]: ${reason}`,
+    ),
+    ...envelope.external_sections.map(
+      ({ url }) => `External source-map section URL is not fetched: ${url}`,
+    ),
+  ];
+  const limitation = [
+    ...(observation.status === "invalid" ? [observation.limitation] : []),
+    ...envelopeLimitations,
+  ].join("; ");
+  return {
+    ...observation,
+    status: "invalid",
+    limitation,
+    ...(envelope.external_sections.length === 0
+      ? {}
+      : { external_sections: envelope.external_sections }),
+    ...(envelope.invalid_sections.length === 0
+      ? {}
+      : { invalid_sections: envelope.invalid_sections }),
+  };
 };
 
 const collectSourceMapOriginals = (
   file: JavaScriptArtifactFile,
-  maps: readonly Readonly<Record<string, unknown>>[],
+  leaves: readonly SourceMapLeaf[],
 ): JavaScriptSourceMapObservation => {
   const sources: JavaScriptSourceMapOriginal[] = [];
+  const limitations: string[] = [];
   let declarationIndex = 0;
-  for (const map of maps) {
+  for (const { map, section_path } of leaves) {
+    const location =
+      section_path.length === 0
+        ? ""
+        : ` in section [${section_path.join(",")}]`;
     const names = map.sources;
-    if (!Array.isArray(names))
-      return invalidSourceMap(file, "Source map has no sources array.");
+    if (!Array.isArray(names)) {
+      limitations.push(`Source map has no sources array${location}.`);
+      continue;
+    }
     const contents = map.sourcesContent;
     if (!hasValidSourceMapContents(contents))
-      return invalidSourceMap(
-        file,
-        "Source map sourcesContent must be an array of strings or null entries.",
+      limitations.push(
+        `Source map sourcesContent must be an array of strings or null entries${location}.`,
       );
-    if (map.sourceRoot != null && typeof map.sourceRoot !== "string")
-      return invalidSourceMap(
-        file,
-        "Source map sourceRoot must be a string or null.",
+    if (map.sourceRoot != null && typeof map.sourceRoot !== "string") {
+      limitations.push(
+        `Source map sourceRoot must be a string or null${location}.`,
       );
+      continue;
+    }
     const root = typeof map.sourceRoot === "string" ? map.sourceRoot : null;
-    const sourceNames: (string | null)[] = [];
-    for (const raw of names) {
-      if (raw !== null && typeof raw !== "string")
-        return invalidSourceMap(
-          file,
-          "Source map contains a non-string source name.",
+    const sourceDeclarations: {
+      readonly index: number;
+      readonly name: string | null;
+    }[] = [];
+    for (const [index, raw] of names.entries()) {
+      if (raw !== null && typeof raw !== "string") {
+        limitations.push(
+          `Source map contains a non-string source name at index ${String(index)}${location}.`,
         );
-      sourceNames.push(raw);
+        continue;
+      }
+      sourceDeclarations.push({ index, name: raw });
     }
     const references = resolveJavaScriptSourceMapReferences(
-      sourceNames,
+      sourceDeclarations.map(({ name }) => name),
       root,
       file.path,
     );
     for (const [index, reference] of references.entries()) {
-      const rawContent = Array.isArray(contents) ? contents[index] : undefined;
+      const declaration = sourceDeclarations[index];
+      if (declaration === undefined) continue;
+      const rawContent = Array.isArray(contents)
+        ? contents[declaration.index]
+        : undefined;
       const content = typeof rawContent === "string" ? rawContent : null;
       sources.push({
-        source_index: index,
+        source_index: declaration.index,
         declaration_index: declarationIndex++,
         reference,
         content,
         content_sha256: content === null ? null : sha256(content),
+        section_path,
       });
     }
+    if (!sourceMapMappingsSchema.safeParse(map.mappings).success)
+      limitations.push(`Source map has no mappings string${location}.`);
   }
+  if (limitations.length > 0)
+    return invalidSourceMap(
+      file,
+      [...new Set(limitations)].join("; "),
+      sources,
+    );
   return {
     path: file.path,
     sha256: file.sha256,
@@ -680,11 +724,12 @@ const unavailableSourceMap = (
 const invalidSourceMap = (
   file: JavaScriptArtifactFile,
   limitation: string,
+  sources: readonly JavaScriptSourceMapOriginal[] = [],
 ): JavaScriptSourceMapObservation => ({
   path: file.path,
   sha256: file.sha256,
   status: "invalid",
-  sources: [],
+  sources,
   limitation,
 });
 
@@ -707,6 +752,3 @@ const optionalString = (value: unknown): string | null =>
 
 const sha256 = (value: string): string =>
   createHash("sha256").update(value).digest("hex");
-
-const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);

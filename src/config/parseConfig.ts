@@ -4,15 +4,12 @@ import type { ConfigurationError } from "../domain/configurationErrors.js";
 import { ok, type Result } from "../domain/result.js";
 import { parseEnvironment } from "./environment.js";
 import { homeDirectoryFromEnvironment } from "./homeDirectory.js";
+import { DEFAULT_BRIDGE_MAX_REQUEST } from "./bridgeMaxRequestBytes.js";
+import { DEFAULT_REGEX_MATCHING_DEADLINE } from "./regexMatchingDeadline.js";
+import { DEFAULT_REGEX_WORKER_HEAP_REQUEST } from "./regexWorkerHeapRequest.js";
 import type { AppConfig } from "./types.js";
-import {
-  linuxHopperLauncherCandidates,
-  REA_MANAGED_LINUX_HOPPER_LAUNCHER,
-} from "../application/LinuxHopper.js";
-import {
-  MAC_HOPPER_SYSTEM_LAUNCHER,
-  macHopperLauncherCandidates,
-} from "../application/MacHopperPaths.js";
+import { hopperLauncherDiscovery } from "../application/HopperLauncherDiscovery.js";
+import { localMacHopperRenamedLauncherCandidates } from "../application/MacHopperPaths.js";
 const executableAvailable = (path: string): boolean => {
   try {
     accessSync(path, constants.X_OK);
@@ -27,28 +24,46 @@ export const defaultHopperLauncherPath = (
   homeDirectory: string,
   executable: (path: string) => boolean = executableAvailable,
 ): string => {
-  if (platform === "darwin") {
-    for (const candidate of macHopperLauncherCandidates(homeDirectory))
+  const discovery = hopperLauncherDiscovery(platform, homeDirectory);
+  for (const candidate of discovery.candidates)
+    if (executable(candidate)) return candidate;
+  if (discovery.probesMacApplicationBundles)
+    for (const candidate of localMacHopperRenamedLauncherCandidates(
+      homeDirectory,
+    ))
       if (executable(candidate)) return candidate;
-    return MAC_HOPPER_SYSTEM_LAUNCHER;
-  }
-  if (platform !== "linux") return MAC_HOPPER_SYSTEM_LAUNCHER;
-  return (
-    linuxHopperLauncherCandidates(homeDirectory).find(executable) ??
-    REA_MANAGED_LINUX_HOPPER_LAUNCHER
-  );
+  return discovery.fallback;
+};
+
+/**
+ * Environment native analysis admits. JEB validates its own timeout during
+ * optional provider composition; that setting must not block unrelated
+ * CLI/MCP startup. Registration validation still checks it directly.
+ */
+const nativeAnalysisEnvironment = (
+  environment: Readonly<Record<string, string | undefined>>,
+): Readonly<Record<string, string | undefined>> => {
+  const { REA_JEB_MCP_TIMEOUT_MS: _jebTimeout, ...appEnvironment } =
+    environment;
+  return appEnvironment;
+};
+
+/**
+ * The configuration error native commands return, without probing launchers.
+ * Doctor uses this so readiness and analysis admit the same settings.
+ */
+export const nativeAnalysisConfigurationError = (
+  environment: Readonly<Record<string, string | undefined>>,
+): ConfigurationError | undefined => {
+  const parsed = parseEnvironment(nativeAnalysisEnvironment(environment));
+  return parsed.ok ? undefined : parsed.error;
 };
 
 /** Parse provider configuration and runtime prerequisites at the composition root. */
 export const parseConfig = (
   environment: Readonly<Record<string, string | undefined>>,
 ): Result<AppConfig, ConfigurationError> => {
-  // JEB validates its own timeout during optional provider composition. It is
-  // not an AppConfig setting and must not prevent unrelated CLI/MCP startup.
-  // Registration validation still checks the complete environment directly.
-  const { REA_JEB_MCP_TIMEOUT_MS: _jebTimeout, ...appEnvironment } =
-    environment;
-  const parsed = parseEnvironment(appEnvironment);
+  const parsed = parseEnvironment(nativeAnalysisEnvironment(environment));
   if (!parsed.ok) return parsed;
   const env = parsed.value;
   return ok({
@@ -58,6 +73,9 @@ export const parseConfig = (
     ...(env.REA_MCP_INPUT_SCHEMA_PROFILE === undefined
       ? {}
       : { mcpInputSchemaProfile: env.REA_MCP_INPUT_SCHEMA_PROFILE }),
+    ...(env.REA_MCP_OUTPUT_SCHEMA_PROFILE === undefined
+      ? {}
+      : { mcpOutputSchemaProfile: env.REA_MCP_OUTPUT_SCHEMA_PROFILE }),
     analysisProvider: env.REA_ANALYSIS_PROVIDER,
     ...(env.REA_IDA_MCP_CONFIG === undefined
       ? {}
@@ -65,6 +83,12 @@ export const parseConfig = (
     ghidraInstallDir: env.GHIDRA_INSTALL_DIR,
     ghidraJavaHome: env.JAVA_HOME,
     ghidraStartupTimeoutMs: env.REA_GHIDRA_STARTUP_TIMEOUT_MS,
+    ...(env.REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS === undefined
+      ? {}
+      : {
+          ghidraDecompileTimeoutSeconds:
+            env.REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS,
+        }),
     ...(env.REA_GHIDRA_LANGUAGE_ID === undefined
       ? {}
       : {
@@ -99,5 +123,26 @@ export const parseConfig = (
     referenceSourcePolicy: {
       secretPatterns: env.referenceSecretPatterns,
     },
+    bridgeMaxRequestBytes:
+      env.REA_BRIDGE_MAX_REQUEST_BYTES === undefined
+        ? DEFAULT_BRIDGE_MAX_REQUEST
+        : {
+            maximumBytes: env.REA_BRIDGE_MAX_REQUEST_BYTES,
+            source: "setting",
+          },
+    regexMatchingDeadline:
+      env.REA_REGEX_MATCHING_DEADLINE_MS === undefined
+        ? DEFAULT_REGEX_MATCHING_DEADLINE
+        : {
+            deadlineMs: env.REA_REGEX_MATCHING_DEADLINE_MS,
+            source: "setting",
+          },
+    regexWorkerHeapRequest:
+      env.REA_REGEX_WORKER_HEAP_REQUEST_MIB === undefined
+        ? DEFAULT_REGEX_WORKER_HEAP_REQUEST
+        : {
+            heapMiB: env.REA_REGEX_WORKER_HEAP_REQUEST_MIB,
+            source: "setting",
+          },
   });
 };

@@ -144,7 +144,7 @@ const compareResources = (
     }),
   ).dimensions.resources;
 
-describe("resource inventory omissions through CDP", () => {
+describe("resource metadata through CDP", () => {
   it.each([
     { fields: { type: undefined }, retained: false },
     { fields: { type: null }, retained: false },
@@ -215,10 +215,15 @@ describe("resource inventory omissions through CDP", () => {
       expect(capture.completeness.unavailable_sections).not.toContain(
         "resources",
       );
-      expect(compareResources(capture, capture).status).toBe("unchanged");
+      // Omitted contentSize is valid metadata, but cannot prove equal resource size.
+      expect(compareResources(capture, capture).status).toBe(
+        size === null ? "unknown" : "unchanged",
+      );
     },
   );
+});
 
+describe("resource inventory omissions through CDP", () => {
   it.each([
     "missing",
     "null",

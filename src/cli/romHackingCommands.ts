@@ -19,7 +19,7 @@ import {
 } from "../domain/romControlCodes.js";
 import { AnalysisInputError } from "../domain/analysisErrorCore.js";
 import { inspectDiscImage } from "../application/romhacking/LocalByteSource.js";
-import { REA_WORKFLOW_PROVIDER } from "../application/InvestigationProviders.js";
+import { REA_WORKFLOW_PROVIDER } from "../domain/investigationProviders.js";
 import { createEvidence } from "../domain/evidence.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import {

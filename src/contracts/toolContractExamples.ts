@@ -14,6 +14,7 @@ export const TOOL_EXAMPLE_OVERRIDES: Readonly<
 > = {
   ...UNKNOWN_CONTRACT_EXAMPLES,
   ...INVESTIGATION_EXAMPLES,
+  inspect_byte_entropy: { path: "/artifacts/firmware.bin" },
   goto_address: { address: "0x1000" },
   procedure_address: { procedure: "main" },
   procedure_assembly: { procedure: "main" },
@@ -60,7 +61,9 @@ export const TOOL_EXAMPLE_OVERRIDES: Readonly<
     encoding: "sjis",
   },
   find_code_caves: { min_size: 64, alignment: 4 },
+  decompile_all: { output_directory: "/tmp/decompile-out" },
   open_binary: { path: "/tmp/fixture" },
+  open_bundle_resources: { path: "/tmp/Fixture.app" },
   export_evidence_bundle: { path: "/tmp/evidence.json" },
   get_evidence_bundle: {
     detail: "summary",
@@ -81,6 +84,10 @@ export const TOOL_EXAMPLE_OVERRIDES: Readonly<
   compare_artifacts: {
     left: ARTIFACT_COMPARISON_EXAMPLE.left,
     right: ARTIFACT_COMPARISON_EXAMPLE.right,
+  },
+  match_native_functions: {
+    left: { kind: "retained-evidence", evidence_id: `ev_${"1".repeat(64)}` },
+    right: { kind: "retained-evidence", evidence_id: `ev_${"2".repeat(64)}` },
   },
   compare_functions: {
     left: FUNCTION_COMPARISON_EXAMPLE.left,

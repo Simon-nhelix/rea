@@ -179,6 +179,51 @@ try {
     disabled,
   );
 
+  const optional = await runHeadless(target, "analyzer-regression-optional", [
+    "-preScript",
+    "ReaGhidraAnalysisOptions.java",
+    "-",
+    `${analyzer},REA Missing Console Preset`,
+    "-postScript",
+    "ReaAnalyzerOptionsRegressionProbe.java",
+    analyzer,
+  ]);
+  assert.ok(
+    optional.includes(`REA_ANALYZER_OPTIONS_DISABLED_OK ${analyzer}`),
+    optional,
+  );
+  assert.ok(
+    !optional.includes('"format":"rea-ghidra-disabled-analyzers-v1"'),
+    optional,
+  );
+
+  // Installed, but Ghidra registers it only for Objective-C 2 Mach-O programs.
+  const formatSpecificAnalyzer = "Objective-C Message Analyzer";
+  const notApplicable = await runHeadless(
+    target,
+    "analyzer-regression-not-applicable",
+    [
+      "-preScript",
+      "ReaGhidraAnalysisOptions.java",
+      `${analyzer},${formatSpecificAnalyzer}`,
+      "-postScript",
+      "ReaAnalyzerOptionsRegressionProbe.java",
+      analyzer,
+    ],
+  );
+  assert.ok(
+    notApplicable.includes(
+      `REA_ANALYZER_OPTIONS_REPORT ${JSON.stringify({
+        format: "rea-ghidra-disabled-analyzers-v1",
+        analyzers: [
+          { name: analyzer, status: "disabled" },
+          { name: formatSpecificAnalyzer, status: "not_applicable" },
+        ],
+      })}`,
+    ),
+    notApplicable,
+  );
+
   const unknownAnalyzer = "REA Unknown Analyzer";
   const rejected = await runHeadless(target, "analyzer-regression-unknown", [
     "-preScript",
@@ -190,7 +235,7 @@ try {
   ]);
   assert.ok(
     rejected.includes(
-      `Unknown Ghidra analyzer for this program: ${unknownAnalyzer}`,
+      `REA_GHIDRA_DISABLED_ANALYZERS names ${unknownAnalyzer}, which is not an analyzer in this Ghidra installation`,
     ),
     rejected,
   );
@@ -208,7 +253,7 @@ try {
   await rm(workspace, { recursive: true, force: true });
 }
 console.log(
-  "Real Ghidra pre-script regression passed: descending function order, out-of-range seed, BSS label, BSS code rejection, unseeded console reset flow, explicit native context before reset-reachable decode, overlapping-context rejection, analyzer option readback, unknown-analyzer abort before post-scripts, and owned-process cleanup.",
+  "Real Ghidra pre-script regression passed: descending function order, out-of-range seed, BSS label, BSS code rejection, unseeded console reset flow, explicit native context before reset-reachable decode, overlapping-context rejection, analyzer option readback, not-applicable analyzer report, unknown-analyzer abort before post-scripts, and owned-process cleanup.",
 );
 
 async function runHeadless(

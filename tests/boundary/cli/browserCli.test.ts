@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { runCliJson as runCli } from "../../fixtures/cliJsonProcess.js";
 import { DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS } from "../../../src/domain/browserScenarioCaptureLimits.js";
+import { BROWSER_STORAGE_FINGERPRINT_VERSION } from "../../../src/domain/browserScenarioCaptureValues.js";
 import {
   startFakeCdpBrowser,
   type FakeCdpBrowser,
@@ -221,6 +222,26 @@ it(
       redirectCapture(inspection, browser.allowedOrigin, 307),
     );
     expect(knownDifference).toMatchObject({
+      normalized_result: {
+        dimensions: { network: { status: "unknown", total_changes: 0 } },
+      },
+    });
+    // A closed imported request inventory supplies the missing directional
+    // proof; two attachment-limited samples cannot pair repeated requests.
+    const closed = redirectCapture(inspection, browser.allowedOrigin, 302);
+    if (!isRecord(closed.inspection.completeness))
+      throw new Error("Missing capture completeness");
+    const limited = closed.inspection.completeness.attach_limited_sections;
+    if (!Array.isArray(limited)) throw new Error("Missing attachment coverage");
+    closed.inspection.completeness.attach_limited_sections = limited.filter(
+      (section) => section !== "network_requests",
+    );
+    expect(
+      await compareCapturesCli(
+        closed,
+        redirectCapture(inspection, browser.allowedOrigin, 307),
+      ),
+    ).toMatchObject({
       normalized_result: {
         dimensions: { network: { status: "changed", total_changes: 1 } },
       },
@@ -687,6 +708,59 @@ const completeScenarioCapture = () => {
     limitations: [],
   };
 };
+
+it(
+  "compares reordered scenario storage through the public CLI and commits the rule",
+  async () => {
+    const capture = completeScenarioCapture();
+    const entries = [
+      { name: "theme", value_state: "hashed", value_sha256: "a".repeat(64) },
+      { name: "locale", value_state: "hashed", value_sha256: "b".repeat(64) },
+    ];
+    const withStorage = (values: typeof entries) => ({
+      ...capture,
+      steps: capture.steps.map((step) => ({
+        ...step,
+        artifacts: {
+          ...step.artifacts,
+          storage: {
+            state: "captured",
+            value: {
+              fingerprint_version: BROWSER_STORAGE_FINGERPRINT_VERSION,
+              cookies: [],
+              local_storage: values,
+              session_storage: [],
+            },
+          },
+        },
+      })),
+    });
+    const compared = await compareCapturesCli(
+      withStorage(entries),
+      withStorage(entries.toReversed()),
+    );
+    expect(compared).toMatchObject({
+      operation: "compare_web_captures",
+      normalized_result: {
+        comparison_kind: "browser_scenario",
+        overall_status: "unchanged",
+        normalization: {
+          built_in_rules: expect.arrayContaining([
+            "compare_storage_entries_as_unordered_collection",
+          ]),
+        },
+      },
+    });
+    const changed = await compareCapturesCli(
+      withStorage(entries),
+      withStorage(entries.slice(1)),
+    );
+    expect(changed).toMatchObject({
+      normalized_result: { overall_status: "changed" },
+    });
+  },
+  INTEGRATION_TEST_TIMEOUT_MS,
+);
 
 const scenarioCaptureWithConsole = (
   text: string,

@@ -171,8 +171,14 @@ the same source byte limit and explicit truncation reporting.
 ## Interpret the result
 
 - Package inspection retains decoded manifest XML, summary declarations,
-  permissions and class/resource counts. Summary fields are extracted by the
-  upstream engine and should be checked against the retained XML when needed.
+  permissions and class/resource counts. REA's bridge selects the exact root
+  `AndroidManifest.xml` resource by original archive name and manifest type,
+  independently of asset order. One namespace-aware JDK XML parse supplies
+  summary attributes and direct permission/SDK declarations; namespace prefixes
+  and XML entity spelling do not change their values. Raw decoded XML is retained
+  exactly and only its displayed text is subject to the existing source byte cap.
+  Summaries use the complete selected XML before that cap. Document types are
+  unsupported; parsing does not load external DTDs, schemas, or XInclude files.
   Signature verification is explicitly `not_performed`.
 - Class search filters the engine's cached top-level names before transferring
   pages, then follows contiguous inventory positions without rescanning earlier
@@ -256,6 +262,10 @@ such as
 `libreactnativejni.so`, `libreactnative.so`, `libhermes.so`,
 `libhermes_executor.so`, `libflutter.so`, and `libunity.so`; unrelated names
 such as `libcommunity.so` and `libreactivity.so` do not identify those families.
+The signing list retains the `META-INF/MANIFEST.MF`, `.SF`, `.RSA`, `.DSA`, and
+`.EC` paths selected by Android's v1 verifier, including nested paths. These are
+inventory metadata candidates, not proof that a v1 signature verifies or that
+the APK is signed; use `inspect-apk-signature` for signature analysis.
 The bridge basis is inferred from the native path and repeated for each managed
 component, so it does not identify a specific JNI binding. Bridge hypotheses form a DEX/JVM-class by native-library
 Cartesian product. The projection computes the product and exact serialized
@@ -335,9 +345,12 @@ export REA_JADX_OPERATION_TIMEOUT_MS=600000
 ```
 
 The value must be a decimal millisecond count from 1 to 2147483647; anything
-else is refused before Java starts. The same deadline bounds each upstream
-call, a timeout reports the selected value, and a passing JADX configuration
-check in `rea doctor` reports the effective `operation_timeout_ms`. Explicit
+else is refused before Java starts. REA reads it from the environment captured
+at process start. A change applies on the next process start; an already
+running server keeps the deadline it started with. The same deadline bounds
+each upstream call. A timeout names `REA_JADX_OPERATION_TIMEOUT_MS`, the
+effective milliseconds, and that range. A passing JADX configuration check in
+`rea doctor` reports the effective `operation_timeout_ms`. Explicit
 cancellation still ends the operation immediately, and partial observations
 and owned-process cleanup are unchanged. Raising the deadline does not extend
 the bridge's 30-second startup handshake or the upstream **90-second**

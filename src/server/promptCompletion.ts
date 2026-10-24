@@ -1,20 +1,21 @@
-import type { EvidenceReader } from "../application/investigation/InvestigationRecordPort.js";
 import { z } from "zod";
 
 import { uniqueSorted } from "../domain/canonicalOrdering.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type { AnalysisOperationPort } from "../application/AnalysisProvider.js";
+import { parseProcessCaptureEvidence } from "../application/process/ProcessEvidence.js";
 import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
 import type { PromptCompletionKind } from "../contracts/promptContracts.js";
-import { addressedValue } from "../contracts/toolOutputSchemaPrimitives.js";
-import { currentMcpRequestSignal } from "./EvidenceMcpServer.js";
+import { addressedValueSchema } from "../domain/native/nativeInventory.js";
+import { currentMcpRequestSignal } from "./EvidenceMcpServerCore.js";
 import { parseArtifactInventoryEvidence } from "../domain/artifactInventoryEvidence.js";
 import { EvidenceIntegrityError } from "../domain/evidenceErrors.js";
-import { parseProcessCapture } from "../domain/process/processCaptureParsing.js";
+import type { Evidence } from "../domain/evidence.js";
+import { investigationEvidenceBundle } from "../application/investigation/InvestigationEvidence.js";
 
 const documentListSchema = z.array(z.string().min(1));
 const procedureInventorySchema = z.array(
-  addressedValue.pick({ address: true, value: true }),
+  addressedValueSchema.pick({ address: true, value: true }),
 );
 const providerStatusSchema = z.object({
   analysis_provider_candidates: z.array(
@@ -171,18 +172,14 @@ const evidenceCandidates = (
 ): readonly string[] => {
   if (session === undefined) return [];
   const candidates: string[] = [];
-  for (const evidence of session.exportEvidenceBundle().records)
+  for (const evidence of investigationEvidenceBundle(session).records)
     candidates.push(...evidenceValues(kind, evidence));
   return candidates;
 };
 
-type LedgerEvidence = ReturnType<
-  EvidenceReader["exportEvidenceBundle"]
->["records"][number];
-
 const evidenceValues = (
   kind: "evidence" | "capture" | "manifest" | "occurrence",
-  evidence: LedgerEvidence,
+  evidence: Evidence,
 ): readonly string[] => {
   if (kind === "evidence") return [evidence.evidence_id];
   if (kind === "capture")
@@ -205,24 +202,21 @@ const artifactInventoryValues = (
       ? [inventory.manifest.manifest_id]
       : inventory.occurrences.map(({ occurrence_id: id }) => id);
   } catch (cause: unknown) {
-    if (
-      cause instanceof TypeError ||
-      cause instanceof z.ZodError ||
-      cause instanceof EvidenceIntegrityError
-    )
-      return [];
+    if (cause instanceof EvidenceIntegrityError) return [];
     throw cause;
   }
 };
 
-const isProcessCaptureEvidence = (evidence: LedgerEvidence): boolean => {
-  if (evidence.operation !== "capture_process_scenario") return false;
-  try {
-    parseProcessCapture(evidence.normalized_result);
-    return true;
-  } catch (cause: unknown) {
-    if (cause instanceof TypeError || cause instanceof z.ZodError) return false;
-    throw cause;
+const isProcessCaptureEvidence = (evidence: Evidence): boolean => {
+  const parsed = parseProcessCaptureEvidence(evidence);
+  if (parsed.ok) return true;
+  switch (parsed.error.kind) {
+    case "wrong-workflow":
+    case "unsupported-provider":
+      return false;
+    case "invalid-evidence":
+    case "invalid-capture":
+      return false;
   }
 };
 

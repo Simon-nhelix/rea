@@ -14,6 +14,7 @@ import { ProviderCleanupError } from "./providerCleanupError.js";
 import { ProviderAdapterError } from "./providerAdapterError.js";
 import { analysisErrorWithCleanupFailure } from "./analysisErrorCleanup.js";
 import { resolvedAnalysisError } from "./analysisErrorBase.js";
+import { createEvidence } from "./evidence.js";
 import {
   redactExplicitFailure,
   redactExplicitPointer,
@@ -55,7 +56,20 @@ it.each([
   ),
   new ProviderAdapterError("provider", "inspect", context),
 ])("preserves sanitized common context for $._tag", (error) => {
+  const observation = createEvidence(
+    undefined,
+    { id: "fixture", name: "Owner facts", version: "1" },
+    {
+      operation: "inspect",
+      parameters: {},
+      result: { source: "already sanitized owner facts" },
+      confidence: "observed",
+      authority: "historical-reference",
+    },
+  );
+  error.retainPartialObservation(observation);
   const sanitized = redactExplicitFailure(error, ["explicit-secret"]);
+  expect(sanitized.partialObservation).toBe(observation);
   expect(sanitized._tag).toBe(error._tag);
   const projected = projectAnalysisError(sanitized);
   expect(projected.details).toMatchObject({
@@ -150,6 +164,26 @@ it("redacts cleanup primaries and mirrors the source error's live status", () =>
       },
     ],
   });
+});
+
+it("keeps a named timeout control through explicit-value redaction", () => {
+  const error = new AnalysisTimeoutError(
+    "analyze_javascript_application",
+    300000,
+    {
+      userMessage:
+        "JavaScript source analysis reached its 300000ms per-source server/provider deadline (analysis_timeout_ms) for explicit-secret, not the MCP client deadline.",
+      remediationAction:
+        "Increase analysis_timeout_ms through MCP for explicit-secret, or use rea analyze-javascript-application <input_path> --analysis-timeout-ms <milliseconds> on the CLI.",
+    },
+  );
+  const redacted = redactExplicitFailure(error, ["explicit-secret"]);
+  const projected = projectAnalysisError(redacted);
+  expect(projected.message).toContain("analysis_timeout_ms");
+  expect(projected.message).toContain("300000");
+  expect(projected.remediation.action).toContain("analysis_timeout_ms");
+  expect(projected.remediation.action).toContain("--analysis-timeout-ms");
+  expect(JSON.stringify(projected)).not.toContain("explicit-secret");
 });
 
 it("keeps unsupported profile reasons distinct from malformed input", () => {

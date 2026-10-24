@@ -548,7 +548,7 @@ describe("web source-map fetching and validation: enforcing fetch limits and val
           {
             status: "fetch_failed",
             artifact: null,
-            limitation: "Source-map fetching exceeded its operation deadline.",
+            limitation: expect.stringContaining("source_map_fetch_timeout_ms"),
           },
         ],
       });
@@ -611,8 +611,7 @@ describe("web source-map fetching and validation: enforcing fetch limits and val
           {
             status: "fetch_failed",
             artifact: null,
-            limitation:
-              "Source-map response exceeded the retained-byte budget.",
+            limitation: expect.stringContaining("retained budget"),
           },
         ],
       });
@@ -666,6 +665,59 @@ describe("web source-map fetching and validation: enforcing fetch limits and val
     });
     expect(result.items[0]?.status).toBe("invalid");
   });
+});
+
+describe("selected source-map fetch deadline", () => {
+  it("applies a non-default source_map_fetch_timeout_ms from the public input", async () => {
+    let calls = 0;
+    let closed = 0;
+    const server = createServer((incoming, response) => {
+      calls += 1;
+      incoming.on("close", () => {
+        closed += 1;
+      });
+      const next =
+        Number(
+          new URL(incoming.url ?? "/", "http://local").searchParams.get("n") ??
+            "0",
+        ) + 1;
+      response.writeHead(302, { location: `/map?n=${String(next)}` }).end();
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const address = server.address();
+      if (address === null || typeof address === "string")
+        throw new TypeError("Expected a TCP listener address");
+      const localOrigin = `http://127.0.0.1:${String(address.port)}`;
+      const url = `${localOrigin}/map?n=0`;
+      const result = await fetchWebSourceMaps(
+        [{ ...request, fetchUrl: url, declaredUrl: url }],
+        input({
+          source_map_fetch_timeout_ms: 150,
+          allowed_origins: [localOrigin],
+        }),
+        undefined,
+        { fetch },
+      );
+      expect(calls).toBeGreaterThan(1);
+      expect(closed).toBeGreaterThan(0);
+      expect(result.items[0]?.limitation).toContain("150");
+      expect(result.items[0]?.limitation).toContain(
+        "source_map_fetch_timeout_ms",
+      );
+    } finally {
+      server.closeAllConnections();
+      if (server.listening)
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) =>
+            error === undefined ? resolve() : reject(error),
+          );
+        });
+    }
+  }, 3_000);
 });
 
 describe("browser map decoded validation", () => {
@@ -1727,6 +1779,17 @@ describe("source-map original artifact language metadata", () => {
     ["main.js", "text/javascript"],
     ["main.mjs", "text/javascript"],
     ["main.cjs", "text/javascript"],
+    ["main.ts?revision=2", "text/typescript"],
+    ["main.tsx?revision=2", "text/typescript"],
+    ["main.mts?revision=2", "text/typescript"],
+    ["main.cts?revision=2", "text/typescript"],
+    ["main.ts#original", "text/typescript"],
+    ["main.tsx#original", "text/typescript"],
+    ["main.mts#original", "text/typescript"],
+    ["main.cts#original", "text/typescript"],
+    ["main.js?filename=main.ts", "text/javascript"],
+    ["main.js#main.ts", "text/javascript"],
+    ["extensionless?revision=2", "text/javascript"],
   ])("retains the source language for %s", async (filename, mediaType) => {
     const text =
       mediaType === "text/typescript"
@@ -1766,7 +1829,12 @@ describe("source-map original artifact language metadata", () => {
             original_sources: [
               {
                 source: `${localOrigin}/${filename}`,
-                artifact: { media_type: mediaType, text },
+                artifact: {
+                  media_type: mediaType,
+                  text,
+                  bytes: Buffer.byteLength(text),
+                  sha256: createHash("sha256").update(text).digest("hex"),
+                },
               },
             ],
             mappings: [{ source: `${localOrigin}/${filename}` }],

@@ -1,13 +1,24 @@
+import { readdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
 import { Cli } from "incur";
 import { afterEach, expect, it, vi } from "vitest";
 
+import * as evidenceInputResolver from "../../src/application/EvidenceInputResolver.js";
 import { WasmArtifactService } from "../../src/application/wasm/WasmArtifactService.js";
+import { registerAnalysisViewCommands } from "../../src/cli/analysisViewCommands.js";
 import { registerWasmCommands } from "../../src/cli/wasmCommands.js";
 import { wasmArtifactModule } from "../../src/composition/wasm.js";
 import { AnalysisOutputError } from "../../src/domain/analysisErrorCore.js";
+import * as analysisView from "../../src/domain/analysisView/analysisView.js";
+import { parseEvidence } from "../../src/domain/evidence.js";
+import { createEvidenceBundle } from "../../src/domain/evidenceBundle.js";
 import { ProviderCleanupError } from "../../src/domain/providerCleanupError.js";
 import { err, ok } from "../../src/domain/result.js";
+import { OwnedFileHandle } from "../../src/filesystem/OwnedFileHandle.js";
 import { silentLogger } from "../../src/logger.js";
+import { analysisViewLayoutEvidence } from "../fixtures/analysisView.js";
+import { createTestTempDirectory } from "../fixtures/temporaryDirectory.js";
 import {
   wasmArtifactExecution,
   wasmArtifactFixture,
@@ -15,7 +26,12 @@ import {
 
 const host = vi.hoisted(() => ({
   listeners: new Map<string, () => void>(),
-  exitCode: undefined as number | undefined,
+  get exitCode() {
+    return process.exitCode;
+  },
+  set exitCode(value: typeof process.exitCode) {
+    process.exitCode = value;
+  },
   on(signal: string, listener: () => void) {
     this.listeners.set(signal, listener);
   },
@@ -40,7 +56,6 @@ vi.mock("../../src/cli/commandCancellation.js", async (importOriginal) => {
 afterEach(() => {
   vi.restoreAllMocks();
   host.listeners.clear();
-  host.exitCode = undefined;
 });
 
 it.each([
@@ -86,7 +101,9 @@ it.each([
     registerWasmCommands(cli, silentLogger, {});
     let output = "";
     const previousExitCode = process.exitCode;
+    let exitCode;
     try {
+      process.exitCode = undefined;
       await cli.serve(
         ["inspect-wasm-artifact", value.artifact.path, "--json"],
         {
@@ -96,6 +113,7 @@ it.each([
           exit: () => {},
         },
       );
+      exitCode = process.exitCode;
     } finally {
       process.exitCode = previousExitCode;
     }
@@ -104,13 +122,13 @@ it.each([
     expect(host.listeners.size).toBe(0);
     if (scenario === "control") {
       expect(result.normalized_result).toEqual(value);
-      expect(host.exitCode).toBeUndefined();
+      expect(exitCode).toBeUndefined();
     } else if (scenario === "primary-failure") {
       expect(result).toMatchObject({
         code: "unreadable_output",
         details: { reason: "primary reply failure" },
       });
-      expect(host.exitCode).toBe(130);
+      expect(exitCode).toBe(130);
     } else {
       expect(result).toMatchObject({
         code: scenario === "interrupt" ? "cancelled" : "cleanup_incomplete",
@@ -124,7 +142,160 @@ it.each([
             : { resources: ["exact-owned-root"] }),
         },
       });
-      if (scenario !== "cleanup-failure") expect(host.exitCode).toBe(130);
+      if (scenario !== "cleanup-failure") expect(exitCode).toBe(130);
+    }
+  },
+);
+
+it.each([
+  ["bundle", "control", "close"],
+  ["bundle", "SIGINT", "close"],
+  ["bundle", "SIGTERM", "close"],
+  ["evidence-file", "control", "close"],
+  ["evidence-file", "SIGINT", "close"],
+  ["evidence-file", "SIGTERM", "close"],
+  ["request-file", "control", "close"],
+  ["request-file", "SIGINT", "close"],
+  ["request-file", "SIGTERM", "close"],
+  ["bundle", "SIGINT", "authentication"],
+  ["bundle", "SIGTERM", "authentication"],
+  ["bundle", "SIGINT", "projection"],
+  ["bundle", "SIGTERM", "projection"],
+  ["bundle", "SIGINT", "authentication-failure"],
+  ["bundle", "SIGTERM", "source-resolution-failure"],
+] as const)(
+  "preserves the analysis-view result and exit status for %s: %s during %s",
+  async (source, signal, phase) => {
+    const root = await createTestTempDirectory("rea-analysis-view-signal-");
+    const parent = analysisViewLayoutEvidence();
+    const filename = `${source}.json`;
+    const path = join(root, filename);
+    const request = {
+      source:
+        source === "bundle"
+          ? {
+              kind: "retained-evidence",
+              evidence_id:
+                phase === "source-resolution-failure"
+                  ? `ev_${"f".repeat(64)}`
+                  : parent.evidence_id,
+            }
+          : source === "evidence-file"
+            ? { kind: "evidence-file", path }
+            : { kind: "inline", evidence: parent },
+      view: { kind: "summary" },
+    };
+    await writeFile(
+      path,
+      JSON.stringify(
+        source === "bundle"
+          ? {
+              ...createEvidenceBundle([parent]),
+              ...(phase === "authentication-failure"
+                ? { records: [{ ...parent, normalized_result: "altered" }] }
+                : {}),
+            }
+          : source === "evidence-file"
+            ? parent
+            : request,
+      ),
+    );
+    let interruptHandled = false;
+    let pendingInterrupt: Promise<void> | undefined;
+    const interrupt = () => {
+      const listener = host.listeners.get(signal);
+      interruptHandled = listener !== undefined;
+      listener?.();
+    };
+    const queueInterrupt = () => {
+      pendingInterrupt = new Promise((resolve) => {
+        setImmediate(() => {
+          interrupt();
+          resolve();
+        });
+      });
+    };
+    // Observe imported production boundaries: spying on the service's own
+    // export cannot intercept its lexical calls to that same function.
+    const originalProject = analysisView.projectAnalysisView;
+    let projected: ReturnType<typeof originalProject> | undefined;
+    const project = vi
+      .spyOn(analysisView, "projectAnalysisView")
+      .mockImplementation((...args) => {
+        projected = originalProject(...args);
+        if (phase === "projection") queueInterrupt();
+        return projected;
+      });
+    const originalResolve = evidenceInputResolver.resolveEvidenceInput;
+    vi.spyOn(evidenceInputResolver, "resolveEvidenceInput").mockImplementation(
+      (...args) => {
+        const resolved = originalResolve(...args);
+        if (phase === "source-resolution-failure") queueInterrupt();
+        return resolved;
+      },
+    );
+    const originalClose = OwnedFileHandle.prototype.close;
+    const close = vi
+      .spyOn(OwnedFileHandle.prototype, "close")
+      .mockImplementation(async function (this: OwnedFileHandle) {
+        await originalClose.call(this);
+        expect(this.handle.fd).toBe(-1);
+        if (signal !== "control" && phase === "close") interrupt();
+        if (phase.startsWith("authentication")) queueInterrupt();
+      });
+    const cli = Cli.create("analysis-view-finalization-test", { sync: false });
+    registerAnalysisViewCommands(cli, silentLogger);
+    let output = "";
+    const previousExitCode = process.exitCode;
+    try {
+      process.exitCode = undefined;
+      await cli.serve(
+        [
+          "inspect-analysis-view",
+          source === "request-file" ? path : JSON.stringify(request),
+          ...(source === "bundle" ? ["--evidence-bundle", path] : []),
+          "--json",
+        ],
+        {
+          stdout: (part) => {
+            output += part;
+          },
+          exit: () => {},
+        },
+      );
+      expect(close).toHaveBeenCalledOnce();
+      expect(host.listeners.size).toBe(0);
+      expect(await readdir(root)).toEqual([filename]);
+      const result = JSON.parse(output);
+      expect(result).toMatchObject(
+        signal === "control"
+          ? { operation: "inspect_analysis_view" }
+          : {
+              code: phase.endsWith("failure")
+                ? "evidence_integrity_mismatch"
+                : "cancelled",
+            },
+      );
+      expect(process.exitCode ?? 0).toBe(
+        signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 0,
+      );
+      if (signal !== "control") expect(interruptHandled).toBe(true);
+      expect(project).toHaveBeenCalledTimes(
+        Number(signal === "control" || phase === "projection"),
+      );
+      if (phase === "projection") {
+        if (!projected?.ok) throw new Error("Expected a completed page");
+        const partial = parseEvidence(result.details.partial_observation);
+        expect(partial.normalized_result).toEqual(projected.value);
+        expect(partial).toMatchObject({
+          operation: "inspect_analysis_view",
+          evidence_links: [parent.evidence_id],
+          subject: parent.subject,
+        });
+      }
+    } finally {
+      await pendingInterrupt;
+      process.exitCode = previousExitCode;
     }
   },
 );

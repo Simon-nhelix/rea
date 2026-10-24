@@ -27,6 +27,13 @@ export const providerSelectionOption = analysisProviderSelectorSchema
     "Bind deep analysis to a provider ID or use deterministic auto selection",
   );
 
+/** Optional path to the local analysis snapshot loaded or updated by a command. */
+export const snapshotSelectionOption = z
+  .string()
+  .min(1)
+  .optional()
+  .describe("Load and update a local analysis snapshot");
+
 /** Explicit interpretation for headerless native executable formats. */
 export const formatSelectionOption = executableFormatHintSchema
   .optional()
@@ -71,35 +78,24 @@ export interface NativeOpenCliFlags {
   readonly "load-address"?: string | undefined;
 }
 
-export const directAnalysisOptions = (
-  logger: Logger,
-  snapshotPath: string | undefined,
-  providerId: AnalysisProviderSelector | undefined,
-  formatHint?: ExecutableFormatHint,
-  architecture?: BinaryArchitecture,
-  entryPoint?: string,
-  loadAddress?: string,
-) => ({
-  logger,
-  snapshotPath,
-  ...(formatHint === undefined ? {} : { formatHint }),
-  ...(architecture === undefined ? {} : { architecture }),
-  ...(entryPoint === undefined ? {} : { entryPoint }),
-  ...(loadAddress === undefined ? {} : { loadAddress }),
-  ...(providerId === undefined ? {} : { providerId }),
-});
-
 /** Map native CLI flags onto the shared one-shot analysis options. */
 export const directAnalysisOptionsFromCli = (
   logger: Logger,
   options: NativeOpenCliFlags,
-) =>
-  directAnalysisOptions(
-    logger,
-    options.snapshot,
-    options.provider,
-    options["target-format"],
-    options.architecture,
-    options["entry-point"],
-    options["load-address"],
-  );
+) => ({
+  logger,
+  snapshotPath: options.snapshot,
+  ...(options["target-format"] === undefined
+    ? {}
+    : { formatHint: options["target-format"] }),
+  ...(options.architecture === undefined
+    ? {}
+    : { architecture: options.architecture }),
+  ...(options["entry-point"] === undefined
+    ? {}
+    : { entryPoint: options["entry-point"] }),
+  ...(options["load-address"] === undefined
+    ? {}
+    : { loadAddress: options["load-address"] }),
+  ...(options.provider === undefined ? {} : { providerId: options.provider }),
+});

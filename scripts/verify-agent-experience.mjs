@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmod,
@@ -11,11 +10,13 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
-import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { z } from "zod";
 
 import { evaluateCodexEvents } from "../dist/evaluation/CodexAgentEval.js";
+import {
+  MISSING_TARGET_SCENARIO,
+  nativeProviderScenario,
+} from "../dist/evaluation/AgentEvaluationScenarios.js";
 import {
   createAgentEvaluationFixtures,
   agentFixtureClaims,
@@ -26,6 +27,7 @@ import {
   summarizeFactualCorrectness,
 } from "../dist/evaluation/AgentEvaluationReport.js";
 import { PRODUCT_IDENTITY } from "../dist/identity.js";
+import { createAgentEvaluationCommands } from "./lib/agent-evaluation-commands.mjs";
 import { closeVerifierResources } from "./lib/verifier-cleanup.mjs";
 import { completeVerifierRun, createVerifierRun } from "./lib/verifier-run.mjs";
 
@@ -68,6 +70,16 @@ const evaluationEnvironment = {
   REA_PROCESS_RUN_ID: verifierRun.run_id,
   PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
 };
+
+const commands = createAgentEvaluationCommands({
+  codex,
+  evaluationRoot,
+  evaluationEnvironment,
+  optionalModel,
+  timeoutMs,
+  repositoryRoot,
+});
+const { runCodex, runProcess, readCommandVersion } = commands;
 
 let primaryError;
 try {
@@ -127,17 +139,7 @@ try {
     requestedScenarioIds.size === 0 || requestedScenarioIds.has("managed"),
   );
   const allScenarios = [
-    {
-      id: "native",
-      expectedFirstTool: "open_binary",
-      requiresEvidence: false,
-      requiredAnswerTermGroups: [["unavailable", "could not", "provider"]],
-      // The verifier authorizes these named session operations, not arbitrary
-      // writes or runtime execution. Missing-engine behavior stays observable.
-      approvedTools: ["open_binary", "close_binary"],
-      requiredToolSubsequence: ["open_binary", "close_binary"],
-      prompt: `Explain what static artifact evidence establishes about the shipped native program at ${targets.native}. Do not execute the target or install tools. Clearly state unavailable provider evidence, and close any analysis session you opened before finishing.`,
-    },
+    nativeProviderScenario(targets.native),
     {
       id: "asar",
       expectedFirstTool: "analyze_javascript_application",
@@ -185,14 +187,7 @@ try {
       ],
       prompt: `Inspect the recorded module identity, exports and observations for main.js in the shipped JavaScript tree ${targets.largeJavascript}. Use REA without directly reading target files or executing the target. Keep results focused on that module, cite Evidence, and state the limits of what its module view establishes.`,
     },
-    {
-      id: "missing-target",
-      expectedFirstTool: null,
-      requiresEvidence: false,
-      requiredAnswerTermGroups: [],
-      prompt:
-        'Reverse engineer my desktop app and explain how it saves user settings. Use static analysis; do not install software. End with one JSON object containing status ("needs_target" or "analyzed"), requested_input ("app_name_or_artifact_path" or null), and question (a string or null).',
-    },
+    MISSING_TARGET_SCENARIO,
     {
       id: "javascript-export-shape",
       expectedFirstTool: "analyze_javascript_application",
@@ -304,8 +299,9 @@ try {
     // Their existence does not identify the unnamed app in this request.
     const targetClarificationPassed =
       scenario.expectedFirstTool === null
-        ? validTargetClarification(metrics.finalMessage)
+        ? scenario.validTargetClarification(metrics.finalMessage)
         : undefined;
+    const scenarioOutcome = scenario.assess?.(metrics);
     const result = {
       id: scenario.id,
       expectedFirstTool: scenario.expectedFirstTool,
@@ -316,6 +312,12 @@ try {
       exitCode: execution.exitCode,
       stderr: execution.stderr,
       ...metrics,
+      ...(scenarioOutcome === undefined
+        ? {}
+        : {
+            scenarioOutcome,
+            scenarioOutcomePassed: scenarioOutcome !== "failed",
+          }),
       ...(targetClarificationPassed === undefined
         ? {}
         : { targetClarificationPassed }),
@@ -400,10 +402,16 @@ try {
   // Even a deliberately retained fixture directory must never retain auth.
   await closeVerifierResources(
     [
-      () => rm(authPath, { force: true }),
-      ...(process.env.REA_AGENT_EVAL_KEEP_FIXTURES === "true"
-        ? []
-        : [() => rm(evaluationRoot, { recursive: true, force: true })]),
+      async () => {
+        // A failed process cleanup retains both its exact owner and its files.
+        await commands.close();
+        await closeVerifierResources([
+          () => rm(authPath, { force: true }),
+          ...(process.env.REA_AGENT_EVAL_KEEP_FIXTURES === "true"
+            ? []
+            : [() => rm(evaluationRoot, { recursive: true, force: true })]),
+        ]);
+      },
     ],
     primaryError,
   );
@@ -472,152 +480,4 @@ async function createTargets(root, includeManaged) {
         }
       : {}),
   };
-}
-
-function validTargetClarification(message) {
-  const schema = z.strictObject({
-    status: z.literal("needs_target"),
-    requested_input: z.literal("app_name_or_artifact_path"),
-    question: z.string().refine((value) => value.trim().length > 0),
-  });
-  try {
-    return schema.safeParse(JSON.parse(message)).success;
-  } catch (cause) {
-    if (cause instanceof SyntaxError) return false;
-    throw cause;
-  }
-}
-
-async function runCodex(prompt, approvedTools) {
-  const arguments_ = [
-    "--no-daemon",
-    "exec",
-    "--ephemeral",
-    "--skip-git-repo-check",
-    "--sandbox",
-    "read-only",
-    "--json",
-    "--color",
-    "never",
-    "-C",
-    evaluationRoot,
-    "-c",
-    'approval_policy="never"',
-    ...approvedTools.flatMap((name) => [
-      "-c",
-      `mcp_servers.rea.tools.${name}.approval_mode="approve"`,
-    ]),
-    ...(optionalModel === undefined ? [] : ["--model", optionalModel]),
-    prompt,
-  ];
-  const child = spawn(codex, arguments_, {
-    cwd: evaluationRoot,
-    env: evaluationEnvironment,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const events = [];
-  const stderr = [];
-  const lines = createInterface({ input: child.stdout });
-  const linesClosed = new Promise((resolveClose) =>
-    lines.once("close", resolveClose),
-  );
-  lines.on("line", (line) => {
-    try {
-      events.push(JSON.parse(line));
-    } catch {
-      stderr.push(`non-json stdout: ${line}`);
-    }
-  });
-  child.stderr.on("data", (chunk) => {
-    if (stderr.join("").length < 32_768) stderr.push(chunk.toString("utf8"));
-  });
-  const exitCode = await new Promise((resolveExit, reject) => {
-    const timeout = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(
-        new Error(`Codex evaluation timed out after ${String(timeoutMs)}ms`),
-      );
-    }, timeoutMs);
-    child.once("error", (cause) => {
-      clearTimeout(timeout);
-      reject(cause);
-    });
-    child.once("exit", (code) => {
-      clearTimeout(timeout);
-      resolveExit(code ?? 1);
-    });
-  });
-  await linesClosed;
-  return { events, exitCode, stderr: stderr.join("").slice(0, 32_768) };
-}
-
-async function runProcess(
-  command,
-  arguments_,
-  cwd,
-  timeout,
-  env = process.env,
-) {
-  const child = spawn(command, arguments_, {
-    cwd,
-    env,
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  let stderr = "";
-  child.stderr.on("data", (chunk) => {
-    if (stderr.length < 32_768) stderr += chunk.toString("utf8");
-  });
-  const code = await new Promise((resolveExit, reject) => {
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`${command} timed out`));
-    }, timeout);
-    child.once("error", (cause) => {
-      clearTimeout(timer);
-      reject(cause);
-    });
-    child.once("exit", (value) => {
-      clearTimeout(timer);
-      resolveExit(value ?? 1);
-    });
-  });
-  if (code !== 0)
-    throw new Error(`${command} failed with ${String(code)}: ${stderr}`);
-}
-
-async function readCommandVersion(command) {
-  const child = spawn(command, ["--version"], {
-    cwd: repositoryRoot,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (chunk) => {
-    if (stdout.length < 4096) stdout += chunk.toString("utf8");
-  });
-  child.stderr.on("data", (chunk) => {
-    if (stderr.length < 4096) stderr += chunk.toString("utf8");
-  });
-  const code = await new Promise((resolveExit, reject) => {
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`${command} --version timed out`));
-    }, 10_000);
-    child.once("error", (cause) => {
-      clearTimeout(timer);
-      reject(cause);
-    });
-    child.once("exit", (value) => {
-      clearTimeout(timer);
-      resolveExit(value ?? 1);
-    });
-  });
-  if (code !== 0)
-    throw new Error(
-      `${command} --version failed with ${String(code)}: ${stderr}`,
-    );
-  const version = stdout.trim();
-  if (version.length === 0)
-    throw new Error(`${command} --version returned empty output`);
-  return version;
 }

@@ -1,4 +1,3 @@
-import { z } from "zod";
 import { err, ok, type Result } from "./result.js";
 import {
   parseRawBinaryEntryPoint,
@@ -27,8 +26,6 @@ export const CONSOLE_TARGET_FORMATS = [
 ] as const;
 
 export type ConsoleTargetFormat = (typeof CONSOLE_TARGET_FORMATS)[number];
-
-export const consoleTargetFormatSchema = z.enum(CONSOLE_TARGET_FORMATS);
 
 export const isConsoleTargetFormat = (
   value: unknown,

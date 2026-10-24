@@ -530,9 +530,7 @@ export {
   parseSegaIpBin,
   resolveDiscLocations,
   type DiscResolvedLocation,
-  type Iso9660FileEntry,
   type Iso9660FileSystem,
-  type Iso9660UnallocatedGap,
   type PlayStationSystemCnf,
   type SegaIpBin,
 } from "./iso9660.js";

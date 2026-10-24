@@ -73,7 +73,15 @@ export class CutterBridgeService {
         requestId,
         pending.completionToken,
       );
-      if (!receipt.ok || !receipt.value) return err(pending.failure);
+      if (!receipt.ok)
+        return err(
+          analysisErrorWithCleanupFailure(
+            pending.failure,
+            receipt.error,
+            "cutter_command",
+          ).bindCleanupDependencies([pending.failure, receipt.error]),
+        );
+      if (!receipt.value) return err(pending.failure);
       const { failure } = pending;
       failure.resolveCleanup();
       this.#pendingCleanup.delete(requestId);
@@ -85,23 +93,23 @@ export class CutterBridgeService {
     options: CutterDiscoveryOptions = {},
   ): Promise<Result<CutterBridgeDiscovery, AnalysisError>> {
     const { signal } = options;
+    if (signal?.aborted)
+      return err(
+        new AnalysisCancelledError("list_cutter_sessions", {
+          cause: signal.reason,
+        }),
+      );
     try {
-      signal?.throwIfAborted();
       const discovery = await this.client.listSessions(options);
-      signal?.throwIfAborted();
-      return ok(discovery);
-    } catch (cause) {
-      if (
-        cause instanceof AnalysisError &&
-        !(signal?.aborted && cause === signal.reason)
-      )
-        return err(cause);
       if (signal?.aborted)
         return err(
           new AnalysisCancelledError("list_cutter_sessions", {
             cause: signal.reason,
           }),
         );
+      return ok(discovery);
+    } catch (cause) {
+      if (cause instanceof AnalysisError) return err(cause);
       return err(
         new AnalysisCapabilityUnavailableError(
           "cutter",
@@ -244,26 +252,15 @@ export class CutterBridgeService {
       return ok(evidence);
     } catch (cause) {
       if (cause instanceof AnalysisError) return err(cause);
-      const message =
-        cause instanceof Error
-          ? cause.message
-          : "Unknown Cutter bridge failure";
-      if (options.signal?.aborted && !message.includes("may have completed"))
-        return err(
-          new AnalysisCancelledError("cutter_command", {
-            cause: options.signal.reason,
-          }),
-        );
       return err(
-        message.includes("generation changed") ||
-          message.includes("unavailable or stale")
-          ? new AnalysisInputError("cutter_command", { cause })
-          : new AnalysisCapabilityUnavailableError(
-              "cutter",
-              "cutter_command",
-              message,
-              { cause },
-            ),
+        new AnalysisCapabilityUnavailableError(
+          "cutter",
+          "cutter_command",
+          cause instanceof Error
+            ? cause.message
+            : "Unknown Cutter bridge failure",
+          { cause },
+        ),
       );
     }
   }

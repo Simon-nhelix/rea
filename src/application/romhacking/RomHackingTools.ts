@@ -1,3 +1,4 @@
+import { compositeKey } from "../../domain/unicodeCodePointOrder.js";
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
 import type {
@@ -127,7 +128,7 @@ const romBytesCache = new Map<string, Buffer>();
 const readRomBytesCached = async (
   target: BinaryTarget & { readonly path: string; readonly sha256: string },
 ): Promise<Buffer | undefined> => {
-  const key = `${target.path}\0${target.sha256}`;
+  const key = compositeKey([target.path, target.sha256]);
   const cached = romBytesCache.get(key);
   if (cached !== undefined) {
     // Refresh LRU order.

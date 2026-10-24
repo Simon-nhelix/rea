@@ -36,6 +36,68 @@ const stageHapEntries = [
   { path: "META-INF/FIXTURE.p7b", content: "opaque signing" },
 ] as const;
 
+it.each(["hap", "app"] as const)(
+  "retains encrypted path-only packaging facts for a %s inventory",
+  async (suffix) => {
+    const root = await createTestTempDirectory("rea-harmony-encrypted-paths-");
+    const path = join(root, `Fixture.${suffix}`);
+    const writer = new ZipWriter(new Uint8ArrayWriter());
+    const member = suffix === "app" ? "entry.hap" : "module.json";
+    await writer.add(member, new TextReader("opaque inaccessible content"), {
+      password: "fixture-only",
+    });
+    await writeFile(path, await writer.close());
+    const inventory = await inventoryApplicationPackage(path);
+    const graph = requireDeterministicProjection(
+      projectHarmonyApplicationEvidence,
+      inventory,
+      harmonyApplicationProjectionResultSchema,
+    );
+    expect(graph.unavailable_components).toContainEqual(
+      expect.objectContaining({
+        path: member,
+        artifact_id: null,
+        sha256: null,
+        encrypted: true,
+      }),
+    );
+    expect(graph.coverage.status).toBe("partial");
+    if (suffix === "app")
+      expect(graph.app_pack_children).toContainEqual(
+        expect.objectContaining({
+          path: member,
+          artifact_id: null,
+          sha256: null,
+        }),
+      );
+    else expect(graph.packaging_model).toBe("stage");
+  },
+);
+
+it("retains inventoried certificate-block suffixes without claiming verified signatures", async () => {
+  const names = ["CERT.RSA", "CERT.DSA", "CERT.EC", "FIXTURE.p7b"];
+  const path = await writeApplicationZip(
+    "rea-harmony-certificate-paths-",
+    "Fixture.hap",
+    [
+      ...names.map((name) => ({
+        path: `META-INF/${name}`,
+        content: "opaque bytes",
+      })),
+      { path: "META-INF/MANIFEST.MF", content: "manifest" },
+      { path: "META-INF/CERT.SF", content: "signature file" },
+    ],
+  );
+  const graph = requireDeterministicProjection(
+    projectHarmonyApplicationEvidence,
+    await inventoryApplicationPackage(path),
+    harmonyApplicationProjectionResultSchema,
+  );
+  expect(graph.components.signing.map(({ path }) => path).sort()).toEqual(
+    names.map((name) => `META-INF/${name}`).sort(),
+  );
+});
+
 describe("HarmonyOS application projection", () => {
   it.each(["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts"])(
     "retains the JavaScript runtime hint for an authenticated .%s component",
@@ -225,6 +287,34 @@ describe("HarmonyOS packaging boundaries", () => {
       "assets/entry/resources.index",
       "assets/entry/resources/base/element/strings.json",
       "assets/feature/resources/rawfile/icon.png",
+    ]);
+  });
+
+  it("does not classify a rawfile named module.json as a manifest", async () => {
+    const path = await writeApplicationZip(
+      "rea-harmony-rawfile-module-manifest-",
+      "Legacy.hap",
+      [
+        { path: "config.json", content: '{"app":{}}' },
+        {
+          path: "assets/entry/resources/rawfile/module.json",
+          content: '{"note":"ordinary raw resource"}',
+        },
+      ],
+    );
+    const inventory = await inventoryApplicationPackage(path);
+    const result = projectHarmonyApplicationEvidence({
+      inventory_evidence: [inventory],
+    });
+    const projection = harmonyApplicationProjectionResultSchema.parse(
+      requireSuccessfulProjection(result).normalized_result,
+    );
+    expect(projection.packaging_model).toBe("fa");
+    expect(projection.components.manifests.map(({ path }) => path)).toEqual([
+      "config.json",
+    ]);
+    expect(projection.components.resources.map(({ path }) => path)).toEqual([
+      "assets/entry/resources/rawfile/module.json",
     ]);
   });
 

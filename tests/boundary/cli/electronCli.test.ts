@@ -1,3 +1,4 @@
+import { parseEvidence } from "../../../src/domain/evidence.js";
 import { execFile, spawn } from "node:child_process";
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -43,7 +44,7 @@ it(
     await writeFile(join(root, "index.html"), "<script src='app.js'></script>");
     await writeFile(join(root, "app.js"), "export const app = true;");
     const browser = await startFakeCdpBrowser({
-      electronFileUrl: pathToFileURL(join(root, "index.html")).href,
+      electronFileUrl: `${pathToFileURL(join(root, "index.html")).href}?next=%2Fsettings#%5Csettings`,
       commandEvents: ({ method }) =>
         method === "Debugger.enable"
           ? [
@@ -61,12 +62,23 @@ it(
     });
     browsers.push(browser);
     const environment = { ...process.env };
-    const listed = await runCli(
-      ["list-electron-targets", browser.endpoint, "--json"],
-      environment,
+    const listed = parseEvidence(
+      await runCli(
+        ["list-electron-targets", browser.endpoint, "--json"],
+        environment,
+      ),
     );
     expect(listed).toMatchObject({
       operation: "list_electron_targets",
+      environment: {
+        id: expect.any(String),
+        platform: "unknown",
+        architecture: "unknown",
+        isolation: "none",
+      },
+      limitations: expect.arrayContaining([
+        "Browser host platform and architecture were not observed.",
+      ]),
       normalized_result: {
         targets: [{ target_id: "electron-page" }],
       },
@@ -84,12 +96,60 @@ it(
     );
     expect(inspected).toMatchObject({
       operation: "inspect_electron_page",
+      environment: listed.environment,
       provider: { id: "rea-cdp-electron" },
       normalized_result: {
         target: { file_path: join(root, "index.html") },
         scripts: {
           items: [{ cdp_hash: null, length: null, is_module: null }],
         },
+      },
+    });
+  },
+  INTEGRATION_TEST_TIMEOUT_MS,
+);
+
+it(
+  "reports rejected Electron CLI arguments with structured issue details",
+  async () => {
+    const invalidTargetList = await runCliResult(
+      ["list-electron-targets", "not a url", "--json"],
+      process.env,
+    );
+    expect(invalidTargetList.exitCode).toBe(1);
+    expect(invalidTargetList.result).toMatchObject({
+      error: "Electron analysis failed",
+      code: "invalid_request",
+      category: "invalid_input",
+      details: {
+        operation: "list_electron_targets",
+        issues: [
+          {
+            path: ["cdp_endpoint"],
+            reason: "invalid_value",
+          },
+        ],
+      },
+    });
+
+    const invalidPageInspect = await runCliResult(
+      ["inspect-electron-page", "http://127.0.0.1:9222", "", "--json"],
+      process.env,
+    );
+    expect(invalidPageInspect.exitCode).toBe(1);
+    expect(invalidPageInspect.result).toMatchObject({
+      error: "Electron analysis failed",
+      code: "invalid_request",
+      category: "invalid_input",
+      details: {
+        operation: "inspect_electron_page",
+        issues: [
+          {
+            path: ["target_id"],
+            reason: "out_of_range",
+            minimum: 1,
+          },
+        ],
       },
     });
   },
@@ -264,6 +324,25 @@ describe("Electron CLI artifact behavior", () => {
   );
 });
 
+describe("Electron CLI runtime reconciliation input", () => {
+  it(
+    "labels schema-invalid reconciliation input without naming Electron",
+    async () => {
+      const rejected = await runCli(
+        ["reconcile-javascript-runtime", "{}", "--json"],
+        process.env,
+      );
+      expect(rejected).toMatchObject({
+        error: "Application workflow failed",
+        code: "invalid_request",
+        category: "invalid_input",
+        details: { operation: "reconcile_javascript_runtime" },
+      });
+    },
+    INTEGRATION_TEST_TIMEOUT_MS,
+  );
+});
+
 describe("Electron CLI runtime reconciliation", () => {
   it(
     "reads a file and returns the derived static/runtime reconciliation contract",
@@ -417,25 +496,32 @@ describe("Electron CLI runtime reconciliation", () => {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const runCli = async (
+const runCliResult = async (
   arguments_: readonly string[],
   environment: NodeJS.ProcessEnv,
-): Promise<unknown> => {
+): Promise<{ readonly exitCode: number; readonly result: unknown }> => {
   try {
     const { stdout } = await execute(
       process.execPath,
       ["scripts/rea.mjs", ...arguments_],
       { cwd: process.cwd(), env: environment, maxBuffer: 16 * 1_024 * 1_024 },
     );
-    return JSON.parse(stdout);
+    return { exitCode: 0, result: JSON.parse(stdout) };
   } catch (cause: unknown) {
     if (
       typeof cause === "object" &&
       cause !== null &&
       "stdout" in cause &&
-      typeof cause.stdout === "string"
+      typeof cause.stdout === "string" &&
+      "code" in cause &&
+      typeof cause.code === "number"
     )
-      return JSON.parse(cause.stdout);
+      return { exitCode: cause.code, result: JSON.parse(cause.stdout) };
     throw cause;
   }
 };
+
+const runCli = async (
+  arguments_: readonly string[],
+  environment: NodeJS.ProcessEnv,
+): Promise<unknown> => (await runCliResult(arguments_, environment)).result;

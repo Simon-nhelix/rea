@@ -2,19 +2,16 @@ import type { EvidenceMcpServer } from "../EvidenceMcpServer.js";
 import { runAdmittedToolOperation } from "../admittedToolOperation.js";
 import { recordSessionEvidenceSources } from "../sessionEvidence.js";
 
-import {
-  buildReconstructionObligationLedgerEvidenceValidated,
-  resolveReconstructionObligationLedgerRequest,
-} from "../../application/ReconstructionObligationLedgerService.js";
-import { applicationToolContract } from "../../contracts/applicationToolContracts.js";
+import { buildResolvedReconstructionObligationLedgerEvidence } from "../../application/ReconstructionObligationLedgerService.js";
+import { resolveReconstructionObligationLedgerRequest } from "../../application/ReconstructionObligationLedgerRequest.js";
+import { ok } from "../../domain/result.js";
+import { toolContract } from "../../contracts/toolContracts.js";
 import { logToolExecution } from "../toolLogging.js";
 import { toolRegistrationOptions } from "../toolRegistrationOptions.js";
 import { recordResult } from "./helpers.js";
 import type { ApplicationToolRegistration } from "./types.js";
 
-const contract = applicationToolContract(
-  "build_reconstruction_obligation_ledger",
-);
+const contract = toolContract("build_reconstruction_obligation_ledger");
 
 /** Register conservative reconstruction-obligation generation and closure. */
 export const registerReconstructionObligationLedgerTool = (
@@ -39,8 +36,10 @@ export const registerReconstructionObligationLedgerTool = (
             contract.name,
             () =>
               Promise.resolve(
-                buildReconstructionObligationLedgerEvidenceValidated(
-                  resolved.value,
+                ok(
+                  buildResolvedReconstructionObligationLedgerEvidence(
+                    resolved.value,
+                  ),
                 ),
               ),
           );
@@ -48,7 +47,7 @@ export const registerReconstructionObligationLedgerTool = (
             return server.delivery.toCallToolResult(result, contract);
           const recorded = recordSessionEvidenceSources(
             options.recordEvidence,
-            resolved.value.evidence_bundle.records,
+            resolved.value.sources.bundle.records,
           );
           if (!recorded.ok)
             return server.delivery.toCallToolResult(recorded, contract);

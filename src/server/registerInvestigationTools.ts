@@ -1,3 +1,7 @@
+import {
+  investigationEvidenceBundle,
+  resolveInvestigationEvidenceClosure,
+} from "../application/investigation/InvestigationEvidence.js";
 import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 
 import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
@@ -9,8 +13,6 @@ import { jsonValueSchema } from "../domain/jsonValue.js";
 import { correlateStaticAndRuntime } from "../domain/staticRuntimeCorrelation.js";
 import {
   comparisonClosure,
-  evidenceClosure,
-  functionEvidenceIds,
   isIncomplete,
   recordWorkflowEvidence,
 } from "./registerInvestigationTools/helpers.js";
@@ -20,9 +22,9 @@ import {
   CHANGED_BEHAVIOR_PROVIDER,
   RECONSTRUCTION_PROVIDER,
   STATIC_RUNTIME_PROVIDER,
-} from "../application/InvestigationProviders.js";
+} from "../domain/investigationProviders.js";
 import {
-  applicationValidatedInputSchema,
+  applicationToolRegistrationOptions,
   toolRegistrationOptions,
 } from "./toolRegistrationOptions.js";
 import { withAdmittedAnalysis } from "./analysisAdmission.js";
@@ -62,74 +64,65 @@ const registerChangedBehavior = (
   admission: ReturnType<typeof withAdmittedAnalysis>,
   contract: ReturnType<typeof toolContract<"find_changed_behavior">>,
 ): void => {
-  const registration = toolRegistrationOptions(contract);
-  server.registerTool(
-    contract.name,
-    {
-      ...registration,
-      inputSchema: applicationValidatedInputSchema(registration.inputSchema),
-    },
-    async (input, context) =>
-      runAdmittedToolOperation(
-        server,
-        admission,
-        contract.name,
-        context.mcpReq.signal,
-        async () => {
-          const computed = await runDerivedOperation(
-            context,
-            contract.name,
-            () => findChangedBehavior(input),
-          );
-          if (!computed.ok)
-            return server.delivery.toCallToolResult(computed, contract);
-          const { result, comparisonEvidenceIds } = computed.value;
-          const closure = evidenceClosure(session, result.evidence_links);
-          if (!closure.ok)
-            return server.delivery.toCallToolResult(closure, contract);
-          const links = closure.value;
-          const evidence = createEvidence(
-            undefined,
-            CHANGED_BEHAVIOR_PROVIDER,
-            {
-              predicateType: "rea.changed-behavior",
-              operation: contract.name,
-              parameters: {
-                comparison_evidence_ids: [...comparisonEvidenceIds],
+  const registration = applicationToolRegistrationOptions(contract);
+  server.registerTool(contract.name, registration, async (input, context) =>
+    runAdmittedToolOperation(
+      server,
+      admission,
+      contract.name,
+      context.mcpReq.signal,
+      async () => {
+        const computed = await runDerivedOperation(context, contract.name, () =>
+          findChangedBehavior(input),
+        );
+        if (!computed.ok)
+          return server.delivery.toCallToolResult(computed, contract);
+        const { result, comparisonEvidenceIds } = computed.value;
+        const closure = resolveInvestigationEvidenceClosure(
+          session,
+          result.evidence_links,
+        );
+        if (!closure.ok)
+          return server.delivery.toCallToolResult(closure, contract);
+        const links = closure.value;
+        const evidence = createEvidence(undefined, CHANGED_BEHAVIOR_PROVIDER, {
+          predicateType: "rea.changed-behavior",
+          operation: contract.name,
+          parameters: {
+            comparison_evidence_ids: [...comparisonEvidenceIds],
+          },
+          result: jsonValueSchema.parse(result),
+          confidence: "derived",
+          authority: "analyst-inference",
+          limitations: result.limitations,
+          evidenceLinks: links,
+        });
+        const recorded = recordWorkflowEvidence(
+          session,
+          evidence,
+          isIncomplete(result.behavior_status),
+          {
+            question:
+              "Did both versions behave the same under a complete controlled replay?",
+            domain: "changed-behavior",
+            requiredAuthority: "controlled-replay",
+            requiredConfidence: "observed",
+            probes: [
+              {
+                operation: "capture_process_scenario",
+                rationale:
+                  "Capture both versions under the same bounded scenario and environment.",
               },
-              result: jsonValueSchema.parse(result),
-              confidence: "derived",
-              authority: "analyst-inference",
-              limitations: result.limitations,
-              evidenceLinks: links,
-            },
-          );
-          const recorded = recordWorkflowEvidence(
-            session,
-            evidence,
-            isIncomplete(result.behavior_status),
-            {
-              question:
-                "Did both versions behave the same under a complete controlled replay?",
-              domain: "changed-behavior",
-              requiredAuthority: "controlled-replay",
-              requiredConfidence: "observed",
-              probes: [
-                {
-                  operation: "capture_process_scenario",
-                  rationale:
-                    "Capture both versions under the same bounded scenario and environment.",
-                },
-              ],
-            },
-          );
-          return server.delivery.toEvidenceToolResult(
-            evidence,
-            contract,
-            recorded,
-          );
-        },
-      ),
+            ],
+          },
+        );
+        return server.delivery.toEvidenceToolResult(
+          evidence,
+          contract,
+          recorded,
+        );
+      },
+    ),
   );
 };
 
@@ -149,9 +142,9 @@ const registerCallPath = (
         contract.name,
         context.mcpReq.signal,
         async () => {
-          const closure = evidenceClosure(
+          const closure = resolveInvestigationEvidenceClosure(
             session,
-            functionEvidenceIds(input.functions),
+            input.functions.map(({ evidence_id }) => evidence_id),
           );
           if (!closure.ok)
             return server.delivery.toCallToolResult(closure, contract);
@@ -222,7 +215,7 @@ const registerStaticRuntime = (
         contract.name,
         context.mcpReq.signal,
         async () => {
-          const closure = evidenceClosure(
+          const closure = resolveInvestigationEvidenceClosure(
             session,
             comparisonClosure([
               ...input.static_comparisons,
@@ -296,7 +289,7 @@ const registerReconstruction = (
         contract.name,
         context.mcpReq.signal,
         async () => {
-          const owned = session.exportEvidenceBundle();
+          const owned = investigationEvidenceBundle(session);
           const computed = await runDerivedOperation(
             context,
             contract.name,
@@ -305,7 +298,10 @@ const registerReconstruction = (
           if (!computed.ok)
             return server.delivery.toCallToolResult(computed, contract);
           const result = computed.value;
-          const closure = evidenceClosure(session, result.evidence_links);
+          const closure = resolveInvestigationEvidenceClosure(
+            session,
+            result.evidence_links,
+          );
           if (!closure.ok)
             return server.delivery.toCallToolResult(closure, contract);
           const links = closure.value;

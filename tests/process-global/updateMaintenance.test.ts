@@ -130,6 +130,64 @@ describe("OMP integration maintenance", () => {
 });
 
 describe("maintenance activation and layered configuration", () => {
+  it("keeps unresolved registrations out of writes without calling them current", async () => {
+    await writeClient("codex", staleCodex);
+    const cursor = await writeClient(
+      "cursor",
+      JSON.stringify({
+        mcpServers: {
+          rea: { command: join(home, "removed-release", "rea"), args: ["mcp"] },
+        },
+      }),
+    );
+    const before = await readFile(cursor, "utf8");
+    const result = await planIntegrationMaintenance(
+      home,
+      entryPoint,
+      process.env,
+      () => {
+        throw new Error("An unresolved maintenance scope must not be executed");
+      },
+    );
+    expect(result).toMatchObject({
+      status: "unavailable",
+      scope: {
+        clients: ["codex"],
+        unresolved: [
+          expect.objectContaining({
+            client: "cursor",
+            state: "unknown",
+            config_path: cursor,
+          }),
+        ],
+      },
+      remediation: expect.stringContaining("cursor"),
+    });
+    expect(await readFile(cursor, "utf8")).toBe(before);
+  });
+
+  it("leaves an inherited disabled OpenCode V2 registration outside maintenance", async () => {
+    const upper = await writeClient(
+      "opencode",
+      JSON.stringify({ mcp: { servers: {} }, theme: "user-selected" }),
+    );
+    const lower = join(home, ".config", "opencode", "config.json");
+    const originalLower = JSON.stringify({
+      mcp: {
+        servers: {
+          rea: { type: "local", command: [entryPoint, "mcp"], disabled: true },
+        },
+      },
+    });
+    await writeFile(lower, originalLower);
+    const originalUpper = await readFile(upper, "utf8");
+    await expect(
+      existingMaintenanceScope(home, entryPoint, process.env),
+    ).resolves.toMatchObject({ clients: [] });
+    expect(await readFile(lower, "utf8")).toBe(originalLower);
+    expect(await readFile(upper, "utf8")).toBe(originalUpper);
+  });
+
   it("leaves a natively disabled ZCode registration outside maintenance", async () => {
     const configPath = await writeClient(
       "zcode",
@@ -382,7 +440,7 @@ describe("updated executable maintenance planning", () => {
 });
 
 describe("update subprocess boundaries", () => {
-  cliTest("exposes update as the sole CLI command", async ({ cli }) => {
+  cliTest("exposes update in CLI help", async ({ cli }) => {
     const help = await cli.run({
       arguments: ["--help"],
       environment: process.env,
@@ -390,6 +448,9 @@ describe("update subprocess boundaries", () => {
     expect(help.exitCode, help.stderr).toBe(0);
     expect(help.stdout).toMatch(/^\s{2}update\s/mu);
     expect(help.stdout).not.toMatch(/^\s{2}upgrade\s/mu);
+  });
+
+  cliTest("rejects the removed upgrade CLI command", async ({ cli }) => {
     const removed = await cli.run({
       arguments: ["upgrade", "--json"],
       environment: process.env,

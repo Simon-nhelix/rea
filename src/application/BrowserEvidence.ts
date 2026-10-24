@@ -138,6 +138,9 @@ const browserParameters = (
         : "target_id" in input && observedOrigin !== undefined
           ? [observedOrigin]
           : [],
+    ...("command_timeout_ms" in input && input.command_timeout_ms !== undefined
+      ? { command_timeout_ms: input.command_timeout_ms }
+      : {}),
   };
   if (!("target_id" in input)) return scope;
   return {
@@ -171,6 +174,11 @@ const browserParameters = (
           ...(input.total_analysis_timeout_ms === undefined
             ? {}
             : { total_analysis_timeout_ms: input.total_analysis_timeout_ms }),
+          ...(input.source_map_fetch_timeout_ms === undefined
+            ? {}
+            : {
+                source_map_fetch_timeout_ms: input.source_map_fetch_timeout_ms,
+              }),
         }
       : {}),
   };
@@ -190,6 +198,8 @@ const browserResultTargetOrigin = (
     typeof result.inspection.target.origin === "string"
   )
     return result.inspection.target.origin;
+  if ("capture" in result && "target_origin" in result.capture)
+    return result.capture.target_origin ?? undefined;
   if (!("target" in result)) return undefined;
   if ("origin" in result.target) return result.target.origin;
   if ("initial_url" in result.target)

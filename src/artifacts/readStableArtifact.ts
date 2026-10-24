@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, type FileHandle } from "node:fs/promises";
+import { sameRegularFileState } from "../filesystem/RegularFile.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
 import type { ArtifactResourceScope } from "./ArtifactResourceScope.js";
 import {
+  artifactFileCompletion,
   withArtifactFileHandle,
   assertArtifactReadActive,
 } from "./ArtifactFileOperation.js";
@@ -13,6 +15,23 @@ export interface StableArtifactSnapshot {
   readonly bytes: Buffer;
   readonly sha256: string;
 }
+
+/** Recover only the exact stable-read outcome retained by descriptor finalization. */
+export const completedStableArtifact = (
+  cause: unknown,
+): StableArtifactSnapshot | undefined => {
+  const value = artifactFileCompletion(cause)?.value;
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    !("bytes" in value) ||
+    !Buffer.isBuffer(value.bytes) ||
+    !("sha256" in value) ||
+    typeof value.sha256 !== "string"
+  )
+    return undefined;
+  return { bytes: value.bytes, sha256: value.sha256 };
+};
 
 /** Filesystem boundary for stable reads, including deterministic replacement probes. */
 export interface StableArtifactFileSystem {
@@ -118,15 +137,7 @@ export const readStableArtifact = async (
         fileSystem.lstat(path),
       );
       if (
-        [after, current].some(
-          (stat) =>
-            !stat.isFile() ||
-            stat.dev !== initial.dev ||
-            stat.ino !== initial.ino ||
-            stat.size !== initial.size ||
-            stat.mtimeNs !== initial.mtimeNs ||
-            stat.ctimeNs !== initial.ctimeNs,
-        ) ||
+        [after, current].some((stat) => !sameRegularFileState(initial, stat)) ||
         BigInt(count) !== initial.size
       )
         throw new ArtifactReaderFailure(

@@ -10,13 +10,10 @@ import {
 } from "./contractToolHandler.js";
 import {
   toolRegistrationOptions,
-  applicationValidatedInputSchema,
+  applicationToolRegistrationOptions,
 } from "./toolRegistrationOptions.js";
 import type { EvidenceLookup } from "../application/EvidenceInputResolver.js";
-import {
-  requireAnalysisViewRetention,
-  summarizeRetainedAnalysis,
-} from "../application/analysisView/AnalysisViewService.js";
+import { retainedSummaryDelivery } from "./retainedSummaryDelivery.js";
 import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 import { err } from "../domain/result.js";
 
@@ -43,7 +40,10 @@ export const registerPcapTools = (
     handler(clientContract),
   );
   const contract = toolContract("inspect_pcap_capture");
-  const registration = toolRegistrationOptions(contract);
+  const delivery = retainedSummaryDelivery(new Set([contract.name]), {
+    recordEvidence,
+    evidenceById,
+  });
   const capture = createEvidenceToolHandler(
     server,
     async (rawInput, options) => {
@@ -58,14 +58,12 @@ export const registerPcapTools = (
           ),
         );
       const { detail, ...input } = parsed.data;
-      const retention = { recordEvidence, evidenceById };
-      if (detail === "summary") {
-        const ready = requireAnalysisViewRetention(contract.name, retention);
-        if (!ready.ok) return ready;
-      }
+      const parameters = { detail };
+      const ready = delivery.preflight(contract.name, parameters);
+      if (!ready.ok) return ready;
       const result = await service.execute(contract.name, input, options);
-      return detail === "summary" && result.ok
-        ? summarizeRetainedAnalysis(result.value, retention)
+      return result.ok
+        ? delivery.projectEvidence(contract.name, parameters, result.value)
         : result;
     },
     logger,
@@ -74,10 +72,7 @@ export const registerPcapTools = (
   );
   server.registerTool(
     contract.name,
-    {
-      ...registration,
-      inputSchema: applicationValidatedInputSchema(registration.inputSchema),
-    },
+    applicationToolRegistrationOptions(contract),
     capture(contract),
   );
 };

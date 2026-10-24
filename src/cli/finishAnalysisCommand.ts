@@ -9,6 +9,7 @@ import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import type { Result } from "../domain/result.js";
+import { dispatchQueuedInterrupts } from "../process/queuedInterrupts.js";
 
 /** Finish a one-shot CLI operation while retaining primary results through close. */
 export const finishAnalysisCommand = async <
@@ -22,6 +23,7 @@ export const finishAnalysisCommand = async <
   fallbackResource?: string,
 ): Promise<Value | ReturnType<typeof projectAnalysisError>> => {
   let result: Result<Value, AnalysisError>;
+  let cleanup: AnalysisError | undefined;
   try {
     result = await run();
   } catch (cause) {
@@ -38,7 +40,6 @@ export const finishAnalysisCommand = async <
     // adapter cannot infer resolution of a producer's earlier cleanup failure.
     await service.close();
   } catch (cause) {
-    let cleanup: AnalysisError;
     if (cause instanceof AnalysisError) cleanup = cause;
     else {
       const observation =
@@ -58,23 +59,28 @@ export const finishAnalysisCommand = async <
         { cause, operation: canonicalOperation },
       );
     }
+  }
+  await dispatchQueuedInterrupts();
+  if (result.ok && signal.aborted)
+    result = {
+      ok: false,
+      error: new AnalysisCancelledError(canonicalOperation, {
+        cause: signal.reason,
+        partialObservation: result.value,
+      }),
+    };
+  if (cleanup !== undefined) {
     if (result.ok) cleanup.retainPartialObservation(result.value);
-    return projectAnalysisError(
-      result.ok
+    result = {
+      ok: false,
+      error: result.ok
         ? cleanup
         : analysisErrorWithCleanupFailure(
             result.error,
             cleanup,
             canonicalOperation,
-          ),
-    );
+          ).bindCleanupDependencies([result.error, cleanup]),
+    };
   }
-  if (result.ok && signal.aborted)
-    return projectAnalysisError(
-      new AnalysisCancelledError(canonicalOperation, {
-        cause: signal.reason,
-        partialObservation: result.value,
-      }),
-    );
   return result.ok ? result.value : projectAnalysisError(result.error);
 };

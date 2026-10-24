@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+import { safeParseJson } from "./safeJson.js";
 
 const jsonValueTypeSchema = z.enum([
   "object",
@@ -21,13 +22,13 @@ type JsonShapePathSegment = z.infer<typeof jsonShapePathSegmentSchema>;
 /** Value-free structural summary of one approved JSON payload. */
 export const jsonShapeSchema = z.object({
   root_type: jsonValueTypeSchema,
-  node_count: z.number().int().min(1),
-  max_depth_observed: z.number().int().min(0),
+  node_count: z.int().min(1),
+  max_depth_observed: z.int().min(0),
   properties: z.array(
     z.object({
       path: z.array(jsonShapePathSegmentSchema).min(1),
       types: z.array(jsonValueTypeSchema).min(1),
-      observations: z.number().int().min(1),
+      observations: z.int().min(1),
     }),
   ),
 });
@@ -42,13 +43,21 @@ interface ShapeNode {
   children?: Map<string | typeof arrayElementKey, ShapeNode>;
 }
 
-/** Parse approved JSON and immediately discard values after iterative shape inference. */
-export const inferJsonShape = (text: string): JsonShape | null => {
+/** Parse approved JSON text or exact UTF-8 bytes, then discard values after shape inference. */
+export const inferJsonShape = (
+  source: string | Uint8Array,
+): JsonShape | null => {
   let root: unknown;
   try {
+    const text =
+      typeof source === "string"
+        ? source
+        : new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+            source,
+          );
     root = JSON.parse(text);
   } catch (cause: unknown) {
-    // Invalid JSON is represented by the null return.
+    // Invalid JSON or non-UTF-8 bytes cannot establish a shape.
     void cause;
     return null;
   }
@@ -133,13 +142,8 @@ export const inferJsonShape = (text: string): JsonShape | null => {
 export const parseJsonObject = (
   text: string,
 ): Readonly<Record<string, unknown>> | null => {
-  let root: unknown;
-  try {
-    root = JSON.parse(text);
-  } catch {
-    return null;
-  }
-  return isRecord(root) ? root : null;
+  const parsed = safeParseJson(text);
+  return parsed.ok && isRecord(parsed.value) ? parsed.value : null;
 };
 /** The JSON type name of one parsed value. */
 export const jsonValueType = (value: unknown): JsonValueType => {

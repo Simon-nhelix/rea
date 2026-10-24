@@ -1,5 +1,9 @@
 import { expect, it } from "vitest";
 import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
+import {
+  CAPTURE_DECODER_OLD_GENERATION_SETTING,
+  DEFAULT_CAPTURE_DECODER_HEAP,
+} from "../../config/captureDecoderHeap.js";
 import { projectAnalysisError } from "../../domain/analysisErrorProjection.js";
 import { analysisErrorProjectionSchema } from "../../contracts/errorSchemas.js";
 import { inspectWebNetworkCaptureInputSchema } from "../../domain/webNetworkCapture.js";
@@ -36,11 +40,11 @@ it.each([
     expect(projected).toMatchObject({
       code: "resource_constraint",
       retryable: false,
-      message: expect.stringContaining("fixed V8 heap"),
+      message: expect.stringContaining(
+        `${String(DEFAULT_CAPTURE_DECODER_HEAP.oldGenerationMiB)} MiB`,
+      ),
       remediation: {
-        action: expect.stringContaining(
-          "smaller capture exported by its producer",
-        ),
+        action: expect.stringContaining(CAPTURE_DECODER_OLD_GENERATION_SETTING),
       },
       details: {
         resource: "memory",
@@ -51,9 +55,20 @@ it.each([
         captured_output: { stdout: "", stderr },
       },
     });
+    expect(projected.message).toContain(
+      `source ${DEFAULT_CAPTURE_DECODER_HEAP.source}`,
+    );
+    expect(projected.remediation.action).toContain(
+      `source ${DEFAULT_CAPTURE_DECODER_HEAP.source}`,
+    );
     expect(JSON.stringify(projected)).not.toContain("rea doctor");
+    expect(JSON.stringify(projected)).not.toContain("no runtime override");
     // Bun ignores the decoder's V8 heap flags, so no fixed heap is reported.
-    const heapLimits = { old_generation_heap_mib: 192, semi_space_heap_mib: 8 };
+    const heapLimits = {
+      old_generation_heap_mib: 192,
+      old_generation_heap_source: "default",
+      semi_space_heap_mib: 8,
+    };
     if (process.versions.bun === undefined)
       expect(projected).toMatchObject({
         details: { reported_limits: heapLimits },

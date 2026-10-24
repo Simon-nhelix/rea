@@ -16,6 +16,8 @@ export interface CdpCaptureEventsState {
   readonly network: Map<string, NetworkState>;
   readonly networkRequestTimestamps: Map<string, number>;
   readonly malformedRedirectRequestIds: Set<string>;
+  /** Requests whose selected JSON request-body shape was expected but not obtained. */
+  readonly missingRequestBodyShapeIds: Set<string>;
   readonly webSocketConnectionsById: Map<
     string,
     WebPageInspection["network"]["websocket_connections"][number]
@@ -26,6 +28,7 @@ export interface CdpCaptureEventsState {
   readonly completeness: CdpCaptureCompleteness;
   originViolation: boolean;
   navigationDuringCapture: boolean;
+  unknownRootIdentity: boolean;
   mainFrameId: string | undefined;
   /**
    * Identity of the document last observed in the main frame. `frameNavigated`

@@ -1,26 +1,23 @@
+import { resolvePairedEvidenceRequest } from "../application/EvidenceInputResolver.js";
 import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 
 import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
 import { toolContract } from "../contracts/toolContracts.js";
-import {
-  createEvidence,
-  parseEvidence,
-  type Evidence,
-} from "../domain/evidence.js";
-import { EvidenceIntegrityError } from "../domain/evidenceErrors.js";
-import { err } from "../domain/result.js";
+import { createEvidence } from "../domain/evidence.js";
+import { parseFunctionEvidence } from "../domain/functionDossierEvidence.js";
+import { FUNCTION_COMPARISON_PROVIDER } from "../domain/comparisonEvidenceIdentity.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
 import type { RecordUnknownInput } from "../domain/residualUnknown.js";
 import { recordDerivedEvidence } from "./recordDerivedEvidence.js";
 import { recordSessionEvidenceSources } from "./sessionEvidence.js";
 import { runDerivedOperation } from "./runDerivedOperation.js";
-import { FUNCTION_COMPARISON_PROVIDER } from "../application/InvestigationProviders.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
 import { withAdmittedAnalysis } from "./analysisAdmission.js";
 import { runAdmittedToolOperation } from "./admittedToolOperation.js";
 
 import { compareFunctions } from "../domain/functionComparison.js";
 import { uniqueSorted } from "../domain/canonicalOrdering.js";
+import { investigationEvidenceLookup } from "../application/investigation/InvestigationEvidence.js";
 /** Register explicit Evidence-backed function comparison. */
 export const registerFunctionComparisonTool = (
   server: EvidenceMcpServer,
@@ -38,45 +35,40 @@ export const registerFunctionComparisonTool = (
         contract.name,
         context.mcpReq.signal,
         async () => {
-          let leftEvidence: Evidence;
-          let rightEvidence: Evidence;
-          try {
-            leftEvidence = parseEvidence(input.left);
-            rightEvidence = parseEvidence(input.right);
-          } catch (cause: unknown) {
-            return server.delivery.toCallToolResult(
-              err(
-                new EvidenceIntegrityError(
-                  cause instanceof Error ? cause.message : "Invalid Evidence",
-                ),
-              ),
-              contract,
-            );
-          }
-          if (
-            leftEvidence.operation !== "analyze_function" ||
-            rightEvidence.operation !== "analyze_function" ||
-            leftEvidence.predicate_type !== "rea.analysis" ||
-            rightEvidence.predicate_type !== "rea.analysis"
-          )
-            return server.delivery.toCallToolResult(
-              err(
-                new EvidenceIntegrityError(
-                  "Expected analyze_function Evidence",
-                ),
-              ),
-              contract,
-            );
-          const leftIds = [leftEvidence.evidence_id];
-          const rightIds = [rightEvidence.evidence_id];
+          const resolved = resolvePairedEvidenceRequest(
+            input,
+            investigationEvidenceLookup(session),
+          );
+          if (!resolved.ok)
+            return server.delivery.toCallToolResult(resolved, contract);
           const computed = await runDerivedOperation(
             context,
             contract.name,
-            () => compareFunctions(leftEvidence, rightEvidence),
+            () => {
+              const left = parseFunctionEvidence(resolved.value.left, {
+                operation: contract.name,
+                path: ["left"],
+              });
+              if (!left.ok) throw left.error;
+              const right = parseFunctionEvidence(resolved.value.right, {
+                operation: contract.name,
+                path: ["right"],
+              });
+              if (!right.ok) throw right.error;
+              return {
+                left: left.value,
+                right: right.value,
+                comparison: compareFunctions(left.value, right.value),
+              };
+            },
           );
           if (!computed.ok)
             return server.delivery.toCallToolResult(computed, contract);
-          const comparison = computed.value;
+          const { left, right, comparison } = computed.value;
+          const leftEvidence = left.evidence;
+          const rightEvidence = right.evidence;
+          const leftIds = [leftEvidence.evidence_id];
+          const rightIds = [rightEvidence.evidence_id];
           const recordedSources = recordSessionEvidenceSources(
             (evidence) => session.recordEvidence(evidence),
             [leftEvidence, rightEvidence],

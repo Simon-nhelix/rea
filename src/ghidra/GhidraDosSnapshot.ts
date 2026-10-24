@@ -30,13 +30,11 @@ export const attestGhidraDosSnapshot = async (
   signal?: AbortSignal,
 ) => {
   const headerBytes = Math.min(fileBytes, 64);
-  const header = await readBoundedFileBytes(
-    handle,
-    headerBytes,
+  const header = await readBoundedFileBytes(handle, headerBytes, {
     signal,
-    headerBytes,
-    cancelled,
-  );
+    expectedSize: headerBytes,
+    cancellationFailure: cancelled,
+  });
   if (header === undefined || header.length !== headerBytes)
     throw new RegularFileChangedError(path);
   const extent = dosMzImageByteLength(header);
@@ -60,15 +58,17 @@ export const attestGhidraDosSnapshot = async (
   }
   if (captured !== captureBytes) throw new RegularFileChangedError(path);
   const windowsHeader = observeMzWindowsHeader(prefix, fileBytes);
-  let signature: Buffer | undefined;
+  let signature:
+    | { readonly offset: number; readonly bytes: Buffer }
+    | undefined;
   if (windowsHeader.state === "signature-needed") {
     const size = Math.min(4, fileBytes - windowsHeader.offset);
-    signature = Buffer.allocUnsafe(size);
+    const signatureBytes = Buffer.allocUnsafe(size);
     let read = 0;
     while (read < size) {
       if (signal?.aborted) throw cancelled(signal.reason);
       const { bytesRead } = await handle.read(
-        signature,
+        signatureBytes,
         read,
         size - read,
         windowsHeader.offset + read,
@@ -76,6 +76,10 @@ export const attestGhidraDosSnapshot = async (
       if (bytesRead === 0) throw new RegularFileChangedError(path);
       read += bytesRead;
     }
+    signature = {
+      offset: windowsHeader.offset,
+      bytes: signatureBytes,
+    };
   }
   const prepared = prepareGhidraDosLoadImage(prefix, fileBytes, signature);
   if (!prepared.ok) return prepared;

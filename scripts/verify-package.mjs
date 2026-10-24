@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 
 import { TOOL_CONTRACTS } from "../dist/contracts/toolContracts.js";
 import { PRODUCT_IDENTITY } from "../dist/identity.js";
-import { MCP_STARTUP_POLICY } from "../dist/mcpStartupPolicy.js";
+import { resolveMcpStartupBudgets } from "../dist/config/mcpStartupBudgets.js";
 import * as prompts from "./verify-package-prompts.mjs";
 import { verifyPackageArtifactAndElectron } from "./verify-package-artifact.mjs";
 import { verifyPackageCapabilitiesAndSearch } from "./verify-package-capabilities.mjs";
@@ -48,6 +48,7 @@ let repositorySkill;
 let report;
 let retainedPackage;
 let retentionMetadata;
+let updateWorkspaceRetained = false;
 
 const runStage = async (name, action) => {
   const started = performance.now();
@@ -115,6 +116,9 @@ try {
       tarball,
       workspace,
       environment: environmentData.environment,
+      retainWorkspace() {
+        updateWorkspaceRetained = true;
+      },
     }),
   );
   mcpStartup = await runStage("MCP startup", () =>
@@ -124,7 +128,7 @@ try {
       environment: {
         ...environmentData.environment,
       },
-      policy: MCP_STARTUP_POLICY,
+      policy: resolveMcpStartupBudgets(environmentData.environment),
     }),
   );
   mcpModuleLoading = await runStage("MCP module loading", () =>
@@ -134,7 +138,7 @@ try {
       environment: {
         ...environmentData.environment,
       },
-      policy: MCP_STARTUP_POLICY,
+      policy: resolveMcpStartupBudgets(environmentData.environment),
       packageName: PRODUCT_IDENTITY.packageName,
     }),
   );
@@ -255,9 +259,14 @@ try {
     });
   }
 } finally {
-  await runStage("workspace cleanup", () =>
-    rm(workspace, { recursive: true, force: true }),
-  );
+  if (updateWorkspaceRetained)
+    process.stderr.write(
+      `Package updater cleanup incomplete; retained ${workspace}\n`,
+    );
+  else
+    await runStage("workspace cleanup", () =>
+      rm(workspace, { recursive: true, force: true }),
+    );
 }
 const verifierLineage = await runStage("verifier lineage", () =>
   completeVerifierRun(verifierRun),

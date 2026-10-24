@@ -283,9 +283,14 @@ export const registrationWriteBlocker = (
   const msix = client.msixPackage;
   if (msix === undefined || msix.processView === "direct") return undefined;
   const name = client.displayName ?? client.name;
-  return msix.processView === "redirected"
-    ? `This process was started from ${name}'s MSIX package ${msix.packageFamilyName}: its AppData is redirected into that package, so ${name} is running and would overwrite ${msix.privateConfigPath} from memory. Quit ${name} fully, then rerun ${operation} from a terminal that ${name} did not start.`
-    : `REA cannot tell whether ${name}'s MSIX package ${msix.packageFamilyName} started this process, because none of its files under ${dirname(msix.privateConfigPath)} could be compared with ${dirname(msix.appDataConfigPath)}. A running ${name} would overwrite the change. Open ${name} once if it has never run, quit it fully, then rerun ${operation} from a terminal that ${name} did not start.`;
+  if (msix.processView === "redirected")
+    return `This process was started from ${name}'s MSIX package ${msix.packageFamilyName}: its AppData is redirected into that package, so ${name} is running and would overwrite ${msix.privateConfigPath} from memory. Quit ${name} fully, then rerun ${operation} from a terminal that ${name} did not start.`;
+  // Setup would write the configuration the app reads; uninstall cleans both files.
+  const manualEdit =
+    operation === "setup"
+      ? `Add REA's entry to ${client.configPath} by hand`
+      : `Remove REA's entry by hand from each of ${msix.privateConfigPath} and ${msix.appDataConfigPath} that has one`;
+  return `REA cannot tell whether ${name}'s MSIX package ${msix.packageFamilyName} started this process, because no private file under ${dirname(dirname(msix.privateConfigPath))} could be compared with ${dirname(dirname(msix.appDataConfigPath))}, and a ${name} that started it would overwrite the change from memory. ${manualEdit} while ${name} is fully quit, or rerun ${operation} from a terminal that ${name} did not start once REA can compare a private file there.`;
 };
 
 /** The MSIX package view, if any, that redirects this process's AppData writes. */
@@ -360,7 +365,7 @@ const piAgentDirectory = ({
 };
 
 const copilotDirectory = ({ home, env }: ClientPathContext): string =>
-  env.COPILOT_HOME ?? join(home, ".copilot");
+  env.COPILOT_HOME || join(home, ".copilot");
 
 const commandCodeDirectory = ({ home }: ClientPathContext): string =>
   join(home, ".commandcode");
@@ -804,13 +809,24 @@ export const supportedClients = (
   });
 };
 
-/** Resolve personal skill roots using the same client environment as setup. */
+/** Resolved destinations and unresolved selections share one path-resolution owner. */
 export const clientSkillDirectories = (
   home: string,
   clientIds: readonly string[] | undefined,
   environment: Readonly<NodeJS.ProcessEnv> = {},
   platform: NodeJS.Platform = process.platform,
-): readonly { readonly client: string; readonly directory: string }[] => {
+): {
+  readonly directories: readonly {
+    readonly client: string;
+    readonly directory: string;
+  }[];
+  readonly unresolved: readonly {
+    readonly client: string;
+    readonly path: string;
+    readonly detail: string;
+  }[];
+} => {
+  const unresolved: { client: string; path: string; detail: string }[] = [];
   const definitions: readonly ClientDefinition[] = SUPPORTED_CLIENT_DEFINITIONS;
   const selected =
     clientIds === undefined
@@ -826,6 +842,14 @@ export const clientSkillDirectories = (
   const destinations = new Map<string, { client: string; directory: string }>();
   for (const client of selected) {
     const definition = definitions.find(({ name }) => name === client);
+    if (definition === undefined && client !== "shared") {
+      unresolved.push({
+        client,
+        path: client,
+        detail: `Unsupported skill client: ${client}`,
+      });
+      continue;
+    }
     let directory: string;
     try {
       const resolved =
@@ -836,11 +860,20 @@ export const clientSkillDirectories = (
               platform,
               env: environment,
             });
-      if (!resolved.ok) continue;
+      if (!resolved.ok) {
+        unresolved.push({
+          client,
+          path: resolved.error.path,
+          detail: resolved.error.message,
+        });
+        continue;
+      }
       directory = resolved.value;
     } catch (cause: unknown) {
-      // Registration diagnostics own an unresolved profile; never fall back to another skill root.
-      if (cause instanceof HermesClientPathError) continue;
+      if (cause instanceof HermesClientPathError) {
+        unresolved.push({ client, path: cause.path, detail: cause.message });
+        continue;
+      }
       throw cause;
     }
     if (!destinations.has(directory))
@@ -850,7 +883,10 @@ export const clientSkillDirectories = (
         directory,
       });
   }
-  return [...destinations.values()].sort((left, right) =>
-    compareUnicodeCodePoints(left.directory, right.directory),
-  );
+  return {
+    directories: [...destinations.values()].sort((left, right) =>
+      compareUnicodeCodePoints(left.directory, right.directory),
+    ),
+    unresolved,
+  };
 };

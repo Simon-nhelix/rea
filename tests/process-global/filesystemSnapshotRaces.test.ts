@@ -34,9 +34,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
         return original.readlink(...args);
       }
       if (path === race.target && race.mode === "readlink_eio")
-        throw Object.assign(new Error("injected unexpected readlink failure"), {
-          code: "EIO",
-        });
+        throw race.reason;
       if (path === race.target && race.mode === "readlink_eacces")
         throw Object.assign(new Error("injected denied readlink"), {
           code: "EACCES",
@@ -106,7 +104,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 });
 
 import {
-  parseProcessScenario,
+  processScenarioSchema,
   type ProcessScenario,
 } from "../../src/domain/process/processScenario.js";
 import { classifyFilesystemEffects } from "../../src/process/capture/ProcessFilesystemEffects.js";
@@ -180,7 +178,7 @@ const entryUnavailable = async (
     const link = join(root, "z-link");
     await writeFile(sibling, "retain this sibling");
     await symlink("missing-target", link);
-    const scenario = parseProcessScenario({
+    const scenario = processScenarioSchema.parse({
       executable: process.execPath,
       working_directory: root,
       filesystem_observation_paths: [root],
@@ -242,7 +240,7 @@ it.skipIf(process.platform === "win32")(
       const link = join(root, "z-link");
       await writeFile(sibling, "retain this sibling");
       await symlink("original-target", link);
-      const scenario = parseProcessScenario({
+      const scenario = processScenarioSchema.parse({
         executable: process.execPath,
         working_directory: root,
         filesystem_observation_paths: [root],
@@ -277,7 +275,7 @@ it("retains siblings and marks child absence unknown when directory revalidation
     await writeFile(sibling, "retain this sibling");
     await mkdir(directory);
     await writeFile(join(directory, "child"), "child observed before race");
-    const scenario = parseProcessScenario({
+    const scenario = processScenarioSchema.parse({
       executable: process.execPath,
       working_directory: root,
       filesystem_observation_paths: [root],
@@ -311,7 +309,7 @@ it.skipIf(process.platform === "win32")(
     withTemporaryRoot("rea-snapshot-cancel-race-", async (root) => {
       const link = join(root, "link");
       await symlink("missing-target", link);
-      const scenario = parseProcessScenario({
+      const scenario = processScenarioSchema.parse({
         executable: process.execPath,
         working_directory: root,
         filesystem_observation_paths: [root],
@@ -332,7 +330,7 @@ it.skipIf(process.platform === "win32")(
     withTemporaryRoot("rea-snapshot-cancel-missing-", async (root) => {
       const link = join(root, "link");
       await symlink("missing-target", link);
-      const scenario = parseProcessScenario({
+      const scenario = processScenarioSchema.parse({
         executable: process.execPath,
         working_directory: root,
         filesystem_observation_paths: [root],
@@ -352,7 +350,7 @@ it("observes cancellation after the selected directory handle closes", async () 
     const directory = join(root, "selected");
     await mkdir(directory);
     await writeFile(join(directory, "child"), "observed child");
-    const scenario = parseProcessScenario({
+    const scenario = processScenarioSchema.parse({
       executable: process.execPath,
       working_directory: root,
       filesystem_observation_paths: [directory],
@@ -376,7 +374,7 @@ it("releases buffered names after a failed directory revalidation before visitin
     await writeFile(join(firstRoot, "a-child"), "first");
     await writeFile(join(firstRoot, "b-child"), "second");
     await writeFile(join(secondRoot, "child"), "retain this root");
-    const scenario = parseProcessScenario({
+    const scenario = processScenarioSchema.parse({
       executable: process.execPath,
       working_directory: parent,
       filesystem_observation_paths: [firstRoot, secondRoot],
@@ -400,18 +398,24 @@ it.skipIf(process.platform === "win32")(
     withTemporaryRoot("rea-snapshot-eio-control-", async (root) => {
       const link = join(root, "link");
       await symlink("missing-target", link);
-      const scenario = parseProcessScenario({
+      const scenario = processScenarioSchema.parse({
         executable: process.execPath,
         working_directory: root,
         filesystem_observation_paths: [root],
       });
       race.mode = "readlink_eio";
       race.target = link;
+      const reason = Object.assign(
+        new Error("injected unexpected readlink failure"),
+        { code: "EIO" },
+      );
+      race.reason = reason;
       const cause = await snapshotRoots(scenario).catch(
         (failure: unknown) => failure,
       );
       expect(cause).toBeInstanceOf(ProcessCaptureSnapshotFailure);
       const failure = cause as ProcessCaptureSnapshotFailure;
+      expect(failure.cause).toBe(reason);
       expect(failure.cause).toMatchObject({ code: "EIO" });
       expect(failure.userCategory).toBeUndefined();
       expect(failure.snapshot).toMatchObject({

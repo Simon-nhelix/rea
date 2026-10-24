@@ -1,3 +1,14 @@
+import { literalFeatureMatchSchema } from "../domain/native/literalFeatureMatch.js";
+import { byteEntropySchema } from "../domain/native/byteEntropy.js";
+import { byteEntropySummaryViewResultSchema } from "../domain/analysisView/analysisView.js";
+import { nativeFunctionMatchingSchema } from "../domain/native/functionMatching.js";
+import { nativeFunctionMatchingSummaryViewResultSchema } from "../domain/analysisView/analysisView.js";
+import { nativeByteReadSchema } from "../domain/native/nativeByteRead.js";
+import { analysisDetailOutputSchemaOf } from "./analysisDetail.js";
+import { nativeFunctionSummaryViewResultSchema } from "../domain/analysisView/analysisView.js";
+import { functionDossierSchema } from "../domain/hopperValues.js";
+import { nativeInventorySummaryViewResultSchema } from "../domain/analysisView/analysisView.js";
+import { nativeInventoryRowsSchemas } from "../domain/native/nativeInventory.js";
 import { z } from "zod";
 import { byteSearchResultSchema } from "../domain/native/bytePattern.js";
 import {
@@ -28,6 +39,7 @@ import { nativeFunctionAnnotationsSchema } from "../domain/native/nativeFunction
 import { nativeLoadImageSchema } from "../domain/native/nativeLoadImage.js";
 import { nativeUiResultSchema } from "../domain/native/nativeUiObservation.js";
 import { nativeValueTraceSchema } from "../domain/native/nativeValueTrace.js";
+import { bundleResourceRootSchema } from "../domain/apple/bundleResourceRoot.js";
 import { nativeDataTypeSchema } from "../domain/native/nativeDataType.js";
 import { nativeCallObservationResultSchema } from "../domain/native/nativeCallObservation.js";
 import {
@@ -44,8 +56,8 @@ import {
   functionInstructionWindowSchema,
   referenceEdgeSchema,
   unresolvedCallSchema,
-  analysisStringSchema,
   procedureIdentitySchema,
+  containingProcedureResolutionSchema,
 } from "../domain/hopperValues.js";
 import { nativeApiInspectionResultSchema } from "../domain/native/nativeApiBoundary.js";
 import {
@@ -77,20 +89,20 @@ import { changedBehaviorResultSchema } from "../domain/changedBehavior.js";
 import { callPathResultSchema } from "../domain/callPathSchemas.js";
 import { staticRuntimeCorrelationResultSchema } from "../domain/staticRuntimeCorrelation.js";
 import { reconstructionVerificationResultSchema } from "../domain/reconstructionVerificationSchemas.js";
+import { decompileDirectoryManifestSchema } from "./decompileDirectory.js";
 import { analysisErrorProjectionSchema } from "./errorSchemas.js";
 import { relationshipCoverageSchema } from "../domain/relationshipCoverage.js";
 import { nativeDispatchMetadataResultSchema } from "../domain/native/objcSwiftMetadata.js";
 import { nativeInvestigationTraceSchema } from "../domain/native/nativeInvestigationGraph.js";
 import {
   addressList,
-  addressedValue,
   addressedEntry,
-  containingProcedureResolution,
   functionDossierOutput,
   graphNode,
   lifecycleResultOf,
   nullableText,
   procedureInfoOutput,
+  objcClassDiscoveryOutput,
   evidenceResultOf,
   segmentOutput,
   sessionProvider,
@@ -138,10 +150,25 @@ export const officialOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   inline_comment: evidenceResultOf(nullableText),
   list_bookmarks: evidenceResultOf(z.array(analysisBookmarkSchema)),
   list_documents: evidenceResultOf(z.array(z.string())),
-  list_names: evidenceResultOf(z.array(addressedValue)),
-  list_procedures: evidenceResultOf(z.array(addressedValue)),
+  list_names: analysisDetailOutputSchemaOf(
+    nativeInventoryRowsSchemas.names,
+    nativeInventorySummaryViewResultSchema.extend({
+      parent_operation: z.literal("list_names"),
+    }),
+  ),
+  list_procedures: analysisDetailOutputSchemaOf(
+    nativeInventoryRowsSchemas.names,
+    nativeInventorySummaryViewResultSchema.extend({
+      parent_operation: z.literal("list_procedures"),
+    }),
+  ),
   list_segments: segmentOutput,
-  list_strings: evidenceResultOf(z.array(analysisStringSchema)),
+  list_strings: analysisDetailOutputSchemaOf(
+    nativeInventoryRowsSchemas.strings,
+    nativeInventorySummaryViewResultSchema.extend({
+      parent_operation: z.literal("list_strings"),
+    }),
+  ),
   next_address: evidenceResultOf(z.string()),
   prev_address: evidenceResultOf(z.string()),
   procedure_address: evidenceResultOf(z.string()),
@@ -150,21 +177,12 @@ export const officialOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   procedure_callers: evidenceResultOf(addressList),
   procedure_info: procedureInfoOutput,
   read_function_instructions: evidenceResultOf(functionInstructionWindowSchema),
-  read_bytes: evidenceResultOf(
-    z.object({
-      address: z.string(),
-      requested_bytes: z.number().int().min(1),
-      returned_bytes: z.number().int().min(0),
-      bytes_hex: z.string().regex(/^(?:[a-f0-9]{2})*$/u),
-      complete: z.boolean(),
-    }),
-  ),
+  read_bytes: evidenceResultOf(nativeByteReadSchema),
   address_to_file_offset: evidenceResultOf(
     z.object({
       address: z.string(),
-      file_offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+      file_offset: z.int().min(0).max(Number.MAX_SAFE_INTEGER),
       provider_file_offset: z
-        .number()
         .int()
         .min(0)
         .max(Number.MAX_SAFE_INTEGER)
@@ -173,7 +191,6 @@ export const officialOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
           "Original coordinate returned by the provider's mapping API.",
         ),
       image_base_file_offset: z
-        .number()
         .int()
         .min(0)
         .max(Number.MAX_SAFE_INTEGER)
@@ -199,11 +216,22 @@ export const officialOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
     }),
   ),
   procedure_pseudo_code: evidenceResultOf(nullableText),
-  resolve_containing_procedure: evidenceResultOf(containingProcedureResolution),
-  search_procedures: evidenceResultOf(
-    z.array(z.object({ address: z.string(), value: z.string() })),
+  resolve_containing_procedure: evidenceResultOf(
+    containingProcedureResolutionSchema,
   ),
-  search_strings: evidenceResultOf(z.array(analysisStringSchema)),
+  search_procedures: analysisDetailOutputSchemaOf(
+    z.array(z.object({ address: z.string(), value: z.string() })),
+    nativeInventorySummaryViewResultSchema.extend({
+      parent_operation: z.literal("search_procedures"),
+    }),
+  ),
+
+  search_strings: analysisDetailOutputSchemaOf(
+    nativeInventoryRowsSchemas.strings,
+    nativeInventorySummaryViewResultSchema.extend({
+      parent_operation: z.literal("search_strings"),
+    }),
+  ),
   set_address_name: evidenceResultOf(z.boolean()),
   set_addresses_names: evidenceResultOf(z.record(z.string(), z.boolean())),
   set_bookmark: evidenceResultOf(z.boolean()),
@@ -217,18 +245,12 @@ const literalTraceOutput = evidenceResultOf(
   z.object({
     query: z.string(),
     search_mode: z.literal("literal"),
-    matches: z.array(
-      z.object({
-        type: z.enum(["string", "procedure"]),
-        address: z.string(),
-        value: z.string(),
-      }),
-    ),
+    matches: z.array(literalFeatureMatchSchema),
     references: z.array(
       z.object({
         target_address: z.string(),
         source_address: z.string(),
-        containing_procedure: containingProcedureResolution,
+        containing_procedure: containingProcedureResolutionSchema,
       }),
     ),
     truncated: z.boolean(),
@@ -245,14 +267,14 @@ const callPathTraceOutput = evidenceResultOf(
     nodes: z.array(
       z.object({
         address: z.string(),
-        depth: z.number().int().min(0),
+        depth: z.int().min(0),
       }),
     ),
     edges: z.array(
       z.object({
         source_address: z.string(),
         target_address: z.string(),
-        discovery_depth: z.number().int().min(1),
+        discovery_depth: z.int().min(1),
       }),
     ),
     traversal_path: z.array(z.string()),
@@ -264,7 +286,7 @@ const callPathTraceOutput = evidenceResultOf(
     ),
     relationship_coverage: z.record(z.string(), relationshipCoverageSchema),
     traversal: z.object({
-      nodes_visited: z.number().int().min(1),
+      nodes_visited: z.int().min(1),
     }),
     truncated: z.boolean(),
     residual_unknowns: z.array(z.string()),
@@ -296,8 +318,9 @@ export const enhancedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   ),
   trace_native_values: evidenceResultOf(nativeValueTraceSchema),
   trace_native_ui_action: evidenceResultOf(nativeInvestigationTraceSchema),
-  get_objc_classes: symbolDiscoveryOutput("classes"),
+  get_objc_classes: objcClassDiscoveryOutput,
   get_objc_protocols: symbolDiscoveryOutput("protocols"),
+  decompile_all: evidenceResultOf(decompileDirectoryManifestSchema),
   batch_decompile: evidenceResultOf(
     z.object({
       items: z.array(
@@ -320,9 +343,9 @@ export const enhancedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
           }),
         ]),
       ),
-      total: z.number().int().min(0),
-      succeeded: z.number().int().min(0),
-      failed: z.number().int().min(0),
+      total: z.int().min(0),
+      succeeded: z.int().min(0),
+      failed: z.int().min(0),
     }),
   ),
   get_call_graph: evidenceResultOf(
@@ -333,11 +356,11 @@ export const enhancedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   ),
   analyze_swift_types: evidenceResultOf(
     z.object({
-      total: z.number().int().min(0),
+      total: z.int().min(0),
       categories: z.record(
         z.string(),
         z.object({
-          count: z.number().int().min(0),
+          count: z.int().min(0),
           items: z.array(
             addressedEntry.extend({
               mangled_names: z.array(z.string()),
@@ -386,12 +409,15 @@ export const enhancedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
           }),
         )
         .optional(),
-      segment_count: z.number().int().min(0).optional(),
-      procedure_count: z.number().int().min(0),
-      string_count: z.number().int().min(0),
+      segment_count: z.int().min(0).optional(),
+      procedure_count: z.int().min(0),
+      string_count: z.int().min(0),
     }),
   ),
-  analyze_function: functionDossierOutput,
+  analyze_function: analysisDetailOutputSchemaOf(
+    functionDossierSchema,
+    nativeFunctionSummaryViewResultSchema,
+  ),
   inspect_native_api: evidenceResultOf(nativeApiInspectionResultSchema),
   trace_feature: literalTraceOutput,
   trace_call_path: callPathTraceOutput,
@@ -401,8 +427,15 @@ export const enhancedOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
   find_code_caves: evidenceResultOf(findCodeCavesResultSchema),
 };
 
+/** Complete entropy Evidence or its retained summary, shared by the named contract. */
+export const byteEntropyOutputSchema = analysisDetailOutputSchemaOf(
+  byteEntropySchema,
+  byteEntropySummaryViewResultSchema,
+);
+
 /** Exact Evidence schemas for provider-neutral native inspection. */
 export const nativeOutputSchemas: Readonly<Record<string, z.ZodObject>> = {
+  inspect_byte_entropy: byteEntropyOutputSchema,
   observe_native_ui: evidenceResultOf(nativeUiResultSchema),
   capture_native_ui_scenario: evidenceResultOf(nativeUiResultSchema),
   observe_native_calls: evidenceResultOf(nativeCallObservationResultSchema),
@@ -525,24 +558,22 @@ const lifecycleTargetSchema = z.discriminatedUnion(
 /** Exact structured-content schemas for target lifecycle operations. */
 export const sessionOutputSchemas = {
   open_binary: lifecycleResultOf(lifecycleTargetSchema),
+  open_bundle_resources: lifecycleResultOf(bundleResourceRootSchema),
   close_binary: lifecycleResultOf(
     z.union([
       z.null(),
       z.object({
         path: z.string(),
-        bytes: z.number().int().min(0),
+        bytes: z.int().min(0),
         primitive_entries: z
-          .number()
           .int()
           .min(0)
           .describe("Retained eligible primitive query bindings."),
         workflow_entries: z
-          .number()
           .int()
           .min(0)
           .describe("Retained eligible composed workflow bindings."),
         evidence_records: z
-          .number()
           .int()
           .min(0)
           .describe(
@@ -554,6 +585,11 @@ export const sessionOutputSchemas = {
   binary_session: lifecycleResultOf(
     z.union([
       sessionProvider.extend({ open: z.literal(false) }),
+      sessionProvider.extend({
+        open: z.literal(true),
+        session_kind: z.literal("bundle_resources"),
+        resource_root: bundleResourceRootSchema,
+      }),
       ...lifecycleTargetSchemas.map((target) =>
         sessionProvider.extend({ open: z.literal(true), ...target.shape }),
       ),
@@ -562,9 +598,9 @@ export const sessionOutputSchemas = {
   export_evidence_bundle: lifecycleResultOf(
     z.object({
       path: z.string(),
-      bytes: z.number().int().min(0),
-      records: z.number().int().min(0),
-      unknowns: z.number().int().min(0),
+      bytes: z.int().min(0),
+      records: z.int().min(0),
+      unknowns: z.int().min(0),
     }),
   ),
   get_evidence_bundle: lifecycleResultOf(
@@ -590,15 +626,21 @@ export const sessionOutputSchemas = {
   ),
   import_evidence_bundle: lifecycleResultOf(
     z.object({
-      imported: z.number().int().min(0),
-      unknowns_added: z.number().int().min(0),
-      total: z.number().int().min(0),
+      imported: z.int().min(0),
+      unknowns_added: z.int().min(0),
+      total: z.int().min(0),
     }),
   ),
   capture_process_scenario: evidenceResultOf(processCaptureSchema),
   compare_process_captures: evidenceResultOf(processCaptureComparisonSchema),
   compare_artifacts: evidenceResultOf(artifactComparisonResultSchema),
   compare_functions: evidenceResultOf(functionComparisonResultSchema),
+  match_native_functions: evidenceResultOf(
+    z.union([
+      nativeFunctionMatchingSchema,
+      nativeFunctionMatchingSummaryViewResultSchema,
+    ]),
+  ),
   compare_bundles: evidenceResultOf(bundleComparisonResultSchema),
   find_changed_behavior: evidenceResultOf(changedBehaviorResultSchema),
   build_call_path: evidenceResultOf(callPathResultSchema),
@@ -611,9 +653,9 @@ export const sessionOutputSchemas = {
   list_unknowns: lifecycleResultOf(
     z.object({
       items: z.array(residualUnknownSchema),
-      total: z.number().int().min(0),
-      offset: z.number().int().min(0),
-      next_offset: z.number().int().min(0).nullable(),
+      total: z.int().min(0),
+      offset: z.int().min(0),
+      next_offset: z.int().min(0).nullable(),
     }),
   ),
   record_unknown: lifecycleResultOf(residualUnknownSchema),

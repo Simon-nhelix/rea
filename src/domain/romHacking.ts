@@ -5,7 +5,6 @@ import {
   matchRomControlCodeAt,
   romControlCodeFields,
   type RomControlCodeTable,
-  type RomControlCodeUse,
   type RomTextWithControlCodes,
   romControlCodeUseSchema,
   withTerminatorAsEndCode,
@@ -17,7 +16,6 @@ import {
   inferOverlayLoadAddress,
   orphanStringEntrySchema,
   type InferredBaseCandidate,
-  type OrphanStringEntry,
 } from "./romLoadAddressInference.js";
 import {
   getSjisDoubleByteDecodeTable,
@@ -319,8 +317,6 @@ export const normalizeRomTextEncoding = (
       return encoding;
   }
 };
-
-export const romTextEncodingSchema = z.enum(ROM_TEXT_ENCODINGS);
 
 /** Packed .tbl byte-sequence key: number for up to 6 bytes, bigint beyond. */
 export type TblByteKey = number | bigint;
@@ -767,12 +763,7 @@ export const decodeRomStringWithControlCodes = (
 };
 
 /** Re-export so result builders need one import for a code occurrence. */
-export type {
-  RomControlCodeUse,
-  RomTextWithControlCodes,
-  InferredBaseCandidate,
-  OrphanStringEntry,
-};
+export type { RomTextWithControlCodes, InferredBaseCandidate };
 export {
   inferOverlayLoadAddress,
   findOrphanStringsInPointerGaps,

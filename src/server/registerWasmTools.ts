@@ -7,14 +7,17 @@ import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 import type { WasmArtifactService } from "../application/wasm/WasmArtifactService.js";
 import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
 import type { EvidenceLookup } from "../application/EvidenceInputResolver.js";
-import { summarizeRetainedAnalysis } from "../application/analysisView/AnalysisViewService.js";
+import { retainedSummaryDelivery } from "./retainedSummaryDelivery.js";
 import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 import { err } from "../domain/result.js";
 import { wasmArtifactModule } from "../composition/wasm.js";
 import type { Logger } from "pino";
 import { createEvidenceToolHandler } from "./contractToolHandler.js";
 import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
-import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
+import {
+  applicationToolRegistrationOptions,
+  toolRegistrationOptions,
+} from "./toolRegistrationOptions.js";
 
 /** Bind the named WASM contract to shared validation and session Evidence recording. */
 export const registerWasmTools = (
@@ -58,6 +61,10 @@ export const registerWasmTools = (
     compareHandler(comparison),
   );
   const contract = wasmArtifactModule.contract;
+  const delivery = retainedSummaryDelivery(new Set([contract.name]), {
+    recordEvidence,
+    evidenceById,
+  });
   const handler = createEvidenceToolHandler(
     server,
     async (rawInput, options) => {
@@ -72,12 +79,12 @@ export const registerWasmTools = (
           ),
         );
       const { detail, ...input } = parsed.data;
+      const parameters = { detail };
+      const ready = delivery.preflight(contract.name, parameters);
+      if (!ready.ok) return ready;
       const inspected = await service.inspect(input, options);
-      return detail === "summary" && inspected.ok
-        ? summarizeRetainedAnalysis(inspected.value, {
-            recordEvidence,
-            evidenceById,
-          })
+      return inspected.ok
+        ? delivery.projectEvidence(contract.name, parameters, inspected.value)
         : inspected;
     },
     logger,
@@ -86,7 +93,7 @@ export const registerWasmTools = (
   );
   server.registerTool(
     contract.name,
-    toolRegistrationOptions(contract),
+    applicationToolRegistrationOptions(contract),
     handler(contract),
   );
 };

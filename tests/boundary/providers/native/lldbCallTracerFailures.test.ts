@@ -1,5 +1,6 @@
 import {
   access,
+  mkdtemp,
   readFile,
   rm,
   writeFile,
@@ -8,11 +9,17 @@ import {
   type FileHandle,
 } from "node:fs/promises";
 import { dirname } from "node:path";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { z } from "zod";
 
-import { AnalysisCancelledError } from "../../../../src/domain/analysisErrorCore.js";
+import {
+  AnalysisCancelledError,
+  AnalysisCapabilityUnavailableError,
+  AnalysisTimeoutError,
+} from "../../../../src/domain/analysisErrorCore.js";
 import { EvidenceIntegrityError } from "../../../../src/domain/evidenceErrors.js";
 import { ArtifactFileCleanupFailure } from "../../../../src/artifacts/ArtifactFileOperation.js";
 import { resolvedAnalysisError } from "../../../../src/domain/analysisErrorBase.js";
@@ -26,6 +33,12 @@ import { NativeCommandFailure } from "../../../../src/native/CommandRunner.js";
 import { NativeMacOSProvider } from "../../../../src/native/NativeMacOSProvider.js";
 import { createDeferred } from "../../../fixtures/binarySession.js";
 import { PrivateRuntimeRoot } from "../../../../src/process/PrivateRuntimeRoot.js";
+import {
+  ProviderProcessSupervisor,
+  type ProviderProcessStopOptions,
+  type ProviderProcessStopResult,
+} from "../../../../src/process/ProviderProcess.js";
+import { ProviderStartupDeadline } from "../../../../src/process/ProviderDeadline.js";
 import {
   NativeFixtureRunner,
   nativeMachoTarget,
@@ -420,7 +433,499 @@ describe("LLDB failure retention through the production tracer", () => {
   });
 });
 
+describe("LLDB primary outcome during owned process cleanup", () => {
+  it
+    .skipIf(process.platform === "win32")
+    .each(["caller cancellation", "deadline timeout"] as const)(
+    "preserves a physical bridge failure and no-target proof when %s arrives during successful process cleanup",
+    async (interruption) => {
+      const fixtureRoot = await mkdtemp(
+        join(tmpdir(), "rea-lldb-primary-outcome-"),
+      );
+      const fakeLldb = join(fixtureRoot, "fake-lldb");
+      await writeFile(
+        fakeLldb,
+        `#!${process.execPath}\nconst fs = require("node:fs");\nconst command = process.argv.at(-1);\nif (!command?.startsWith("rea_trace ")) process.exit(91);\nconst config = JSON.parse(fs.readFileSync(command.slice("rea_trace ".length), "utf8"));\nfs.writeFileSync(config.result_path, JSON.stringify({ status: "target-error", error: "fixture physical bridge failure", target_process_created: false }));\nprocess.exit(17);\n`,
+        { mode: 0o700 },
+      );
+
+      const controller = new AbortController();
+      const stopEntered = createDeferred<void>();
+      const stopReleased = createDeferred<void>();
+      let stopping = false;
+      const deadlineSpy =
+        interruption === "deadline timeout"
+          ? vi
+              .spyOn(ProviderStartupDeadline.prototype, "interruption", "get")
+              .mockImplementation(() => (stopping ? "timeout" : undefined))
+          : undefined;
+      let observedExit:
+        | ReturnType<ProviderProcessSupervisor["observedExit"]>
+        | undefined;
+      let observedStop: ProviderProcessStopResult | undefined;
+      const originalStop = ProviderProcessSupervisor.prototype.stop;
+      const stopSpy = vi
+        .spyOn(ProviderProcessSupervisor.prototype, "stop")
+        .mockImplementation(async function (
+          this: ProviderProcessSupervisor,
+          options?: ProviderProcessStopOptions,
+        ): Promise<ProviderProcessStopResult> {
+          observedExit = this.observedExit();
+          stopping = true;
+          stopEntered.resolve(undefined);
+          await stopReleased.promise;
+          observedStop = await originalStop.call(this, options);
+          return observedStop;
+        });
+      const tracer = new LldbCallTracer({}, undefined, async () =>
+        ok({ path: fakeLldb, sha256: "c".repeat(64) }),
+      );
+
+      try {
+        const pending = tracer.trace(
+          request,
+          interruption === "caller cancellation"
+            ? controller.signal
+            : undefined,
+        );
+        await stopEntered.promise;
+        expect(observedExit).toEqual({ code: 17, signal: null });
+        if (interruption === "caller cancellation")
+          controller.abort(new Error("abort during final cleanup"));
+        stopReleased.resolve(undefined);
+        const result = await pending;
+
+        expect(observedStop?.status).toMatch(
+          /^(already-exited|verified-cleanup|terminated|killed)$/u,
+        );
+        expect(result.ok).toBe(false);
+        if (result.ok) throw new Error("Expected the bridge target error");
+        expect(result.error).toBeInstanceOf(AnalysisCapabilityUnavailableError);
+        if (!(result.error instanceof AnalysisCapabilityUnavailableError))
+          return;
+        expect(result.error.reason).toBe(
+          "lldb-target-unloadable: fixture physical bridge failure",
+        );
+        expect(result.error.cleanup).toBeUndefined();
+        expect(result.error.cleanupIncomplete).toBe(false);
+        expect(result.error.cleanupResources).toEqual([]);
+        expect(result.error.partialObservation).toMatchObject({
+          coverage: { status: "partial", reason: "tracer-failure" },
+          process: { pid: null },
+        });
+      } finally {
+        stopReleased.resolve(undefined);
+        stopSpy.mockRestore();
+        deadlineSpy?.mockRestore();
+        await tracer.close();
+        await rm(fixtureRoot, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+describe("LLDB process exit while output is still open", () => {
+  it.skipIf(process.platform === "win32")(
+    "keeps a nonzero leader exit observed before cancellation while inherited output is still open",
+    async () => {
+      const fixtureRoot = await mkdtemp(
+        join(tmpdir(), "rea-lldb-exit-before-cancel-"),
+      );
+      const fakeLldb = join(fixtureRoot, "fake-lldb");
+      await writeFile(
+        fakeLldb,
+        `#!${process.execPath}\nconst fs = require("node:fs");\nconst { spawn } = require("node:child_process");\nconst command = process.argv.at(-1);\nif (!command?.startsWith("rea_trace ")) process.exit(91);\nconst config = JSON.parse(fs.readFileSync(command.slice("rea_trace ".length), "utf8"));\nconst child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: ["ignore", "inherit", "inherit"] });\nchild.once("error", () => process.exit(92));\nchild.once("spawn", () => { fs.writeFileSync(config.result_path, JSON.stringify({ status: "target-error", error: "fixture leader failure before drain", target_process_created: false })); process.exit(17); });\n`,
+        { mode: 0o700 },
+      );
+
+      const controller = new AbortController();
+      const drainObserved = createDeferred<void>();
+      const drainReleased = createDeferred<void>();
+      const originalWait =
+        ProviderProcessSupervisor.prototype.waitForOutputClose;
+      const drainSpy = vi
+        .spyOn(ProviderProcessSupervisor.prototype, "waitForOutputClose")
+        .mockImplementation(async function (
+          this: ProviderProcessSupervisor,
+          timeoutMs?: number,
+          signal?: AbortSignal,
+        ): Promise<boolean> {
+          const closed = await originalWait.call(this, timeoutMs, signal);
+          if (!closed && !stopping && this.observedExit()?.code === 17) {
+            drainObserved.resolve(undefined);
+            await drainReleased.promise;
+          }
+          return closed;
+        });
+      let stopping = false;
+      let stopReceipt: ProviderProcessStopResult | undefined;
+      const originalStop = ProviderProcessSupervisor.prototype.stop;
+      const stopSpy = vi
+        .spyOn(ProviderProcessSupervisor.prototype, "stop")
+        .mockImplementation(async function (
+          this: ProviderProcessSupervisor,
+          options?: ProviderProcessStopOptions,
+        ): Promise<ProviderProcessStopResult> {
+          stopping = true;
+          stopReceipt = await originalStop.call(this, options);
+          return stopReceipt;
+        });
+      const tracer = new LldbCallTracer({}, undefined, async () =>
+        ok({ path: fakeLldb, sha256: "d".repeat(64) }),
+      );
+
+      try {
+        const pending = tracer.trace(request, controller.signal);
+        await drainObserved.promise;
+        controller.abort(new Error("abort after leader exit"));
+        drainReleased.resolve(undefined);
+        const result = await pending;
+
+        expect(stopReceipt?.status).toMatch(
+          /^(already-exited|verified-cleanup|terminated|killed)$/u,
+        );
+        expect(result.ok).toBe(false);
+        if (result.ok) throw new Error("Expected the bridge target error");
+        expect(result.error).toBeInstanceOf(AnalysisCapabilityUnavailableError);
+        if (!(result.error instanceof AnalysisCapabilityUnavailableError))
+          return;
+        expect(result.error.reason).toBe(
+          "lldb-target-unloadable: fixture leader failure before drain",
+        );
+        expect(result.error.cleanupIncomplete).toBe(false);
+        expect(result.error.cleanupResources).toEqual([]);
+      } finally {
+        drainReleased.resolve(undefined);
+        drainSpy.mockRestore();
+        stopSpy.mockRestore();
+        await tracer.close();
+        await rm(fixtureRoot, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+const completedOutputCloseFixture = async () => {
+  const fixtureRoot = await mkdtemp(
+    join(tmpdir(), "rea-lldb-complete-output-"),
+  );
+  const fakeLldb = join(fixtureRoot, "fake-lldb");
+  const completedPidPath = join(fixtureRoot, "completed-target.pid");
+  const completed = {
+    ...successfulTracerOutput,
+    target_output: {
+      ...successfulTracerOutput.target_output,
+      stdout_bytes: 2,
+    },
+  };
+  await writeFile(
+    fakeLldb,
+    `#!${process.execPath}
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const command = process.argv.at(-1);
+if (!command?.startsWith("rea_trace ")) process.exit(91);
+const config = JSON.parse(fs.readFileSync(command.slice("rea_trace ".length), "utf8"));
+const child = spawnSync(process.execPath, ["-e", ""]);
+const result = ${JSON.stringify(completed)};
+result.pid = child.pid;
+fs.writeFileSync(${JSON.stringify(completedPidPath)}, String(child.pid));
+fs.writeFileSync(config.pid_path, String(child.pid));
+fs.writeFileSync(config.stdout_capture_path, "ok");
+fs.writeFileSync(config.stderr_capture_path, "");
+fs.writeFileSync(config.observation_path, JSON.stringify({ kind: "event", event: result.events[0] }) + "\\n");
+fs.writeFileSync(config.result_path, JSON.stringify(result));
+process.exit(0);
+`,
+    { mode: 0o700 },
+  );
+  return {
+    fixtureRoot,
+    fakeLldb,
+    readCompleted: async () => ({
+      ...completed,
+      pid: z.coerce
+        .number()
+        .int()
+        .positive()
+        .parse(await readFile(completedPidPath, "utf8")),
+    }),
+  };
+};
+
+describe("LLDB process exit at output-close loop completion", () => {
+  for (const abort of [false, true])
+    it.skipIf(process.platform === "win32")(
+      `retains completed trace facts after output closure (cancelled=${String(abort)})`,
+      async () => {
+        const fixture = await completedOutputCloseFixture();
+        const controller = new AbortController();
+        const reason = { requested: "stop after completed output closure" };
+        let interrupted = false;
+        const originalWait =
+          ProviderProcessSupervisor.prototype.waitForOutputClose;
+        const waitSpy = vi
+          .spyOn(ProviderProcessSupervisor.prototype, "waitForOutputClose")
+          .mockImplementation(async function (
+            this: ProviderProcessSupervisor,
+            timeoutMs?: number,
+            signal?: AbortSignal,
+          ): Promise<boolean> {
+            const closed = await originalWait.call(this, timeoutMs, signal);
+            if (
+              abort &&
+              !interrupted &&
+              closed &&
+              this.observedExit()?.code === 0
+            ) {
+              interrupted = true;
+              controller.abort(reason);
+            }
+            return closed;
+          });
+        const tracer = new LldbCallTracer({}, undefined, async () =>
+          ok({ path: fixture.fakeLldb, sha256: "e".repeat(64) }),
+        );
+        try {
+          const result = await tracer.trace(request, controller.signal);
+          const completed = await fixture.readCompleted();
+          expect(interrupted).toBe(abort);
+          if (result.ok) {
+            expect(abort).toBe(false);
+            expect(result.value.run).toMatchObject(completed);
+            expect(result.value.stdout).toMatchObject({
+              text: "ok",
+              bytes: 2,
+              complete: true,
+            });
+          } else {
+            expect(abort).toBe(true);
+            expect(result.error).toBeInstanceOf(AnalysisCancelledError);
+            expect(result.error.cause).toBe(reason);
+            expect(result.error.cleanupIncomplete).toBe(false);
+            expect(
+              nativeCallPartialObservationSchema.parse(
+                result.error.partialObservation,
+              ),
+            ).toMatchObject({
+              coverage: { status: "partial", reason: "cancelled" },
+              debugger: { version: completed.version },
+              process: {
+                pid: completed.pid,
+                outcome: "exited",
+                exit_status: 0,
+                terminated: true,
+                elapsed_ms: 1,
+                stdout: { text: "ok", bytes: 2, complete: true },
+              },
+              target: { launch_identity: completed.target_identity },
+              breakpoints: [{ index: 0, location_count: 1 }],
+              events: [EVENT],
+            });
+          }
+        } finally {
+          waitSpy.mockRestore();
+          expect((await tracer.close()).ok).toBe(true);
+          await rm(fixture.fixtureRoot, { recursive: true, force: true });
+        }
+      },
+    );
+
+  it.skipIf(process.platform === "win32")(
+    "keeps a nonzero exit when output closure and cancellation meet at loop exit",
+    async () => {
+      const fixtureRoot = await mkdtemp(
+        join(tmpdir(), "rea-lldb-closed-output-cancel-"),
+      );
+      const fakeLldb = join(fixtureRoot, "fake-lldb");
+      await writeFile(
+        fakeLldb,
+        `#!${process.execPath}\nconst fs = require("node:fs");\nconst command = process.argv.at(-1);\nif (!command?.startsWith("rea_trace ")) process.exit(91);\nconst config = JSON.parse(fs.readFileSync(command.slice("rea_trace ".length), "utf8"));\nfs.writeFileSync(config.result_path, JSON.stringify({ status: "target-error", error: "fixture exit before closed-output cancellation", target_process_created: false }));\nprocess.exit(17);\n`,
+        { mode: 0o700 },
+      );
+
+      const controller = new AbortController();
+      let interruptionApplied = false;
+      let stopReceipt: ProviderProcessStopResult | undefined;
+      const originalWait =
+        ProviderProcessSupervisor.prototype.waitForOutputClose;
+      const waitSpy = vi
+        .spyOn(ProviderProcessSupervisor.prototype, "waitForOutputClose")
+        .mockImplementation(async function (
+          this: ProviderProcessSupervisor,
+          timeoutMs?: number,
+          signal?: AbortSignal,
+        ): Promise<boolean> {
+          const closed = await originalWait.call(this, timeoutMs, signal);
+          if (
+            !interruptionApplied &&
+            closed &&
+            this.observedExit()?.code === 17
+          ) {
+            interruptionApplied = true;
+            controller.abort(new Error("abort at output-close loop exit"));
+          }
+          return closed;
+        });
+      const originalStop = ProviderProcessSupervisor.prototype.stop;
+      const stopSpy = vi
+        .spyOn(ProviderProcessSupervisor.prototype, "stop")
+        .mockImplementation(async function (
+          this: ProviderProcessSupervisor,
+          options?: ProviderProcessStopOptions,
+        ): Promise<ProviderProcessStopResult> {
+          stopReceipt = await originalStop.call(this, options);
+          return stopReceipt;
+        });
+      const tracer = new LldbCallTracer({}, undefined, async () =>
+        ok({ path: fakeLldb, sha256: "f".repeat(64) }),
+      );
+
+      try {
+        const result = await tracer.trace(request, controller.signal);
+
+        expect(interruptionApplied).toBe(true);
+        expect(stopReceipt?.status).toMatch(
+          /^(already-exited|verified-cleanup|terminated|killed)$/u,
+        );
+        expect(result.ok).toBe(false);
+        if (result.ok) throw new Error("Expected the bridge target error");
+        expect(result.error).toBeInstanceOf(AnalysisCapabilityUnavailableError);
+        if (!(result.error instanceof AnalysisCapabilityUnavailableError))
+          return;
+        expect(result.error.reason).toBe(
+          "lldb-target-unloadable: fixture exit before closed-output cancellation",
+        );
+        expect(result.error.cleanupIncomplete).toBe(false);
+        expect(result.error.cleanupResources).toEqual([]);
+      } finally {
+        waitSpy.mockRestore();
+        stopSpy.mockRestore();
+        await tracer.close();
+        await rm(fixtureRoot, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+describe("LLDB late timeout publication", () => {
+  it("converts a late deadline to timeout at successful-result publication", async () => {
+    let runtime: string | undefined;
+    const tracer = new LldbCallTracer(
+      {},
+      async (_executable, arguments_) => {
+        const { config } = await configFromArguments(arguments_);
+        runtime = dirname(config.result_path);
+        await writeFile(
+          config.observation_path,
+          `${JSON.stringify({ kind: "event", event: EVENT })}\n`,
+        );
+        await writeFile(config.stdout_capture_path, "");
+        await writeFile(config.stderr_capture_path, "");
+        await writeFile(
+          config.result_path,
+          JSON.stringify(successfulTracerOutput),
+        );
+        return {
+          kind: "exited",
+          targetLaunched: false,
+          exitCode: 0,
+          output: "",
+          targetIdentity: undefined,
+          cleanupFailure: undefined,
+          lateTimeout: true,
+        };
+      },
+      async () => ok(fakeTool),
+    );
+
+    const result = await tracer.trace(request);
+    if (runtime === undefined) throw new Error("LLDB fixture did not run");
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("Expected the late deadline to be retained");
+    expect(result.error).toBeInstanceOf(AnalysisTimeoutError);
+    if (!(result.error instanceof AnalysisTimeoutError)) return;
+    expect(result.error.timeoutMs).toBeGreaterThan(request.input.duration_ms);
+    expect(result.error.cleanup).toBeUndefined();
+    expect(result.error.cleanupIncomplete).toBe(false);
+    expect(result.error.partialObservation).toMatchObject({
+      coverage: { status: "partial", reason: "timeout" },
+      process: {
+        outcome: "exited",
+        exit_status: 0,
+        terminated: true,
+      },
+      events: [EVENT],
+    });
+    await expect(access(runtime)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
 describe("LLDB pre-target phase proof", () => {
+  it("releases an invalid-process launch failure and permits the next complete observation", async () => {
+    let launches = 0;
+    const runtimes: string[] = [];
+    const tracer = new LldbCallTracer(
+      {},
+      async (_executable, arguments_) => {
+        const { config } = await configFromArguments(arguments_);
+        launches += 1;
+        runtimes.push(dirname(config.result_path));
+        await writeFile(config.observation_path, "");
+        await writeFile(config.stdout_capture_path, "");
+        await writeFile(config.stderr_capture_path, "");
+        await writeFile(
+          config.result_path,
+          JSON.stringify(
+            launches === 1
+              ? {
+                  status: "launch-error",
+                  error: "No such file or directory: fixture/absent",
+                  target_process_created: false,
+                }
+              : successfulTracerOutput,
+          ),
+        );
+        return {
+          kind: "exited",
+          exitCode: launches === 1 ? 1 : 0,
+          output: "",
+          targetLaunched: launches === 1,
+          targetIdentity: undefined,
+          cleanupFailure: undefined,
+        };
+      },
+      async () => ok(fakeTool),
+    );
+    try {
+      const rejected = await tracer.trace(request);
+      expect(rejected.ok).toBe(false);
+      if (rejected.ok) throw new Error("Expected launch refusal");
+      expect(projectAnalysisError(rejected.error)).toMatchObject({
+        code: "capability_unavailable",
+        details: {
+          reason: "launch-failed: No such file or directory: fixture/absent",
+        },
+      });
+      expect(rejected.error.cleanupIncomplete).toBe(false);
+      expect(rejected.error.cleanupResources).toEqual([]);
+      await expect(access(runtimes[0]!)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      const completed = await tracer.trace(request);
+      expect(completed.ok).toBe(true);
+      if (!completed.ok) throw completed.error;
+      expect(completed.value.run).toMatchObject(successfulTracerOutput);
+      expect(launches).toBe(2);
+      await expect(access(runtimes[1]!)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      expect((await tracer.close()).ok).toBe(true);
+    } finally {
+      await tracer.close();
+    }
+  });
+
   it("releases a proven pre-target integrity rejection and allows tracer reuse", async () => {
     let launches = 0;
     let firstRuntime: string | undefined;

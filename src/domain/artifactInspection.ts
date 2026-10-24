@@ -1,3 +1,10 @@
+import { readEvidencePayload } from "./evidenceValidation.js";
+import type { EvidenceIntegrityError } from "./evidenceErrors.js";
+import { ok, type Result } from "./result.js";
+import {
+  canBorrowParsedJsonSnapshot,
+  immutableJsonSnapshotMember,
+} from "./immutableJson.js";
 import {
   artifactIntegrityPairOf,
   artifactSha256PairSchema,
@@ -97,15 +104,15 @@ export const artifactInspectionResultSchema = z.strictObject({
   next_probes: z.array(nextProbeSchema),
   coverage: z.strictObject({
     status: z.enum(["complete-within-substeps", "partial", "truncated"]),
-    substeps_completed: z.number().int().min(1),
-    observations_retained: z.number().int().min(0),
-    observations_omitted: z.number().int().min(0),
-    hypotheses_retained: z.number().int().min(0),
-    hypotheses_omitted: z.number().int().min(0),
-    unexplored_branches_retained: z.number().int().min(0),
-    unexplored_branches_omitted: z.number().int().min(0),
-    next_probes_retained: z.number().int().min(0),
-    next_probes_omitted: z.number().int().min(0),
+    substeps_completed: z.int().min(1),
+    observations_retained: z.int().min(0),
+    observations_omitted: z.int().min(0),
+    hypotheses_retained: z.int().min(0),
+    hypotheses_omitted: z.int().min(0),
+    unexplored_branches_retained: z.int().min(0),
+    unexplored_branches_omitted: z.int().min(0),
+    next_probes_retained: z.int().min(0),
+    next_probes_omitted: z.int().min(0),
   }),
   evidence_links: z.array(evidenceIdSchema).min(1),
   limitations: z.array(textSchema),
@@ -427,10 +434,32 @@ const branch = (
   };
 };
 
+// A completed substep establishes only the coverage its producer examined, so
+// unknown inventory traversal keeps the inspection partial, never complete.
 const inspectionCoverage = (
-  _inventory: ArtifactInventoryResult,
+  inventory: ArtifactInventoryResult,
   omissions: Readonly<Record<string, number>>,
 ): ArtifactInspectionResult["coverage"]["status"] => {
   if (Object.values(omissions).some((count) => count > 0)) return "truncated";
+  if (inventory.coverage.status !== "complete") return "partial";
   return "complete-within-substeps";
+};
+
+/** Own the atomic source closure published or retained with an inspection. */
+export const readArtifactInspectionSources = (
+  result: unknown,
+): Result<readonly Evidence[], EvidenceIntegrityError> => {
+  const parsed = readEvidencePayload(artifactInspectionResultSchema, result);
+  if (!parsed.ok) return parsed;
+  const inspection = canBorrowParsedJsonSnapshot(result, parsed.value)
+    ? result
+    : parsed.value;
+  const substeps = immutableJsonSnapshotMember(inspection, "substeps");
+  return ok(
+    inspection.substeps.map((step, index) => {
+      const ownedStep = immutableJsonSnapshotMember(substeps, String(index));
+      immutableJsonSnapshotMember(ownedStep, "evidence");
+      return step.evidence;
+    }),
+  );
 };

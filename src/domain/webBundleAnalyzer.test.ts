@@ -1,6 +1,10 @@
+import {
+  projectAnalysisView,
+  analysisViewRequestSchema,
+} from "./analysisView/analysisView.js";
 import { describe, expect, it } from "vitest";
+import { createWebPageInspection } from "../../tests/support/browser/webPageInspection.js";
 
-import { webPageInspectionSchema } from "./browserObservationSchemas.js";
 import { analyzeJavaScriptStaticSource } from "./javascript/javascriptStaticAnalysis.js";
 import {
   analyzeCapturedWebBundle,
@@ -8,7 +12,7 @@ import {
 } from "./webBundleAnalyzer.js";
 import { buildCapturedWebBundleAnalysis } from "./webBundleAnalyzerResult.js";
 import { webBundleAnalysisSchema } from "./webBundleAnalysis.js";
-import { isIncludedScript } from "./webBundleAnalyzerInspection.js";
+import { isIncludedScript } from "./webBundleAnalyzerState.js";
 import { webBundleScriptAnalysisSchema } from "./webBundleScriptAnalysis.js";
 import { createWebTextArtifact } from "./webContentArtifact.js";
 
@@ -158,6 +162,232 @@ it("discloses widened returned-reference effects only for the affected script", 
   ).toEqual(["/candidate"]);
 });
 
+it.each([
+  {
+    label: "inline declaration and schema spreads",
+    source: `document.modelContext.registerTool({
+      ...{
+        name: "spread-tool",
+        description: "Copied from a literal",
+        inputSchema: {
+          ...{
+            type: "object",
+            properties: { query: { type: "string" } }
+          }
+        }
+      }
+    });`,
+    name: "spread-tool",
+    description: "Copied from a literal",
+    properties: ["query"],
+    coverage: "complete",
+  },
+  {
+    label: "unrelated trailing literal spread",
+    source: `document.modelContext.registerTool({
+      name: "direct-tool",
+      description: "Explicit metadata",
+      inputSchema: { properties: { query: { type: "string" } } },
+      ...{ timeout: 5 }
+    });`,
+    name: "direct-tool",
+    description: "Explicit metadata",
+    properties: ["query"],
+    coverage: "complete",
+  },
+  {
+    label: "null spread after explicit metadata",
+    source: `document.modelContext.registerTool({
+      name: "null-safe-tool",
+      description: "Null spread is inert",
+      inputSchema: { properties: { query: { type: "string" } } },
+      ...null
+    });`,
+    name: "null-safe-tool",
+    description: "Null spread is inert",
+    properties: ["query"],
+    coverage: "complete",
+  },
+  {
+    label: "snake-case schema property from a spread",
+    source: `document.modelContext.registerTool({
+      ...{
+        name: "snake-tool",
+        description: "Snake-case schema",
+        input_schema: { properties: { item_id: { type: "string" } } }
+      }
+    });`,
+    name: "snake-tool",
+    description: "Snake-case schema",
+    properties: ["item_id"],
+    coverage: "complete",
+  },
+])(
+  "preserves WebMCP facts through $label",
+  ({ source, name, description, properties, coverage }) => {
+    const result = analyzeCapturedWebBundle(inspection(source));
+
+    expect(result.observations.webmcp_declarations).toEqual([
+      expect.objectContaining({
+        name,
+        description,
+        schema_property_names: properties,
+        schema_property_names_coverage: coverage,
+        trust: "page-declared-untrusted",
+      }),
+    ]);
+    expect(result.completeness.status).toBe("complete");
+  },
+);
+
+it.each([
+  {
+    label: "unknown spread after explicit facts",
+    source: `document.modelContext.registerTool({
+      name: "possibly-overridden",
+      description: "Possibly overridden",
+      inputSchema: { properties: { query: { type: "string" } } },
+      ...dynamicOptions
+    });`,
+    name: null,
+    description: null,
+    properties: [],
+    coverage: "unknown",
+  },
+  {
+    label: "explicit facts after an unknown spread",
+    source: `document.modelContext.registerTool({
+      ...dynamicOptions,
+      name: "known-after-spread",
+      description: "Explicitly restored",
+      inputSchema: { properties: { query: { type: "string" } } }
+    });`,
+    name: "known-after-spread",
+    description: "Explicitly restored",
+    properties: ["query"],
+    coverage: "complete",
+  },
+])(
+  "preserves rightmost uncertainty for $label",
+  ({ source, name, description, properties, coverage }) => {
+    const result = analyzeCapturedWebBundle(inspection(source));
+
+    expect(result.observations.webmcp_declarations).toEqual([
+      expect.objectContaining({
+        name,
+        description,
+        schema_property_names: properties,
+        schema_property_names_coverage: coverage,
+        trust: "page-declared-untrusted",
+      }),
+    ]);
+    expect(result.completeness.status).toBe("complete");
+  },
+);
+
+it.each([
+  {
+    label: "an unknown camel-case schema override",
+    source: `document.modelContext.registerTool({
+      ...dynamicOptions,
+      inputSchema: { properties: { camel: {} } },
+      ...anotherDynamicOptions,
+      input_schema: { properties: { snake: {} } },
+      name: "tool",
+      description: "Explicit metadata"
+    });`,
+    name: "tool",
+    properties: [],
+    coverage: "unknown",
+  },
+  {
+    label: "an explicit null camel-case schema",
+    source: `document.modelContext.registerTool({
+      name: "null-alias",
+      description: "Fallback applies",
+      inputSchema: null,
+      input_schema: { properties: { snake: {} } }
+    });`,
+    name: "null-alias",
+    properties: ["snake"],
+    coverage: "complete",
+  },
+  {
+    label: "literal property spreads",
+    source: `document.modelContext.registerTool({
+      name: "spread-properties",
+      inputSchema: { properties: { ...{ query: {} }, direct: {} } }
+    });`,
+    name: "spread-properties",
+    properties: ["direct", "query"],
+    coverage: "complete",
+  },
+  {
+    label: "prototype setters are not schema properties",
+    source: `document.modelContext.registerTool({
+      name: "prototype-properties",
+      inputSchema: { properties: { __proto__: { hidden: {} }, direct: {}, ["__proto__"]: {} } }
+    });`,
+    name: "prototype-properties",
+    properties: ["__proto__", "direct"],
+    coverage: "complete",
+  },
+  {
+    label: "own schema properties before a prototype setter",
+    source: `document.modelContext.registerTool({
+      name: "own-before-prototype",
+      inputSchema: { properties: { known: {} }, __proto__: { properties: { inherited: {} } } }
+    });`,
+    name: "own-before-prototype",
+    properties: ["known"],
+    coverage: "complete",
+  },
+  {
+    label: "own schema properties after a prototype setter",
+    source: `document.modelContext.registerTool({
+      name: "own-after-prototype",
+      inputSchema: { __proto__: { properties: { inherited: {} } }, properties: { known: {} } }
+    });`,
+    name: "own-after-prototype",
+    properties: ["known"],
+    coverage: "complete",
+  },
+  {
+    label: "an unresolved property spread",
+    source: `document.modelContext.registerTool({
+      name: "unknown-properties",
+      inputSchema: { properties: { ...dynamicProperties, direct: {} } }
+    });`,
+    name: "unknown-properties",
+    properties: ["direct"],
+    coverage: "partial",
+  },
+  {
+    label: "an unresolved computed property key",
+    source: `document.modelContext.registerTool({
+      name: "computed-properties",
+      inputSchema: { properties: { [propertyName]: {}, direct: {} } }
+    });`,
+    name: "computed-properties",
+    properties: ["direct"],
+    coverage: "partial",
+  },
+])(
+  "preserves WebMCP schema ownership for $label",
+  ({ source, name, properties, coverage }) => {
+    const result = analyzeCapturedWebBundle(inspection(source));
+
+    expect(result.observations.webmcp_declarations).toEqual([
+      expect.objectContaining({
+        name,
+        schema_property_names: properties,
+        schema_property_names_coverage: coverage,
+        trust: "page-declared-untrusted",
+      }),
+    ]);
+  },
+);
+
 describe("web bundle analyzer", () => {
   it("extracts graph, route, endpoint, vendor, and WebMCP evidence", () => {
     const source = `
@@ -206,6 +436,7 @@ describe("web bundle analyzer", () => {
         name: "lookup-user",
         trust: "page-declared-untrusted",
         schema_property_names: ["userId", "verbose"],
+        schema_property_names_coverage: "complete",
       }),
     ]);
     expect(result.inferences).toEqual(
@@ -266,6 +497,7 @@ describe("web bundle analyzer", () => {
       name,
       description,
       schema_property_names: [propertyName],
+      schema_property_names_coverage: "complete",
       trust: "page-declared-untrusted",
     });
   });
@@ -868,6 +1100,17 @@ describe("web bundle configuration and navigation parity", () => {
 });
 
 describe("web bundle artifact metadata", () => {
+  it("retains only a validated HTTP target origin", () => {
+    expect(
+      analyzeCapturedWebBundle(inspection("export {};")).capture.target_origin,
+    ).toBe(origin);
+
+    const nonHttp = inspection("export {};");
+    nonHttp.target.url = "ftp://host/app";
+    nonHttp.target.origin = "ftp://host";
+    expect(analyzeCapturedWebBundle(nonHttp).capture.target_origin).toBeNull();
+  });
+
   it("preserves long provider media types in artifact summaries", () => {
     const result = analyzeCapturedWebBundle(inspection("export {};"));
     const mediaType = `application/${"x".repeat(300)}`;
@@ -918,112 +1161,15 @@ describe("deep captured web bundle syntax", () => {
 });
 
 const inspection = (source: string) =>
-  webPageInspectionSchema.parse({
-    browser: {
-      product: "Fake Chrome",
-      protocol_version: "1.3",
-      revision: "1",
-      user_agent: "fake",
-      js_version: "1",
-    },
-    target: {
-      target_id: "page-1",
-      type: "page",
-      title: "App",
-      url: `${origin}/app`,
+  createWebPageInspection([
+    {
+      source,
+      scriptKey: `scr_${"1".repeat(64)}`,
+      url: `${origin}/assets/app.js`,
       origin,
-      attached: false,
+      cdpHash: "hash",
     },
-    capture_window: {
-      started_at: "2026-07-14T00:00:00.000Z",
-      ended_at: "2026-07-14T00:00:01.000Z",
-      observation_ms: 1_000,
-    },
-    completeness: {
-      status: "attach_limited",
-      conditions: ["attach_limited"],
-      policy_filtered_sections: [],
-      attach_limited_sections: ["network_requests"],
-      truncated_sections: [],
-      unavailable_sections: [],
-      excluded: [],
-      dropped_events: {
-        scripts: 0,
-        network_requests: 0,
-        console_events: 0,
-        websocket_connections: 0,
-        websocket_frames: 0,
-        webmcp_tools: 0,
-        timeline_events: 0,
-        total: 0,
-      },
-    },
-    frames: [],
-    dom: { total_nodes: 0, nodes: [] },
-    accessibility: {
-      total_nodes: 0,
-      text_capture: {
-        status: "not_approved",
-        retained_bytes: 0,
-        excluded_fields: 0,
-      },
-      nodes: [],
-    },
-    scripts: {
-      total: 1,
-      items: [
-        {
-          script_key: `scr_${"1".repeat(64)}`,
-          url: `${origin}/assets/app.js`,
-          origin,
-          cdp_hash: "hash",
-          length: Buffer.byteLength(source),
-          is_module: true,
-          language: "JavaScript",
-          source_map_url: null,
-          resource_reconciliation: {
-            status: "unmatched",
-            reason: "no_exact_sanitized_url",
-          },
-          source: {
-            included: true,
-            artifact: createWebTextArtifact(source, "text/javascript"),
-          },
-        },
-      ],
-    },
-    resources: [],
-    network: {
-      requests: [],
-      websocket_connections: [],
-      coverage_started_at: "2026-07-14T00:00:00.000Z",
-      prior_activity_available: false,
-    },
-    console: {
-      events: [],
-      coverage_started_at: "2026-07-14T00:00:00.000Z",
-      prior_activity_available: false,
-    },
-    workers: [],
-    metadata: {
-      responses: [],
-      dom_urls: [],
-      agent_hints: [],
-      excluded_dom_urls: 0,
-      headers_allowlisted: true,
-    },
-    storage: {
-      origin,
-      usage_bytes: null,
-      quota_bytes: null,
-      local_storage_keys: [],
-      session_storage_keys: [],
-      indexed_db_names: [],
-      cache_names: [],
-      values_redacted: true,
-    },
-    limitations: [],
-  });
+  ]);
 
 describe("per-script web bundle analysis", () => {
   it("keeps parser failures as analyzed outcomes with their own coverage", () => {
@@ -1481,10 +1627,24 @@ describe("web metadata key semantics", () => {
       expect.objectContaining({
         name: "new",
         schema_property_names: ["literal"],
+        schema_property_names_coverage: "partial",
       }),
-      expect.objectContaining({ name: null }),
-      expect.objectContaining({ name: "restored" }),
-      expect.objectContaining({ name: "valid" }),
+      expect.objectContaining({
+        name: null,
+        schema_property_names_coverage: "unknown",
+      }),
+      expect.objectContaining({
+        name: null,
+        schema_property_names_coverage: "not_present",
+      }),
+      expect.objectContaining({
+        name: "restored",
+        schema_property_names_coverage: "unknown",
+      }),
+      expect.objectContaining({
+        name: "valid",
+        schema_property_names_coverage: "not_present",
+      }),
     ]);
   });
 
@@ -1514,19 +1674,85 @@ describe("web metadata key semantics", () => {
 
     expect(
       result.observations.webmcp_declarations.map(
-        ({ name, schema_property_names }) => ({ name, schema_property_names }),
+        ({ name, schema_property_names, schema_property_names_coverage }) => ({
+          name,
+          schema_property_names,
+          schema_property_names_coverage,
+        }),
       ),
     ).toEqual([
-      { name: "literal", schema_property_names: ["", "properties", "type"] },
-      { name: "missing properties", schema_property_names: [] },
-      { name: "dynamic properties", schema_property_names: [] },
-      { name: "null properties", schema_property_names: [] },
-      { name: "missing schema", schema_property_names: [] },
-      { name: "dynamic schema", schema_property_names: [] },
-      { name: "null schema", schema_property_names: [] },
-      { name: "spread schema", schema_property_names: [] },
-      { name: "computed literal keys", schema_property_names: ["", "literal"] },
+      {
+        name: "literal",
+        schema_property_names: ["", "properties", "type"],
+        schema_property_names_coverage: "partial",
+      },
+      {
+        name: "missing properties",
+        schema_property_names: [],
+        schema_property_names_coverage: "not_present",
+      },
+      {
+        name: "dynamic properties",
+        schema_property_names: [],
+        schema_property_names_coverage: "unknown",
+      },
+      {
+        name: "null properties",
+        schema_property_names: [],
+        schema_property_names_coverage: "unknown",
+      },
+      {
+        name: "missing schema",
+        schema_property_names: [],
+        schema_property_names_coverage: "not_present",
+      },
+      {
+        name: "dynamic schema",
+        schema_property_names: [],
+        schema_property_names_coverage: "unknown",
+      },
+      {
+        name: "null schema",
+        schema_property_names: [],
+        schema_property_names_coverage: "not_present",
+      },
+      {
+        name: "spread schema",
+        schema_property_names: [],
+        schema_property_names_coverage: "unknown",
+      },
+      {
+        name: "computed literal keys",
+        schema_property_names: ["", "literal"],
+        schema_property_names_coverage: "partial",
+      },
     ]);
+  });
+
+  it("keeps missing coverage absent when parsing historical observations", () => {
+    const analyzed = analyzeCapturedWebBundle(
+      inspection(
+        `document.modelContext.registerTool({ name: "legacy", inputSchema: { properties: {} } });`,
+      ),
+    );
+    const declaration = analyzed.observations.webmcp_declarations[0];
+    expect(declaration).toBeDefined();
+    if (declaration === undefined) throw new Error("Expected declaration");
+    const { schema_property_names_coverage: _coverage, ...legacyDeclaration } =
+      declaration;
+    const parsed = webBundleAnalysisSchema.parse({
+      ...analyzed,
+      observations: {
+        ...analyzed.observations,
+        webmcp_declarations: [legacyDeclaration],
+      },
+    });
+    expect(
+      Object.hasOwn(
+        parsed.observations.webmcp_declarations[0] ?? {},
+        "schema_property_names_coverage",
+      ),
+    ).toBe(false);
   });
 });
 
@@ -1695,6 +1921,8 @@ it("retains distinct WebMCP descriptions and names while deduplicating equivalen
       document.modelContext.registerTool({ name: "lookup", description: "second", inputSchema: { properties: { alpha: {} } } });
       document.modelContext.registerTool({ name: "equivalent", inputSchema: { properties: { alpha: {}, beta: {} } } });
       document.modelContext.registerTool({ name: "equivalent", inputSchema: { properties: { beta: {}, alpha: {}, alpha: {} } } });
+      document.modelContext.registerTool({ name: "empty-status", inputSchema: { properties: {} } });
+      document.modelContext.registerTool({ name: "empty-status", inputSchema: { properties: dynamicProperties } });
       document.modelContext.registerTool({ description: "unnamed" });
       document.modelContext.registerTool({ name: "", description: "unnamed" });
     `),
@@ -1702,10 +1930,16 @@ it("retains distinct WebMCP descriptions and names while deduplicating equivalen
 
   expect(
     result.observations.webmcp_declarations.map(
-      ({ name, description, schema_property_names }) => ({
+      ({
         name,
         description,
         schema_property_names,
+        schema_property_names_coverage,
+      }) => ({
+        name,
+        description,
+        schema_property_names,
+        schema_property_names_coverage,
       }),
     ),
   ).toEqual([
@@ -1713,19 +1947,44 @@ it("retains distinct WebMCP descriptions and names while deduplicating equivalen
       name: "lookup",
       description: "first",
       schema_property_names: ["alpha"],
+      schema_property_names_coverage: "complete",
     },
     {
       name: "lookup",
       description: "second",
       schema_property_names: ["alpha"],
+      schema_property_names_coverage: "complete",
     },
     {
       name: "equivalent",
       description: null,
       schema_property_names: ["alpha", "beta"],
+      schema_property_names_coverage: "complete",
     },
-    { name: null, description: "unnamed", schema_property_names: [] },
-    { name: "", description: "unnamed", schema_property_names: [] },
+    {
+      name: "empty-status",
+      description: null,
+      schema_property_names: [],
+      schema_property_names_coverage: "complete",
+    },
+    {
+      name: "empty-status",
+      description: null,
+      schema_property_names: [],
+      schema_property_names_coverage: "unknown",
+    },
+    {
+      name: null,
+      description: "unnamed",
+      schema_property_names: [],
+      schema_property_names_coverage: "not_present",
+    },
+    {
+      name: "",
+      description: "unnamed",
+      schema_property_names: [],
+      schema_property_names_coverage: "not_present",
+    },
   ]);
   expect(result.observations.webmcp_declarations[2]?.location).toEqual({
     script_key: `scr_${"1".repeat(64)}`,
@@ -1737,4 +1996,54 @@ it("retains distinct WebMCP descriptions and names while deduplicating equivalen
       ({ trust }) => trust === "page-declared-untrusted",
     ),
   ).toBe(true);
+});
+
+it("keeps known capture omissions in compact route summaries and queryable gap facts", () => {
+  const captured = inspection("createBrowserRouter([{path:'/reports'}]);");
+  captured.completeness.excluded.push(
+    { section: "scripts", reason: "resource_budget_exhausted", count: 3 },
+    {
+      section: "script_sources",
+      reason: "resource_budget_exhausted",
+      count: null,
+    },
+  );
+  const report = analyzeCapturedWebBundle(captured),
+    parent = {
+      evidenceId: `ev_${"a".repeat(64)}`,
+      operation: "analyze_web_bundle",
+      normalizedResult: report,
+      limitations: report.limitations,
+      subject: null,
+    };
+  const summary = projectAnalysisView(
+    parent,
+    analysisViewRequestSchema.parse({
+      kind: "javascript-routes",
+      collection: "summary",
+    }),
+  );
+  if (!summary.ok) throw summary.error;
+  if (summary.value.kind !== "javascript-routes") throw new Error("Wrong view");
+  expect(summary.value.source_coverage.candidate_enumeration).toBe("partial");
+  expect(summary.value.summary!.reported_capture_omissions).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ unit: "script-records", count: 3 }),
+      expect.objectContaining({ unit: "script-sources", count: null }),
+    ]),
+  );
+  const gaps = projectAnalysisView(
+    parent,
+    analysisViewRequestSchema.parse({
+      kind: "javascript-routes",
+      collection: "unknowns",
+      where: { kinds: ["capture-omission"] },
+      fields: ["capture_omission", "reason"],
+    }),
+  );
+  if (!gaps.ok) throw gaps.error;
+  if (gaps.value.kind !== "javascript-routes") throw new Error("Wrong view");
+  expect(gaps.value.items).toHaveLength(2);
+  for (const row of gaps.value.items)
+    expect(row).toMatchObject({ source_id: null, provenance: null });
 });

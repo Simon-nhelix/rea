@@ -22,7 +22,7 @@ it("keeps the shared browser scenario provider open when the SDK discards its di
   const browserClose = vi
     .spyOn(browserObservation, "close")
     .mockResolvedValue(undefined);
-  const electronObservation = createElectronObservationProvider();
+  const electronObservation = createElectronObservationProvider({});
   const electronClose = vi
     .spyOn(electronObservation, "close")
     .mockResolvedValue(undefined);
@@ -119,7 +119,7 @@ it("closes optional providers when MCP server startup throws", async () => {
   const browserClose = vi
     .spyOn(browserObservation, "close")
     .mockResolvedValue(undefined);
-  const electronObservation = createElectronObservationProvider();
+  const electronObservation = createElectronObservationProvider({});
   const electronClose = vi
     .spyOn(electronObservation, "close")
     .mockResolvedValue(undefined);
@@ -156,7 +156,17 @@ it("closes optional providers when MCP server startup throws", async () => {
       }),
     });
 
-    expect(transport).toEqual({ ok: false });
+    expect(transport).toMatchObject({
+      ok: false,
+      cancelled: false,
+      handle: { close: expect.any(Function) },
+      closeAndroid: expect.any(Function),
+      closeOptionalProviders: expect.any(Function),
+    });
+    // Failed admission still returns partial owners for idempotent retries.
+    await transport.handle.close();
+    await transport.closeOptionalProviders();
+    await transport.closeAndroid();
     expect(browserClose).toHaveBeenCalledTimes(1);
     expect(scenarioClose).toHaveBeenCalledTimes(1);
     expect(electronClose).toHaveBeenCalledTimes(1);

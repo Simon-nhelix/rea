@@ -6,7 +6,11 @@ import type {
 } from "@modelcontextprotocol/server";
 import type { Logger } from "pino";
 
-import type { ReverseEngineeringService } from "../application/reverse/ReverseEngineeringService.js";
+import {
+  resolveRizinCommandRequest,
+  type ReverseEngineeringService,
+} from "../application/reverse/ReverseEngineeringService.js";
+import type { EvidenceLookup } from "../application/EvidenceInputResolver.js";
 import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
 import type { Evidence } from "../domain/evidence.js";
 import { toolContract } from "../contracts/toolContracts.js";
@@ -15,7 +19,6 @@ import { logToolExecution } from "./toolLogging.js";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
 import type { ToolResultDelivery } from "./toolResult.js";
 import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
-import { rizinInputSchema } from "../domain/reverseEngineering.js";
 import { AnalysisOutputError } from "../domain/analysisErrorCore.js";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { Result } from "../domain/result.js";
@@ -38,6 +41,7 @@ export const registerReverseEngineeringTools = (
       error: AnalysisError,
     ) => AnalysisError,
   ) => Promise<Result<Result<Value, AnalysisError>, AnalysisError>>,
+  evidenceById?: EvidenceLookup,
 ): void => {
   const objdump = toolContract("inspect_with_objdump");
   const rizin = toolContract("execute_rizin_command");
@@ -52,9 +56,13 @@ export const registerReverseEngineeringTools = (
         delivery,
         async () => {
           const result = await logToolExecution(logger, objdump.name, () =>
-            service.inspectWithObjdump(input, {
-              signal: context.mcpReq.signal,
-            }),
+            service.inspectWithObjdump(
+              input,
+              {
+                signal: context.mcpReq.signal,
+              },
+              { recordEvidence, evidenceById },
+            ),
           );
           if (!result.ok)
             return deliverFailure(
@@ -75,18 +83,18 @@ export const registerReverseEngineeringTools = (
     rizin.name,
     toolRegistrationOptions(rizin),
     async (input, context: ServerContext) => {
-      const parsed = rizinInputSchema.safeParse(input);
-      if (parsed.success && withAdmittedExternalMutation !== undefined) {
+      const parsed = resolveRizinCommandRequest(input);
+      if (parsed.ok && withAdmittedExternalMutation !== undefined) {
         const cleanup = await service.retryCleanup(rizin.name);
         if (!cleanup.ok)
           return deliverFailure(cleanup.error, rizin, delivery, recordEvidence);
         const admitted = await withAdmittedExternalMutation(
-          parsed.data.path,
+          parsed.value.path,
           context.mcpReq.signal,
           async () => {
             invalidateSnapshotForExternalMutation?.();
             return logToolExecution(logger, rizin.name, () =>
-              service.executeRizinCommand(parsed.data, {
+              service.executeRizinCommandValidated(parsed.value, {
                 signal: context.mcpReq.signal,
               }),
             );
@@ -137,15 +145,14 @@ export const registerReverseEngineeringTools = (
         withAdmittedAnalysis,
         delivery,
         async () => {
-          if (
-            invalidateSnapshotForExternalMutation !== undefined &&
-            rizinInputSchema.safeParse(input).success
-          )
+          if (invalidateSnapshotForExternalMutation !== undefined && parsed.ok)
             invalidateSnapshotForExternalMutation();
           const result = await logToolExecution(logger, rizin.name, () =>
-            service.executeRizinCommand(input, {
-              signal: context.mcpReq.signal,
-            }),
+            parsed.ok
+              ? service.executeRizinCommandValidated(parsed.value, {
+                  signal: context.mcpReq.signal,
+                })
+              : Promise.resolve(parsed),
           );
           if (!result.ok)
             return deliverFailure(

@@ -1,3 +1,4 @@
+import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
 import { describe, expect, it } from "vitest";
 
 import type {
@@ -16,6 +17,11 @@ import type {
   SessionProviderRouter,
 } from "./SessionProviderRouter.js";
 import { binarySessionStatus } from "./BinarySessionStatus.js";
+import {
+  APPLE_DISPATCH_METADATA_ANALYSIS_PROFILE,
+  NATIVE_MACOS_PROVIDER_IDENTITY,
+  nativeMacOSCapabilities,
+} from "../../native/NativeMacOSProviderMetadata.js";
 
 const projectedStatusSchema = sessionProvider.pick({
   capabilities: true,
@@ -119,6 +125,7 @@ const project = async (
     string,
     { readonly reason: string }
   > = new Map(),
+  target?: BinaryTarget,
 ) => {
   const route: SessionProviderRoute = {
     identity: providerA,
@@ -137,7 +144,7 @@ const project = async (
   };
   return projectedStatusSchema.parse(
     await binarySessionStatus({
-      target: undefined,
+      target,
       route,
       router,
       runtimeUnavailability,
@@ -326,6 +333,21 @@ const expectedExpandedCandidateCapabilities = [
 ];
 
 describe("binary session provider capability projection", () => {
+  it("keeps the private dispatch reader profile out of public capability status", async () => {
+    const capabilities = nativeMacOSCapabilities("darwin");
+    const projected = await project(capabilities, [
+      candidate(NATIVE_MACOS_PROVIDER_IDENTITY, capabilities),
+    ]);
+    const serialized = JSON.stringify(projected);
+    expect(serialized).not.toContain(
+      APPLE_DISPATCH_METADATA_ANALYSIS_PROFILE.provider.version,
+    );
+    expect(serialized).not.toContain(
+      APPLE_DISPATCH_METADATA_ANALYSIS_PROFILE.digest,
+    );
+    expect(projectedStatusSchema.parse(projected)).toEqual(projected);
+  });
+
   it("preserves provider scope and route overlays while factoring exact prefixes", async () => {
     const selectedBefore = structuredClone(selectedCapabilities);
     const otherBefore = structuredClone(otherCapabilities);
@@ -392,3 +414,33 @@ describe("binary session provider capability projection", () => {
     ]);
   });
 });
+
+it.each(["elf", "pe"] as const)(
+  "reports format rejection for %s dylib discovery",
+  async (format) => {
+    const target: BinaryTarget = {
+      kind: "executable",
+      format,
+      path: "/fixture",
+      sha256: "a".repeat(64),
+      architecture: "x86_64",
+      availableArchitectures: ["x86_64"],
+      ...(format === "pe"
+        ? { executableRole: "application" as const, managed: false }
+        : {}),
+    } as BinaryTarget;
+    const status = await project(
+      [descriptor(providerA, "trace_dylib_resolution", [])],
+      [],
+      new Map(),
+      target,
+    );
+    expect(expandCanonicalCapabilities(status.capabilities)).toMatchObject([
+      {
+        operation: "trace_dylib_resolution",
+        available: false,
+        availability_code: "target_format_unsupported",
+      },
+    ]);
+  },
+);

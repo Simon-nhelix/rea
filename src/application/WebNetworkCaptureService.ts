@@ -1,7 +1,6 @@
 import { redactExplicitFailure } from "../domain/explicitSensitiveFailure.js";
 import { excludeCaptureCoordinates } from "../domain/webNetworkCaptureCoordinates.js";
 import { redactExplicitText } from "../domain/explicitSensitiveValues.js";
-import { isAbsolute } from "node:path";
 import type { ExecutionOptions } from "./AnalysisProvider.js";
 import type { WebNetworkCapturePort } from "./WebNetworkCapturePort.js";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
@@ -57,16 +56,6 @@ export class WebNetworkCaptureService {
         }),
       );
     const input = parsed.data;
-    if (!isAbsolute(input.capture_path))
-      return failure(
-        new AnalysisInputError(OPERATION, undefined, [
-          {
-            path: ["capture_path"],
-            reason: "invalid_format",
-            message: "Expected an absolute filesystem path on this host.",
-          },
-        ]),
-      );
     if (
       input.record_ordinals !== undefined &&
       new Set(input.record_ordinals).size !== input.record_ordinals.length
@@ -77,6 +66,17 @@ export class WebNetworkCaptureService {
             path: ["record_ordinals"],
             reason: "invalid_format",
             message: "Each requested producer ordinal must occur once.",
+          },
+        ]),
+      );
+    if (input.protobuf !== undefined && input.record_ordinals === undefined)
+      return failure(
+        new AnalysisInputError(OPERATION, undefined, [
+          {
+            path: ["record_ordinals"],
+            reason: "invalid_format",
+            message:
+              "Protobuf options require explicit producer record ordinals.",
           },
         ]),
       );
@@ -201,7 +201,34 @@ export class WebNetworkCaptureService {
         ? {}
         : { format: input.format }),
       record_ordinals: selected,
+      ...(input.protobuf === undefined
+        ? {}
+        : {
+            protobuf: {
+              framing: input.protobuf.framing,
+              ...(input.protobuf.body_pointers === undefined
+                ? {}
+                : {
+                    body_pointers: input.protobuf.body_pointers.map(redactText),
+                  }),
+              ...(input.protobuf.schema === undefined
+                ? {}
+                : {
+                    schema: {
+                      descriptor_set_path: redactText(
+                        input.protobuf.schema.descriptor_set_path,
+                      ),
+                      message_type: redactText(
+                        input.protobuf.schema.message_type,
+                      ),
+                    },
+                  }),
+            },
+          }),
       sensitive_value_count: input.sensitive_values.length,
+      ...(input.capture_timeout_ms === undefined
+        ? {}
+        : { capture_timeout_ms: input.capture_timeout_ms }),
     });
     return ok(
       createEvidence(

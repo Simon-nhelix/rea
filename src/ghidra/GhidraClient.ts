@@ -19,7 +19,12 @@ import {
 import { err, ok, type Result } from "../domain/result.js";
 import { silentLogger } from "../logger.js";
 import type { Logger } from "pino";
+import {
+  readLinuxCgroupMemoryState,
+  type LinuxCgroupMemoryState,
+} from "../process/LinuxCgroupMemory.js";
 import { PendingOperations } from "../process/PendingOperations.js";
+import { DecodedNdjsonLineBuffer } from "../process/DecodedNdjsonLineBuffer.js";
 import { ABORTED, waitForAbortable } from "../process/AbortablePromise.js";
 import {
   SharedStartupAttempt,
@@ -50,7 +55,6 @@ import {
   GHIDRA_PROCESS_DIAGNOSTIC_BYTES,
 } from "./GhidraDiagnostics.js";
 import { GhidraLaunchError, type GhidraLaunch } from "./GhidraLauncher.js";
-import { GhidraResponseBuffer } from "./GhidraResponseBuffer.js";
 import { GhidraResponseRouter } from "./GhidraResponseRouter.js";
 import { GhidraRequestQueue } from "./GhidraRequestQueue.js";
 import {
@@ -75,7 +79,7 @@ import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import {
   artifactFileCancellationCause,
-  artifactFilePrimaryFailure,
+  artifactFilePrimaryFacts,
   bindArtifactFileCleanup,
   withArtifactRegularFile,
 } from "../artifacts/ArtifactFileOperation.js";
@@ -133,6 +137,7 @@ export class GhidraClient {
   #socketRoot: PrivateRuntimeRoot | undefined;
   #endpointPath: string | undefined;
   #snapshotPath: string | undefined;
+  #memoryCgroupBaseline: LinuxCgroupMemoryState | undefined;
   readonly #fileResources = new ArtifactResourceScope();
   readonly #cleanupFailures = new Set<AnalysisError>();
   #targetAdmission: JsonValue | undefined;
@@ -166,11 +171,11 @@ export class GhidraClient {
       }),
     protocolFailure: (message, cause) => this.#abortProtocol(message, cause),
   });
-  readonly #responseBuffer = new GhidraResponseBuffer({
-    onLine: (line) => this.#responseRouter.route(line),
-  });
-  readonly #onSocketData = (chunk: string): void =>
-    this.#responseBuffer.push(chunk);
+  readonly #responseLines = new DecodedNdjsonLineBuffer();
+  readonly #onSocketData = (chunk: string): void => {
+    for (const line of this.#responseLines.push(chunk))
+      this.#responseRouter.route(line);
+  };
   readonly #onSocketError = (): void => {
     this.#failAll(this.#failure("process", "Ghidra bridge socket failed"));
   };
@@ -216,12 +221,14 @@ export class GhidraClient {
               requestOptions.signal,
             );
             return err(
-              this.#refreshProcessFailure(
-                result.error,
-                owner,
-                checkpoint,
-                token,
-                !drained,
+              await this.#withMemoryCgroupEvidence(
+                this.#refreshProcessFailure(
+                  result.error,
+                  owner,
+                  checkpoint,
+                  token,
+                  !drained,
+                ),
               ),
             );
           }
@@ -414,12 +421,16 @@ export class GhidraClient {
         const bytes = await readBoundedFileBytes(
           handle,
           maximumBytes ?? initial.size,
-          signal,
-          initial.size,
-          (reason) =>
-            new ArtifactReaderFailure("cancelled", "Snapshot read cancelled", {
-              cause: reason,
-            }),
+          {
+            signal,
+            expectedSize: initial.size,
+            cancellationFailure: (reason) =>
+              new ArtifactReaderFailure(
+                "cancelled",
+                "Snapshot read cancelled",
+                { cause: reason },
+              ),
+          },
         );
         if (bytes === undefined || bytes.length !== initial.size)
           throw new RegularFileChangedError(path);
@@ -558,8 +569,9 @@ export class GhidraClient {
         cause instanceof ArtifactReaderFailure && cause.reason === "cancelled"
           ? { reason: artifactFileCancellationCause(cause) }
           : undefined;
-      const primary = artifactFilePrimaryFailure(cause);
+      const { cause: primary, origin } = artifactFilePrimaryFacts(cause);
       let failure =
+        origin === "owned-or-classified" &&
         primary instanceof GhidraSessionError
           ? primary
           : this.#failure(
@@ -675,7 +687,9 @@ export class GhidraClient {
           : { remoteCode: primary.remoteCode }),
       },
     );
-    primary = primary.withDiagnostics(refreshed.diagnostics, refreshed.message);
+    primary = await this.#withMemoryCgroupEvidence(
+      primary.withDiagnostics(refreshed.diagnostics, refreshed.message),
+    );
     try {
       await this.#cleanup();
       return err(primary);
@@ -865,6 +879,7 @@ export class GhidraClient {
     this.#authenticationTokens.add(this.#token);
     this.#lineage.reset();
     this.#runId = this.#options.runId ?? randomUUID();
+    this.#memoryCgroupBaseline = await this.#readMemoryCgroup();
     const launched = await this.#options.launcher
       .launch(
         {
@@ -970,7 +985,7 @@ export class GhidraClient {
       this.#detachSocket = undefined;
       this.#socket?.destroy();
       this.#socket = undefined;
-      this.#responseBuffer.reset();
+      this.#responseLines.reset();
     }
   }
 
@@ -1115,7 +1130,7 @@ export class GhidraClient {
       this.#endpointPath = undefined;
       this.#token = undefined;
       this.#runId = undefined;
-      this.#responseBuffer.reset();
+      this.#responseLines.reset();
       if (forcedStopFailure !== undefined) throw forcedStopFailure.cause;
       for (const failure of this.#cleanupFailures) failure.resolveCleanup();
       this.#cleanupFailures.clear();
@@ -1198,6 +1213,7 @@ export class GhidraClient {
       return;
     }
     this.#processSnapshot = event.snapshot;
+    if (event.type === "output-close") return;
     this.#options.onDiagnostic?.({
       type: "launcher-exit",
       code: event.code,
@@ -1315,11 +1331,43 @@ export class GhidraClient {
       ...failure.diagnostics,
       exit_code: snapshot.exitCode ?? null,
       exit_signal: snapshot.signal ?? null,
+      stop_requested: snapshot.stopRequested === true,
       diagnostic_truncated: snapshot.diagnosticTruncated === true || incomplete,
       output_incomplete: snapshot.outputIncomplete === true || drainIncomplete,
       stdout: ghidraDiagnosticStream(snapshot.stdout, token),
       stderr: ghidraDiagnosticStream(snapshot.stderr, token),
       failure_output: ghidraFailureOutput(scoped, token, drainIncomplete),
+    });
+  }
+
+  #readMemoryCgroup(): Promise<LinuxCgroupMemoryState | undefined> {
+    return (this.#options.readMemoryCgroup ?? readLinuxCgroupMemoryState)();
+  }
+
+  /**
+   * Compare REA's memory cgroup with its pre-launch observation once Ghidra is
+   * known to have died by SIGKILL, so a kernel OOM kill becomes evidence.
+   */
+  async #withMemoryCgroupEvidence(
+    failure: GhidraSessionError,
+  ): Promise<GhidraSessionError> {
+    const before = this.#memoryCgroupBaseline;
+    if (
+      before === undefined ||
+      failure.diagnostics.exit_signal !== "SIGKILL" ||
+      failure.diagnostics.stop_requested !== false
+    )
+      return failure;
+    const after = await this.#readMemoryCgroup();
+    if (after === undefined || after.path !== before.path) return failure;
+    return failure.withDiagnostics({
+      ...failure.diagnostics,
+      memory_cgroup: {
+        path: after.path,
+        oom_kill_before: before.oomKills,
+        oom_kill_after: after.oomKills,
+        memory_max: after.memoryMax,
+      },
     });
   }
 

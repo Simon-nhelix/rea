@@ -1,9 +1,4 @@
-import type { AnalysisError } from "../domain/analysisErrorBase.js";
-import {
-  AnalysisInputError,
-  AnalysisCancelledError,
-  AnalysisUnsupportedTargetError,
-} from "../domain/analysisErrorCore.js";
+import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { ArtifactOperationError } from "../domain/artifactOperationError.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
 import {
@@ -31,18 +26,16 @@ export const translateArtifactFailure = (
         ...(cause.partialObservation === undefined
           ? {}
           : { partialObservation: cause.partialObservation }),
+        ...(cause.admission === undefined
+          ? {}
+          : { admission: cause.admission }),
+        ...(cause.boundary === undefined ? {} : { boundary: cause.boundary }),
       },
     );
     bindArtifactFileCleanup(cause, error);
     return error;
   }
-  // Caller-selection and unsupported-target failures are already typed; keep
-  // their correction details instead of reducing them to an I/O failure.
-  if (
-    cause instanceof AnalysisInputError ||
-    cause instanceof AnalysisCancelledError ||
-    cause instanceof AnalysisUnsupportedTargetError
-  )
-    return cause;
+  // Keep typed Evidence and other analysis failures instead of reducing them to I/O.
+  if (cause instanceof AnalysisError) return cause;
   return new ArtifactOperationError(operation, "io");
 };

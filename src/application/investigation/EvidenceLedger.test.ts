@@ -43,7 +43,7 @@ describe("evidence ledger recording", () => {
         recordsAdded: 0,
         unknownsAdded: 0,
         changed: false,
-        metadataChanged: false,
+        replacements: [],
       },
     });
     expect(ledger.export().records).toEqual([evidence]);
@@ -60,7 +60,13 @@ describe("evidence ledger recording", () => {
         recordsAdded: 0,
         unknownsAdded: 0,
         changed: true,
-        metadataChanged: true,
+        replacements: [
+          {
+            kind: "subject-display",
+            previous: evidence,
+            current: relocatedBundleRecord,
+          },
+        ],
       },
     });
     expect(ledger.get(evidence.evidence_id)).toEqual(relocatedBundleRecord);
@@ -73,7 +79,7 @@ describe("evidence ledger recording", () => {
         recordsAdded: 0,
         unknownsAdded: 0,
         changed: false,
-        metadataChanged: false,
+        replacements: [],
       },
     });
     const conflictingBundle = createEvidenceBundle([
@@ -111,7 +117,7 @@ describe("evidence ledger recording", () => {
         recordsAdded: 0,
         unknownsAdded: 0,
         changed: false,
-        metadataChanged: false,
+        replacements: [],
       },
     });
     ledger.clear();
@@ -138,13 +144,13 @@ describe("evidence ledger recording", () => {
     expect(Reflect.set(detached, "operation", "forged")).toBe(true);
     expect(ledger.record(detached).ok).toBe(false);
     expect(ledger.forAnalysis(evidence.evidence_id)).toBe(borrowed);
-    const snapshot = ledger.forSerialization();
+    const snapshot = ledger.immutableBundle();
     expect(snapshot).toEqual(ledger.export());
     expect(snapshot.records[0]).toBe(borrowed);
     expect(Object.isFrozen(snapshot.records)).toBe(true);
     ledger.clear();
     expect(ledger.forAnalysis(evidence.evidence_id)).toBeUndefined();
-    expect(ledger.forSerialization().records).toEqual([]);
+    expect(ledger.immutableBundle().records).toEqual([]);
     expect(snapshot.records).toEqual([evidence]);
   });
 });
@@ -194,7 +200,13 @@ describe("evidence ledger metadata imports", () => {
         recordsAdded: 0,
         unknownsAdded: 0,
         changed: true,
-        metadataChanged: true,
+        replacements: [
+          {
+            kind: "subject-display",
+            previous: mutation,
+            current: relocatedMutation,
+          },
+        ],
       },
     });
     expect(ledger.get(mutation.evidence_id)).toEqual(relocatedMutation);
@@ -204,7 +216,7 @@ describe("evidence ledger metadata imports", () => {
         recordsAdded: 0,
         unknownsAdded: 0,
         changed: false,
-        metadataChanged: false,
+        replacements: [],
       },
     });
   });

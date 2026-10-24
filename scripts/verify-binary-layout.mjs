@@ -329,6 +329,48 @@ try {
     }
   }
   const protectedReport = reports.get("protected");
+  // Ordinary data markers are not a request to discover/decompress a kernel config.
+  const markerBytes = Buffer.from(await readFile(join(root.path, "protected")));
+  const markerOffset = markerBytes.indexOf(Buffer.from("source-owned"));
+  assert.ok(markerOffset >= 0);
+  markerBytes.write("IKCFG_ST", markerOffset, "ascii");
+  const markerPath = join(root.path, "ordinary-kernel-marker");
+  await writeFile(markerPath, markerBytes);
+  for (const mode of ["cli", "mcp"]) {
+    const value = await inspect(mode, markerPath);
+    for (const field of [
+      "sections",
+      "segments",
+      "symbols",
+      "relocations",
+      "linkage",
+      "mitigations",
+    ])
+      assert.deepEqual(value[field], protectedReport[field]);
+    assert.equal(
+      value.artifact.sha256,
+      createHash("sha256").update(markerBytes).digest("hex"),
+    );
+    cases++;
+  }
+  assert.deepEqual(await readFile(markerPath), markerBytes);
+  // File-table offsets are validated before narrower dependency seek APIs.
+  const overflowingTable = Buffer.from(markerBytes);
+  overflowingTable.writeBigUInt64LE(0x8000000000000040n, 32);
+  const overflowingTablePath = join(root.path, "overflowing-program-table");
+  await writeFile(overflowingTablePath, overflowingTable);
+  for (const mode of ["cli", "mcp"]) {
+    const error = await inspect(mode, overflowingTablePath, "invalid_input");
+    assert.equal(error.code, "invalid_request");
+    assert.ok(
+      error.details.issues.some(
+        ({ path, reason }) => path[0] === "path" && reason === "invalid_format",
+      ),
+    );
+    cases++;
+  }
+  assert.deepEqual(await readFile(overflowingTablePath), overflowingTable);
+
   const fileSymbols = protectedReport.symbols.filter(
     (symbol) => symbol.type === "STT_FILE",
   );
@@ -927,9 +969,8 @@ try {
   sectionHeavy.writeUInt16LE(sectionCount, 60);
   const sectionHeavyPath = join(root.path, "section-heavy.o");
   await writeFile(sectionHeavyPath, sectionHeavy);
-  // pwntools materializes each PT_LOAD zero-filled tail during inspection.
-  // One allocation larger than the whole address-space budget fails promptly;
-  // a large section count instead races CPU work against the command deadline.
+  // A structural report must retain a large virtual zero tail without allocating it.
+  // Bootstrap controls above retain genuine MemoryError/ENOMEM classification.
   const memoryHeavy = Buffer.from(await readFile(join(root.path, "protected")));
   const memoryPhOffset = Number(memoryHeavy.readBigUInt64LE(32));
   const memoryPhSize = memoryHeavy.readUInt16LE(54);
@@ -944,11 +985,15 @@ try {
   assert.notEqual(lastLoadIndex, undefined);
   const memorySizeOffset = memoryPhOffset + lastLoadIndex * memoryPhSize + 40;
   memoryHeavy.writeBigUInt64LE(
-    memoryHeavy.readBigUInt64LE(memorySizeOffset) + 128n * 1024n * 1024n,
+    memoryHeavy.readBigUInt64LE(memorySizeOffset) +
+      3n * 1024n * 1024n * 1024n +
+      1n,
     memorySizeOffset,
   );
   const memoryHeavyPath = join(root.path, "memory-zero-tail");
   await writeFile(memoryHeavyPath, memoryHeavy);
+  // Resource limits are result-affecting inputs: upstream PLT emulation may be
+  // incomplete under this address-space budget. Compare adapters at that budget.
   const memoryEnvironment = limitedEnvironment("--as=100663296");
   const memoryClient = new Client({
     name: "memory-layout-verifier",
@@ -962,22 +1007,39 @@ try {
   });
   try {
     await memoryClient.connect(memoryTransport);
+    let boundedMemoryReference;
     for (const mode of ["cli", "mcp"]) {
-      const error = await inspect(
+      const value = await inspect(
         mode,
         memoryHeavyPath,
-        "resource_constraint",
+        undefined,
         memoryEnvironment,
         memoryClient,
       );
-      assert.equal(error.code, "resource_constraint");
-      assert.equal(error.details.resource, "memory");
+      const original = protectedReport.segments[lastLoadIndex];
+      assert.deepEqual(value.segments[lastLoadIndex], {
+        ...original,
+        memory_size: `0x${memoryHeavy.readBigUInt64LE(memorySizeOffset).toString(16)}`,
+      });
+      assert.deepEqual(value.sections, protectedReport.sections);
+      assert.deepEqual(value.symbols, protectedReport.symbols);
+      assert.deepEqual(value.relocations, protectedReport.relocations);
+      if (mode === "cli") boundedMemoryReference = value;
+      else assert.deepEqual(value, boundedMemoryReference);
       assert.ok(
-        error.details.reported_limits === null ||
-          error.details.reported_limits.address_space_bytes === 100663296,
+        value.limitations.some((item) =>
+          item.includes('"address_space_bytes": 100663296'),
+        ),
       );
-      assert.equal(error.details.captured_output.truncated, false);
-      assert.ok(error.remediation.action.includes("memory"));
+      assert.equal(value.linkage.convenience_maps_completeness, "unknown");
+      const { plt: _originalPlt, ...originalLinkage } = protectedReport.linkage;
+      const { plt: _mutatedPlt, ...mutatedLinkage } = value.linkage;
+      assert.deepEqual(mutatedLinkage, originalLinkage);
+      assert.deepEqual(value.mitigations, protectedReport.mitigations);
+      assert.equal(
+        value.artifact.sha256,
+        createHash("sha256").update(memoryHeavy).digest("hex"),
+      );
       cases++;
     }
     assert.deepEqual(await readFile(memoryHeavyPath), memoryHeavy);

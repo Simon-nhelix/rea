@@ -17,6 +17,7 @@ import { readConfigurationFile } from "../../../src/application/ClientConfigurat
 import {
   configureClientConfiguration,
   inspectClientConfiguration,
+  clientConfigurationAligned,
 } from "../../../src/application/SetupClientConfiguration.js";
 import { resolveWindowsClaudeDesktopLocation } from "../../../src/application/ClaudeDesktopConfigLocation.js";
 import { supportedClients } from "../../../src/application/SupportedClients.js";
@@ -25,6 +26,48 @@ import { failedConfigurationMessage } from "../../../src/application/SetupClient
 import { PRODUCT_IDENTITY } from "../../../src/identity.js";
 
 const pinnedPackage = PRODUCT_IDENTITY.registrationPackageSpecifier;
+
+it.skipIf(process.platform === "win32")(
+  "preserves an aligned caller launcher alias without writes or a backup",
+  async () => {
+    const home = await createTestTempDirectory(
+      "rea-config-equivalent-launcher-",
+    );
+    const real = join(home, "rea-current");
+    const alias = join(home, "rea-alias");
+    await writeFile(real, "current launcher\n");
+    await symlink(real, alias);
+    await mkdir(join(home, ".cursor"));
+    const configPath = join(home, ".cursor", "mcp.json");
+    const original = JSON.stringify({
+      mcpServers: {
+        rea: { command: alias, args: ["mcp"], future_policy: { retain: true } },
+      },
+    });
+    await writeFile(configPath, original);
+    const client = { name: "cursor", format: "json", configPath } as const;
+    expect(await clientConfigurationAligned(client, {}, [real, "mcp"])).toBe(
+      true,
+    );
+    expect(await inspectClientConfiguration(client, {}, [real, "mcp"])).toEqual(
+      { status: "already_current" },
+    );
+    expect(
+      await configureClientConfiguration(client, {}, [real, "mcp"]),
+    ).toEqual({ status: "unchanged" });
+    expect(await readFile(configPath, "utf8")).toBe(original);
+    await expect(readFile(`${configPath}.rea.backup`)).rejects.toThrow();
+    const other = join(home, "another-launcher");
+    await writeFile(other, "different launcher\n");
+    expect(
+      await configureClientConfiguration(client, {}, [other, "mcp"]),
+    ).toMatchObject({ status: "configured" });
+    expect(JSON.parse(await readFile(configPath, "utf8"))).toMatchObject({
+      mcpServers: { rea: { command: other, future_policy: { retain: true } } },
+    });
+    expect(await readFile(`${configPath}.rea.backup`, "utf8")).toBe(original);
+  },
+);
 
 describe("JSON client configuration transaction: writing configuration through safe paths", () => {
   it.skipIf(typeof process.getuid !== "function")(
@@ -47,6 +90,38 @@ describe("JSON client configuration transaction: writing configuration through s
           realpath: () => Promise.resolve("/target"),
         }),
       ).toBeUndefined();
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "resolves a directory symlink and its real directory to one transaction path",
+    async () => {
+      const root = await createTestTempDirectory("rea-config-dir-alias-");
+      const realDirectory = join(root, "real");
+      const alias = join(root, "alias");
+      await mkdir(realDirectory);
+      await symlink(realDirectory, alias, "dir");
+      const realPath = join(realDirectory, "config.json");
+      const aliasPath = join(alias, "config.json");
+      const nestedRealPath = join(realDirectory, "nested", "config.json");
+      const nestedAliasPath = join(alias, "nested", "config.json");
+
+      expect(await resolveClientConfigTransactionPath(aliasPath)).toBe(
+        realPath,
+      );
+      expect(await resolveClientConfigTransactionPath(realPath)).toBe(realPath);
+      expect(await resolveClientConfigTransactionPath(nestedAliasPath)).toBe(
+        nestedRealPath,
+      );
+      expect(await resolveClientConfigTransactionPath(nestedRealPath)).toBe(
+        nestedRealPath,
+      );
+
+      await writeFile(realPath, "{}\n");
+      expect(await resolveClientConfigTransactionPath(aliasPath)).toBe(
+        realPath,
+      );
+      expect(await resolveClientConfigTransactionPath(realPath)).toBe(realPath);
     },
   );
 

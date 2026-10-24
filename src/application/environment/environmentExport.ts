@@ -1,3 +1,4 @@
+import { isAbsolute } from "node:path";
 import { getHeapStatistics } from "node:v8";
 
 import { AnalysisError } from "../../domain/analysisErrorBase.js";
@@ -21,7 +22,10 @@ import { AnalysisCleanupLease } from "../../artifacts/AnalysisCleanupLease.js";
 import { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
 import { RegularFileCleanupFailure } from "../../filesystem/OwnedRegularFile.js";
 import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
-import { writeEnvironmentBundle } from "./environmentBundleWrite.js";
+import {
+  BundleFileHostFailure,
+  writeEnvironmentBundle,
+} from "./environmentBundleWrite.js";
 import { sealOwnedJsonInput } from "../OwnedJsonInput.js";
 import { nativeJsonParseRequiredBytes } from "../JsonInputFile.js";
 import { readRegularFile } from "../RegularFileRead.js";
@@ -36,6 +40,7 @@ import {
   type EnvironmentPackageSource,
 } from "./environmentBundle.js";
 import type { EnvironmentSource } from "./environmentSource.js";
+import { prepareServedState, type PreparedState } from "./environmentState.js";
 
 /** One input file read once: the bytes the bundle copies and the value they parse to. */
 export interface EnvironmentExportFile {
@@ -51,7 +56,7 @@ export interface EnvironmentExportInputs {
 }
 
 export interface EnvironmentExportInput extends EnvironmentExportInputs {
-  /** The authenticated pair the bundle replays, loaded from the parsed values of the two files. */
+  /** The authenticated pair the bundle serves, loaded from the parsed values of the two files. */
   readonly source: EnvironmentSource;
   /** Absolute bundle root; absent or empty. */
   readonly directory: string;
@@ -70,9 +75,12 @@ export interface EnvironmentExportResult {
   readonly status: "exported";
   readonly directory: string;
   readonly name: string;
+  /** Tools the bundle serves. */
   readonly tool_count: number;
   readonly evidence_id: string;
   readonly manifest_evidence_id: string;
+  /** Whether the bundle serves from the state the export derived, as `environment-serve` reports it. */
+  readonly state: PreparedState["report"];
   readonly package_source: JsonValue;
   readonly files: readonly WrittenBundleFile[];
 }
@@ -90,28 +98,78 @@ const systemCode = (cause: unknown): string | undefined =>
     ? cause.code
     : undefined;
 
+/** Recovery for a host write failure that may leave partial output behind. */
+const hostWriteFailure = (directory: string) => ({
+  userMessage: `Writing the environment bundle to ${directory} failed on the host; the details name the cause and, when it failed on one bundle file, that file.`,
+  remediationAction: `Resolve the reported host failure (for example, choose a shorter destination path or free disk space). Inspect ${directory} and remove any partial output this export wrote before retrying, since a retry refuses a non-empty directory.`,
+  diagnostics: { output_directory: directory },
+});
+
+/** Recovery for a host failure reading the package tarball during the copy. */
+const hostReadFailure = (source: string, directory: string) => ({
+  userMessage: `Reading ${source} failed on the host while writing the environment bundle to ${directory}; the details name the cause.`,
+  remediationAction: `Resolve the reported host failure reading ${source}. Inspect ${directory} and remove any partial output this export wrote before retrying, since a retry refuses a non-empty directory.`,
+  diagnostics: { output_directory: directory },
+});
+
+/** The host failure beneath a wrapper, whose message names its code and absolute path. */
+const hostSystemError = (cause: Error): Error | undefined => {
+  const seen = new Set<unknown>([cause]);
+  let current = cause.cause;
+  while (current instanceof Error && !seen.has(current)) {
+    if (systemCode(current) !== undefined) return current;
+    seen.add(current);
+    current = current.cause;
+  }
+  return undefined;
+};
+
 const accessDeniedError = (
   cause: unknown,
   path: string,
-): AnalysisAccessDeniedError | undefined => {
+  diagnostics?: Readonly<Record<string, JsonValue>>,
+  access: "read" | "write" = "read",
+): AnalysisAccessDeniedError | AnalysisOutputError | undefined => {
   const seen = new Set<Error>();
   let current = cause;
   while (current instanceof Error && !seen.has(current)) {
     seen.add(current);
+    if (current instanceof BundleFileHostFailure)
+      access = current.operation === "reading" ? "read" : "write";
     const code = systemCode(current);
     if (code === "EACCES" || code === "EPERM") {
-      const error = new AnalysisAccessDeniedError(
-        ENVIRONMENT_EXPORT_OPERATION,
-        path,
-        code,
-        {
-          cause,
-          ...(cause instanceof ArtifactReaderFailure &&
-          cause.cleanup !== undefined
-            ? { cleanup: cause.cleanup }
-            : {}),
-        },
-      );
+      const options = {
+        cause,
+        ...(diagnostics === undefined ? {} : { diagnostics }),
+        ...(cause instanceof ArtifactReaderFailure &&
+        cause.cleanup !== undefined
+          ? { cleanup: cause.cleanup }
+          : {}),
+      };
+      const error =
+        access === "read"
+          ? new AnalysisAccessDeniedError(
+              ENVIRONMENT_EXPORT_OPERATION,
+              path,
+              code,
+              options,
+            )
+          : new AnalysisOutputError(
+              ENVIRONMENT_EXPORT_OPERATION,
+              `Host filesystem permissions denied write access: ${path}`,
+              {
+                ...options,
+                userMessage: `Host filesystem permissions denied writing the environment bundle at ${path}.`,
+                remediationAction:
+                  "Check write access or select a writable destination. Inspect the output directory for partial output before retrying; export refuses a non-empty directory.",
+                diagnostics: {
+                  ...diagnostics,
+                  path,
+                  system_code: code,
+                  boundary: "filesystem-write",
+                },
+              },
+            );
       bindArtifactFileCleanup(cause, error);
       return error;
     }
@@ -120,9 +178,19 @@ const accessDeniedError = (
   return undefined;
 };
 
-/** Host permission failures retain their typed cause; unexpected failures propagate. */
-const rethrowUnlessDenied = (cause: unknown, path: string): never => {
-  throw accessDeniedError(cause, path) ?? cause;
+/** The absolute path a host failure beneath wrappers names, if it names one. */
+const hostFailurePath = (cause: unknown): string | undefined => {
+  const seen = new Set<unknown>();
+  let current = cause;
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current);
+    if (current instanceof BundleFileHostFailure) return current.path;
+    const path = Reflect.get(current, "path");
+    if (systemCode(current) !== undefined && typeof path === "string")
+      return isAbsolute(path) ? path : undefined;
+    current = current.cause;
+  }
+  return undefined;
 };
 
 /** A path that is not a readable regular file, including inline JSON text offered as one. */
@@ -227,7 +295,9 @@ const readInput = async (
           `${path} could not be read as the ${role} file.`,
         ),
       );
-    return rethrowUnlessDenied(cause, path);
+    const denied = accessDeniedError(cause, path);
+    if (denied !== undefined) return err(denied);
+    throw cause;
   }
   let parsed: ReturnType<typeof parseUtf8Json>;
   try {
@@ -281,9 +351,15 @@ export const exportEnvironmentBundle = async (
     input.packageTarball === undefined
       ? registryPackageSource()
       : { kind: "tarball", path: input.packageTarball };
+  // The bundle's server prepares the state at startup; preparing it here, once the name is checked, predicts what it serves.
   const plan = planEnvironmentBundle(input.source, {
     name: input.name,
     packageSource,
+    served: (name) =>
+      prepareServedState(input.source, input.evidence.value, {
+        name,
+        operation: ENVIRONMENT_EXPORT_OPERATION,
+      }),
   });
   if (!plan.ok) return plan;
   let files: readonly WrittenBundleFile[];
@@ -291,7 +367,16 @@ export const exportEnvironmentBundle = async (
     files = await writeEnvironmentBundle(input, plan.value);
   } catch (cause: unknown) {
     if (cause instanceof AnalysisError) return err(cause);
-    const denied = accessDeniedError(cause, input.directory);
+    // A refused bundle write names the path the host refused, which may be a
+    // nested file after earlier files were written into the directory.
+    const denied = accessDeniedError(
+      cause,
+      hostFailurePath(cause) ?? input.directory,
+      { output_directory: input.directory },
+      cause instanceof BundleFileHostFailure && cause.operation === "reading"
+        ? "read"
+        : "write",
+    );
     if (denied !== undefined) return err(denied);
     if (cause instanceof RegularFileChangedError)
       return err(
@@ -303,32 +388,37 @@ export const exportEnvironmentBundle = async (
         ),
       );
     if (cause instanceof ArtifactReaderFailure) {
-      if (cause.reason === "path" && cause.cleanup === undefined)
-        return err(
-          inputError(
-            {
-              path: ["directory"],
-              reason: "invalid_value",
-              message: cause.message,
-            },
-            cause.message,
-          ),
-        );
+      const host = hostSystemError(cause);
       const error = new AnalysisOutputError(
         ENVIRONMENT_EXPORT_OPERATION,
-        cause.message,
+        host === undefined
+          ? cause.message
+          : `${cause.message}: ${host.message}`,
         {
           cause,
-          ...(cause.cleanup === undefined ? {} : { cleanup: cause.cleanup }),
+          // Only a host failure gets host recovery; an integrity or other
+          // refusal keeps its own message without disk-space advice.
+          ...(cause.cleanup !== undefined
+            ? { cleanup: cause.cleanup }
+            : host === undefined
+              ? { diagnostics: { output_directory: input.directory } }
+              : hostWriteFailure(input.directory)),
         },
       );
       bindArtifactFileCleanup(cause, error);
       return err(error);
     }
-    if (cause instanceof Error && systemCode(cause) !== undefined)
+    if (
+      cause instanceof BundleFileHostFailure ||
+      (cause instanceof Error && systemCode(cause) !== undefined)
+    )
       return err(
         new AnalysisOutputError(ENVIRONMENT_EXPORT_OPERATION, cause.message, {
           cause,
+          ...(cause instanceof BundleFileHostFailure &&
+          cause.operation === "reading"
+            ? hostReadFailure(cause.path, input.directory)
+            : hostWriteFailure(input.directory)),
         }),
       );
     throw cause;
@@ -340,6 +430,7 @@ export const exportEnvironmentBundle = async (
     tool_count: plan.value.toolCount,
     evidence_id: input.source.evidenceId,
     manifest_evidence_id: input.source.manifestEvidenceId,
+    state: plan.value.state,
     package_source: packageSourceValue(plan.value.packageSource),
     files,
   });
