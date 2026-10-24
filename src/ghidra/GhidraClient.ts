@@ -137,6 +137,7 @@ export class GhidraClient {
   #socketRoot: PrivateRuntimeRoot | undefined;
   #endpointPath: string | undefined;
   #snapshotPath: string | undefined;
+  #importedSha256: string | undefined;
   #memoryCgroupBaseline: LinuxCgroupMemoryState | undefined;
   readonly #fileResources = new ArtifactResourceScope();
   readonly #cleanupFailures = new Set<AnalysisError>();
@@ -854,9 +855,13 @@ export class GhidraClient {
           signal: deadline.signal,
           platform: this.#options.platform,
           resourceScope: this.#fileResources,
+          ...(this.#options.universalSlice === undefined
+            ? {}
+            : { universalSlice: this.#options.universalSlice }),
         },
       );
       this.#snapshotPath = snapshot.path;
+      this.#importedSha256 = snapshot.importedSha256;
       this.#targetAdmission = snapshot.admission;
     } catch (cause: unknown) {
       const failure =
@@ -890,6 +895,17 @@ export class GhidraClient {
           runId: this.#runId,
           targetPath: this.#snapshotPath,
           targetSha256: this.#options.targetSha256,
+          ...(this.#options.universalSlice === undefined ||
+          this.#importedSha256 === undefined
+            ? {}
+            : {
+                targetImage: {
+                  sha256: this.#importedSha256,
+                  offset: this.#options.universalSlice.offset,
+                  size: this.#options.universalSlice.size,
+                  source_path: this.#options.targetPath,
+                },
+              }),
           providerVersion: this.#options.providerVersion,
           profileDigest: this.#options.profileDigest,
         },
@@ -1127,6 +1143,7 @@ export class GhidraClient {
         else throw cause;
       }
       this.#snapshotPath = undefined;
+      this.#importedSha256 = undefined;
       this.#endpointPath = undefined;
       this.#token = undefined;
       this.#runId = undefined;

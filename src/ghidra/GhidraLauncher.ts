@@ -70,6 +70,12 @@ export interface GhidraLaunchSession {
   readonly runId: string;
   readonly targetPath: string;
   readonly targetSha256: string;
+  readonly targetImage?: {
+    readonly sha256: string;
+    readonly offset: number;
+    readonly size: number;
+    readonly source_path: string;
+  };
   readonly providerVersion: string;
   readonly profileDigest: string;
 }
@@ -355,6 +361,9 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
           token: session.token,
           run_id: session.runId,
           target_sha256: session.targetSha256,
+          ...(session.targetImage === undefined
+            ? {}
+            : { target_image: session.targetImage }),
           provider_version: session.providerVersion,
           profile_digest: session.profileDigest,
           ...(this.options.decompileTimeoutSeconds === undefined

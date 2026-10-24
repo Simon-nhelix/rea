@@ -221,6 +221,27 @@ export const createGhidraProviderClient = (input: {
         },
       }),
     );
+  if (target.format === "mach-o-universal") {
+    const selection = committedProfile.parameters.universal_slice;
+    if (
+      selection === null ||
+      typeof selection !== "object" ||
+      Array.isArray(selection) ||
+      selection.offset !== target.universalSlice.offset ||
+      selection.size !== target.universalSlice.size ||
+      selection.architecture !== target.architecture ||
+      committedProfile.parameters.universal_import !==
+        "verified-thin-slice-original-file-coordinates-v1"
+    )
+      return err(
+        new ProviderAdapterError("ghidra", "open_binary", {
+          diagnostics: {
+            reason:
+              "The universal Mach-O slice differs from the committed analysis profile; reopen the target.",
+          },
+        }),
+      );
+  }
   const seeds = seedProfile.data;
   const parameterLanguage = ghidraProfileLanguageOverride(
     committedProfile.parameters,
@@ -462,6 +483,14 @@ export const createGhidraProviderClient = (input: {
         ? (target.sourcePath ?? target.path)
         : target.path,
     targetSha256: target.sha256,
+    ...(target.format !== "mach-o-universal"
+      ? {}
+      : {
+          universalSlice: {
+            ...target.universalSlice,
+            architecture: target.architecture,
+          },
+        }),
     transport:
       installation.platform === "win32"
         ? "authenticated-loopback-tcp"
@@ -620,6 +649,11 @@ export const createGhidraProviderClient = (input: {
       analysisProfile: committedProfile,
       limitations: [
         ...limitationsFor(operation),
+        ...(target.format !== "mach-o-universal"
+          ? []
+          : [
+              `Ghidra imports only the selected ${target.architecture} slice at original file offset ${target.universalSlice.offset}, length ${target.universalSlice.size}; the Evidence subject retains the original universal file identity. Address mappings, byte-search offsets and file-offset procedure selectors use original-container offsets. inspect_native_load_image source_files and mappings describe the extracted image in its own file coordinates. Other slices were not analyzed.`,
+            ]),
         ...(observation.limitations ?? []),
         ...sessionLimitations(),
       ],

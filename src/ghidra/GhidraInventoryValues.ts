@@ -225,10 +225,16 @@ const baseItem = {
 };
 const symbolItem = z.object({ ...baseItem, symbol: symbolFacts }).strict();
 const procedureItem = z
-  .object({ ...baseItem, procedure: procedureFacts })
+  .object({
+    ...baseItem,
+    procedure: procedureFacts,
+    symbol: nativeSymbolMetadataSchema.optional(),
+  })
   .strict();
 const stringItem = z.object({ ...baseItem, string: stringFacts }).strict();
-const searchItem = z.object(baseItem).strict();
+const searchItem = z
+  .object({ ...baseItem, symbol: nativeSymbolMetadataSchema.optional() })
+  .strict();
 
 const availablePermissions = z
   .object({
@@ -330,6 +336,17 @@ const resultSchemas = {
   address_to_file_offset: z.strictObject({
     address: nativeAddressObservationSchema,
     file_offset: z.int().min(0).max(Number.MAX_SAFE_INTEGER),
+    provider_file_offset: z
+      .int()
+      .min(0)
+      .max(Number.MAX_SAFE_INTEGER)
+      .optional(),
+    image_base_file_offset: z
+      .int()
+      .min(0)
+      .max(Number.MAX_SAFE_INTEGER)
+      .optional(),
+    source_path: z.string().optional(),
   }),
   address_name: z.string().nullable(),
   list_documents: z.array(z.string().min(1)).length(1),

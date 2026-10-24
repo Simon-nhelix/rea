@@ -589,7 +589,7 @@ describe("Ghidra Mach-O slice support", () => {
       code: "architecture_unsupported",
     });
   });
-  it("refuses universal targets whose selected slice cannot be enforced", () => {
+  it("admits universal targets through their selected private slice", async () => {
     const ghidra = provider();
     const universal: BinaryTarget = {
       path: "/tmp/fixture",
@@ -598,18 +598,40 @@ describe("Ghidra Mach-O slice support", () => {
       format: "mach-o-universal",
       architecture: "arm64",
       availableArchitectures: ["x86_64", "arm64"],
-      universalSlice: { offset: 0, size: 32 },
+      universalSlice: { offset: 4096, size: 32 },
     };
 
     expect(ghidra.inspectTargetSupport(universal)).toMatchObject({
-      status: "unsupported",
-      code: "architecture_unsupported",
-      reason: expect.stringContaining("universal Mach-O"),
+      status: "supported",
+      code: null,
+      reason: null,
       diagnostics: {
         architecture: "arm64",
         available_architectures: ["x86_64", "arm64"],
       },
     });
+    const resolved = await ghidra.resolveAnalysisProfile(universal);
+    if (!resolved.ok) throw resolved.error;
+    expect(resolved.value.profile?.parameters.universal_slice).toEqual({
+      offset: 4096,
+      size: 32,
+      architecture: "arm64",
+    });
+    const override = await provider(installationHost(), undefined, {
+      REA_GHIDRA_LANGUAGE_ID: "x86:LE:64:default",
+    }).resolveAnalysisProfile(universal);
+    expect(override).toMatchObject({
+      ok: false,
+      error: { _tag: "ConfigurationError" },
+    });
+    const shifted = await ghidra.resolveAnalysisProfile({
+      ...universal,
+      universalSlice: { offset: 8192, size: 32 },
+    });
+    if (!shifted.ok) throw shifted.error;
+    expect(shifted.value.profile?.digest).not.toBe(
+      resolved.value.profile?.digest,
+    );
     expect(
       ghidra.inspectTargetSupport(executableTarget("mach-o", "arm64")),
     ).toMatchObject({ status: "supported" });

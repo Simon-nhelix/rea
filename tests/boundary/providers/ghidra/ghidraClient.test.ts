@@ -1,3 +1,5 @@
+import { universalMacho, CPU_ARM64 } from "../../../fixtures/universalMacho.js";
+import type { GhidraUniversalSlice } from "../../../../src/ghidra/GhidraUniversalSlice.js";
 import { parseConfig } from "../../../../src/config/parseConfig.js";
 import { GhidraProvider } from "../../../../src/ghidra/GhidraProvider.js";
 import { fixtureDosLoadImage } from "../../../../src/ghidra/GhidraLoadImage.fixture.js";
@@ -124,12 +126,16 @@ const clientFor = (
     readonly logger?: Logger;
     readonly targetPath?: string;
     readonly targetSha256?: string;
+    readonly universalSlice?: GhidraUniversalSlice;
   } = {},
 ): GhidraClient => {
   const client = new GhidraClient({
     launcher,
     targetPath: options.targetPath ?? fixturePath,
     targetSha256: options.targetSha256 ?? TARGET_SHA256,
+    ...(options.universalSlice === undefined
+      ? {}
+      : { universalSlice: options.universalSlice }),
     transport: options.transport ?? HOST_TRANSPORT,
     providerVersion: PROVIDER_VERSION,
     profileDigest: PROFILE_DIGEST,
@@ -794,6 +800,57 @@ it("keeps runtime cleanup pending after a snapshot descriptor releases and shrin
   expect(second.error.cleanupIncomplete).toBe(false);
 });
 
+it.skipIf(process.platform === "win32")(
+  "launches an extracted image with separate source identity and removes it on close",
+  async () => {
+    const root = await createTestTempDirectory("rea-ghidra-universal-client-");
+    const thin = Buffer.alloc(32);
+    thin.writeUInt32LE(0xfeedfacf, 0);
+    const fixture = universalMacho([
+      { bytes: thin, cpuType: CPU_ARM64, cpuSubtype: 0x80000002 },
+    ]);
+    const source = join(root, "universal");
+    await writeFile(source, fixture.bytes);
+    const slice = fixture.slices[0]!;
+    const expected = fixture.bytes.subarray(
+      slice.offset,
+      slice.offset + slice.size,
+    );
+    const digest = (bytes: Buffer) =>
+      createHash("sha256").update(bytes).digest("hex");
+    const launcher = new FixtureLauncher();
+    let snapshotPath = "";
+    const client = clientFor(
+      {
+        launch: async (session) => {
+          snapshotPath = session.targetPath;
+          expect(readFileSync(snapshotPath)).toEqual(expected);
+          expect(session.targetSha256).toBe(digest(fixture.bytes));
+          expect(session.targetImage).toEqual({
+            sha256: digest(expected),
+            offset: slice.offset,
+            size: slice.size,
+            source_path: source,
+          });
+          return launcher.launch(session);
+        },
+      },
+      {
+        targetPath: source,
+        targetSha256: digest(fixture.bytes),
+        universalSlice: { ...slice, architecture: "arm64" },
+      },
+    );
+    const started = await client.start();
+    if (!started.ok) throw started.error;
+    const closed = await client.close();
+    if (!closed.ok) throw closed.error;
+    await expect(access(snapshotPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(readFileSync(source)).toEqual(fixture.bytes);
+  },
+);
 describe("GhidraClient captured source snapshot", () => {
   it("retains a snapshot descriptor whose close failed until session cleanup succeeds", async () => {
     const client = clientFor(new FixtureLauncher());

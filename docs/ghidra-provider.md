@@ -36,6 +36,35 @@ provider stays bound to the target; runtime failure never selects another
 provider automatically. The contracts below describe Ghidra observations,
 not equivalence with another engine's pseudocode or analysis database.
 
+## Universal Mach-O imports
+
+On Linux/macOS, open the original universal Mach-O directly. REA extracts the
+slice already selected by target resolution into its private runtime directory;
+it does not require `lipo`. The selection is recorded in the analysis profile as
+`universal_slice` (architecture, original byte offset and size). Only that slice
+is analyzed. A processor override cannot reinterpret the selected slice; use a
+thin input for an explicit processor reinterpretation. Windows P0 admission is
+unchanged.
+
+Extraction verifies the architecture table, embedded CPU type/subtype, original
+file state and full original SHA-256. Ghidra separately verifies the extracted
+image's SHA-256. Evidence retains the original path and digest. The private copy
+is removed with the session's existing runtime cleanup.
+
+`address_to_file_offset`, byte-search offsets and `file-offset:` procedure
+selectors use offsets in the original universal file. Address conversion also
+returns the slice-relative `provider_file_offset`, its `image_base_file_offset`
+and original `source_path`. Offsets outside the selected slice are rejected.
+`inspect_native_load_image` preserves Ghidra's extracted-source digest and
+slice-relative source mappings, with an explicit Evidence limitation; its
+mapping offsets must not be interpreted as original-container offsets.
+
+Verify a local universal fixture through the real MCP provider with:
+
+```sh
+GHIDRA_INSTALL_DIR=/path/to/ghidra npm run verify:ghidra:universal -- /bin/ls
+```
+
 ## Admitted inventory semantics
 
 | Concern          | Ghidra contract                                                                                                                                                                                                                                                                                 |
@@ -113,7 +142,8 @@ failure retains the selector, mapped address and procedure entry without
 changing the backend failure code.
 
 Both mapping directions require a complete original `FileBytes` source whose
-SHA-256 matches the admitted target. Auxiliary files and partial source objects
+SHA-256 matches the admitted target (or the verified extracted slice for a
+universal Mach-O). Auxiliary files and partial source objects
 remain visible in the load-image inventory but do not establish offsets in the
 original target. Ghidra's object-local offsets are not silently treated as
 original-file coordinates. Original-source identity is checked once per source

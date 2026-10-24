@@ -126,6 +126,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
     private static final Gson GSON = new GsonBuilder().serializeNulls().create();
     private final Map<FileBytes, Boolean> targetSourceIdentity = new IdentityHashMap<>();
     private String admittedTargetSha256;
+    private TargetImage targetImage;
     private static final Set<String> DESCRIPTOR_KEYS = Set.of(
         "transport",
         "endpoint_path",
@@ -196,6 +197,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
         Path descriptorPath = Path.of(arguments[0]);
         SessionDescriptor descriptor = readDescriptor(descriptorPath);
         decompileTimeoutSeconds = descriptor.decompileTimeoutSeconds();
+        targetImage = descriptor.targetImage();
         // Windows retains a native immutable bearer descriptor lease until
         // runtime_close; POSIX removes it after this read. Normal cleanup removes
         // the Windows file, while abrupt owner death can leave private residue.
@@ -233,13 +235,13 @@ public final class ReaGhidraBridge extends HeadlessScript {
         if (importedSha256 == null ||
             !constantTimeEquals(
                 importedSha256.toLowerCase(Locale.ROOT),
-                descriptor.targetSha256
+                targetImage == null ? descriptor.targetSha256 : targetImage.sha256
             )) {
             throw new IllegalStateException(
                 "Ghidra imported-byte digest does not match the admitted target"
             );
         }
-        admittedTargetSha256 = descriptor.targetSha256;
+        admittedTargetSha256 = targetImage == null ? descriptor.targetSha256 : targetImage.sha256;
         // GhidraScript wraps run() in a transaction. End it before serving so
         // each edit owns a real outer transaction and can roll back immediately.
         end(true);
@@ -908,6 +910,10 @@ public final class ReaGhidraBridge extends HeadlessScript {
                 !isTargetSource(source.getFileBytes().get())) continue;
             long candidate = source.getFileBytesOffset(address);
             if (candidate < 0) continue;
+            if (targetImage != null) {
+                if (candidate >= targetImage.size) continue;
+                candidate = Math.addExact(candidate, targetImage.offset);
+            }
             offset = candidate;
             mappings++;
         }
@@ -930,6 +936,11 @@ public final class ReaGhidraBridge extends HeadlessScript {
         JsonObject result = new JsonObject();
         result.addProperty("address", canonicalAddress(address));
         result.addProperty("file_offset", fileOffset);
+        if (targetImage != null) {
+            result.addProperty("provider_file_offset", fileOffset - targetImage.offset);
+            result.addProperty("image_base_file_offset", targetImage.offset);
+            result.addProperty("source_path", targetImage.sourcePath);
+        }
         return result;
     }
 
@@ -998,6 +1009,12 @@ public final class ReaGhidraBridge extends HeadlessScript {
         if (parsed.compareTo(BigInteger.valueOf(9007199254740991L)) > 0)
             throw new RequestFailure("invalid_request", "File offset exceeds the exact JSON integer range");
         long offset = parsed.longValueExact();
+        long imageOffset = offset;
+        if (targetImage != null) {
+            if (offset < targetImage.offset || offset - targetImage.offset >= targetImage.size)
+                throw new RequestFailure("not_found", "File offset is outside the selected universal Mach-O slice");
+            imageOffset = offset - targetImage.offset;
+        }
         monitor.checkCancelled();
         // Ghidra's convenience lookup spans every FileBytes and uses coordinates
         // local to each object. Only a complete, digest-matched target source
@@ -1008,7 +1025,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
                 monitor.checkCancelled();
                 FileBytes backing = source.getFileBytes().orElse(null);
                 if (backing == null || !isTargetSource(backing)) continue;
-                Address mapped = source.locateAddressForFileOffset(offset);
+                Address mapped = source.locateAddressForFileOffset(imageOffset);
                 if (mapped != null) mappedAddresses.add(mapped);
             }
         }
@@ -4953,6 +4970,8 @@ public final class ReaGhidraBridge extends HeadlessScript {
             keys.add("analysis_extensions");
         if (parsed.isJsonObject() && parsed.getAsJsonObject().has("decompile_timeout_seconds"))
             keys.add("decompile_timeout_seconds");
+        if (parsed.isJsonObject() && parsed.getAsJsonObject().has("target_image"))
+            keys.add("target_image");
         JsonObject object = requireObject(parsed, keys);
         int decompileTimeout = 0;
         if (object.has("decompile_timeout_seconds")) {
@@ -4969,8 +4988,18 @@ public final class ReaGhidraBridge extends HeadlessScript {
             requireString(object, "provider_version"),
             requireString(object, "profile_digest"),
             object.has("analysis_extensions") ? object.getAsJsonArray("analysis_extensions") : new JsonArray(),
-            decompileTimeout
+            decompileTimeout,
+            object.has("target_image") ? readTargetImage(object.get("target_image")) : null
         );
+    }
+
+    private static TargetImage readTargetImage(JsonElement value) {
+        JsonObject image = requireObject(value, Set.of("sha256", "offset", "size", "source_path"));
+        long offset = image.get("offset").getAsBigDecimal().longValueExact();
+        long size = image.get("size").getAsBigDecimal().longValueExact();
+        if (offset < 0 || size <= 0 || offset > 9007199254740991L - size)
+            throw new IllegalArgumentException("Invalid selected image range");
+        return new TargetImage(requireSha256(image, "sha256"), offset, size, requireString(image, "source_path"));
     }
 
     private static Request parseRequest(String line, String expectedToken) {
@@ -5175,8 +5204,10 @@ public final class ReaGhidraBridge extends HeadlessScript {
         String providerVersion,
         String profileDigest,
         JsonArray analysisExtensions,
-        int decompileTimeoutSeconds
+        int decompileTimeoutSeconds,
+        TargetImage targetImage
     ) {}
+    private record TargetImage(String sha256, long offset, long size, String sourcePath) {}
     private record Request(int id, String method, JsonObject params) {}
 
     private static final class RequestFailure extends RuntimeException {

@@ -29,10 +29,7 @@ import {
   createAnalysisProfile,
   type AnalysisProfileCommitment,
 } from "../domain/analysisProfile.js";
-import {
-  isMachOFormat,
-  type BinaryTarget,
-} from "../domain/binaryTargetTypes.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import {
   jsonObjectSchema,
   jsonValueSchema,
@@ -269,17 +266,6 @@ export class GhidraProvider implements AnalysisProviderCandidate {
         status: "unsupported",
         code: "architecture_unsupported",
         reason: mipsReason,
-        diagnostics,
-      };
-    if (
-      isMachOFormat(target.format) &&
-      target.availableArchitectures.length > 1
-    )
-      return {
-        status: "unsupported",
-        code: "architecture_unsupported",
-        reason:
-          "Ghidra v1 cannot enforce the selected architecture when importing a universal Mach-O; analyze a thinned Mach-O slice instead.",
         diagnostics,
       };
     if (!SUPPORTED_ARCHITECTURES.has(target.architecture))

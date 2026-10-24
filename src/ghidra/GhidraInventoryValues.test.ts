@@ -205,3 +205,32 @@ describe("containing-procedure complete body evidence", () => {
     ).toBe(false);
   });
 });
+
+it("preserves producer symbol provenance in procedure inventories and searches", () => {
+  const symbol = {
+    primary: true,
+    dynamic: false,
+    external: false,
+    type: "Function",
+    source: "analysis",
+  };
+  const row = { address: "0x100000700", value: "entry", symbol };
+  for (const [operation, item] of [
+    [
+      "list_procedures",
+      {
+        ...row,
+        procedure: { external: false, thunk: false, thunk_target: null },
+      },
+    ],
+    ["search_procedures", row],
+  ] as const) {
+    const parsed = parseGhidraInventoryResult(operation, [item]);
+    expect(parsed).toEqual({ ok: true, value: { value: [item] } });
+    expect(
+      parseGhidraInventoryResult(operation, [
+        { ...item, symbol: { ...symbol, source: "guessed" } },
+      ]).ok,
+    ).toBe(false);
+  }
+});

@@ -146,6 +146,13 @@ export const resolveGhidraAnalysisProfile = async (
         ),
       ),
     );
+  if (target.format === "mach-o-universal" && languageOverride !== undefined)
+    return err(
+      languageOverrideConflict(
+        languageOverride,
+        "Processor overrides cannot replace the selected universal Mach-O slice CPU; open a thin file for a caller-selected reinterpretation.",
+      ),
+    );
   // A caller-selected generic processor cannot override this verified PSP loader.
   if (isGhidraPspTarget(target) && languageOverride !== undefined)
     return err(
@@ -491,10 +498,28 @@ const createGhidraProfile = (
 ) =>
   createAnalysisProfile(provider, {
     ...parameters,
-    // Ghidra does not currently commit an exact universal-container slice selection.
-    ...(target.kind === "executable" && target.format !== "mach-o-universal"
+    ...(target.format !== "mach-o-universal"
+      ? {}
+      : {
+          universal_slice: {
+            offset: target.universalSlice.offset,
+            size: target.universalSlice.size,
+            architecture: target.architecture,
+          },
+          universal_import: "verified-thin-slice-original-file-coordinates-v1",
+        }),
+    ...(target.kind === "executable"
       ? {
           function_coordinate_context: createFunctionCoordinateContext({
+            ...(target.format !== "mach-o-universal"
+              ? {}
+              : {
+                  universal_slice: {
+                    offset: target.universalSlice.offset,
+                    size: target.universalSlice.size,
+                    architecture: target.architecture,
+                  },
+                }),
             loader: parameters.loader ?? null,
             language_id: parameters.language_id ?? null,
             compiler_spec_id: parameters.compiler_spec_id ?? null,
