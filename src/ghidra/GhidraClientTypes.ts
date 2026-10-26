@@ -1,3 +1,4 @@
+import type { GhidraUniversalSlice } from "./GhidraUniversalSlice.js";
 import type { Logger } from "pino";
 import type { BridgeMaxRequestBytes } from "../config/bridgeMaxRequestBytes.js";
 import type { Result } from "../domain/result.js";
@@ -39,6 +40,7 @@ export interface GhidraClientOptions {
   readonly runId?: string;
   readonly targetPath: string;
   readonly targetSha256: string;
+  readonly universalSlice?: GhidraUniversalSlice;
   /** Installation host shared by runtime allocation and snapshot admission. */
   readonly platform?: NodeJS.Platform;
   readonly transport?: GhidraTransportKind;

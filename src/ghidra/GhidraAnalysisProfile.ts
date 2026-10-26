@@ -178,6 +178,13 @@ export const resolveGhidraAnalysisProfile = async (
         ),
       ),
     );
+  if (target.format === "mach-o-universal" && languageOverride !== undefined)
+    return err(
+      languageOverrideConflict(
+        languageOverride,
+        "Processor overrides cannot replace the selected universal Mach-O slice CPU; open a thin file for a caller-selected reinterpretation.",
+      ),
+    );
   // A caller-selected generic processor cannot override this verified PSP loader.
   if (isGhidraPspTarget(target) && languageOverride !== undefined)
     return err(
@@ -288,22 +295,7 @@ export const resolveGhidraAnalysisProfile = async (
           architecture: target.architecture,
           available_architectures: [...target.availableArchitectures].sort(),
           import_mode: "ephemeral-source-immutable",
-          annotation_policy: "atomic-function-entry-metadata-v1",
-          load_image_observations: "source-mappings-entry-context-v2",
-          function_body_evidence: "complete-inclusive-ranges-v1",
-          function_references: "complete-body-and-entry-reference-manager-v2",
-          call_relationship_coverage:
-            sharedAnalysisSemantics.call_relationship_coverage,
-          function_dossier_coverage:
-            "observed-facets-and-call-relationships-v1",
-          string_inventory_evidence: "defined-data-coverage-v1",
-          location_resolution: "explicit-address-exact-entry-symbol-first-v3",
-          procedure_file_offset_resolution:
-            "address-first-unique-target-source-mapping-v2",
-          instruction_flow_evidence: "decoded-return-pcode-v1",
-          instruction_references: "exact-address-incoming-v1",
-          function_boundary_observations:
-            "ghidra-function-boundary-limitations-v3",
+          ...sharedAnalysisSemantics,
           no_return_repair:
             installation.platform === "win32"
               ? "disabled-windows-p0"
@@ -559,10 +551,28 @@ const createGhidraProfile = (
 ) =>
   createAnalysisProfile(provider, {
     ...parameters,
-    // Ghidra does not currently commit an exact universal-container slice selection.
-    ...(target.kind === "executable" && target.format !== "mach-o-universal"
+    ...(target.format !== "mach-o-universal"
+      ? {}
+      : {
+          universal_slice: {
+            offset: target.universalSlice.offset,
+            size: target.universalSlice.size,
+            architecture: target.architecture,
+          },
+          universal_import: "verified-thin-slice-original-file-coordinates-v1",
+        }),
+    ...(target.kind === "executable"
       ? {
           function_coordinate_context: createFunctionCoordinateContext({
+            ...(target.format !== "mach-o-universal"
+              ? {}
+              : {
+                  universal_slice: {
+                    offset: target.universalSlice.offset,
+                    size: target.universalSlice.size,
+                    architecture: target.architecture,
+                  },
+                }),
             loader: parameters.loader ?? null,
             language_id: parameters.language_id ?? null,
             compiler_spec_id: parameters.compiler_spec_id ?? null,

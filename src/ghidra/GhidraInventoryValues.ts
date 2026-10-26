@@ -149,15 +149,6 @@ export const parseGhidraInventoryInput = (
   return ok(parsed.data);
 };
 
-const symbolFacts = z
-  .object({
-    primary: z.boolean(),
-    dynamic: z.boolean(),
-    external: z.boolean(),
-    type: z.string().min(1),
-    source: z.enum(["default", "analysis", "ai", "imported", "user_defined"]),
-  })
-  .strict();
 const procedureFacts = z
   .object({
     external: z.boolean(),
@@ -223,9 +214,14 @@ const baseItem = {
   address: nativeAddressObservationSchema,
   value: z.string(),
 };
-const symbolItem = z.object({ ...baseItem, symbol: symbolFacts }).strict();
+const symbolItem = z
+  .object({ ...baseItem, symbol: nativeSymbolMetadataSchema })
+  .strict();
 const addressedItem = z
-  .object({ ...baseItem, symbol: symbolFacts.exactOptional() })
+  .object({
+    ...baseItem,
+    symbol: nativeSymbolMetadataSchema.exactOptional(),
+  })
   .strict();
 const procedureItem = addressedItem.extend({ procedure: procedureFacts });
 const stringItem = z.object({ ...baseItem, string: stringFacts }).strict();
@@ -330,6 +326,17 @@ const resultSchemas = {
   address_to_file_offset: z.strictObject({
     address: nativeAddressObservationSchema,
     file_offset: z.int().min(0).max(Number.MAX_SAFE_INTEGER),
+    provider_file_offset: z
+      .int()
+      .min(0)
+      .max(Number.MAX_SAFE_INTEGER)
+      .optional(),
+    image_base_file_offset: z
+      .int()
+      .min(0)
+      .max(Number.MAX_SAFE_INTEGER)
+      .optional(),
+    source_path: z.string().optional(),
   }),
   address_name: z.string().nullable(),
   list_documents: z.array(z.string().min(1)).length(1),

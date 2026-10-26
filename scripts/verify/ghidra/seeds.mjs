@@ -179,6 +179,24 @@ try {
     disabled,
   );
 
+  const optional = await runHeadless(target, "analyzer-regression-optional", [
+    "-preScript",
+    "ReaGhidraAnalysisOptions.java",
+    "-",
+    `${analyzer},REA Missing Console Preset`,
+    "-postScript",
+    "ReaAnalyzerOptionsRegressionProbe.java",
+    analyzer,
+  ]);
+  assert.ok(
+    optional.includes(`REA_ANALYZER_OPTIONS_DISABLED_OK ${analyzer}`),
+    optional,
+  );
+  assert.ok(
+    !optional.includes('"format":"rea-ghidra-disabled-analyzers-v1"'),
+    optional,
+  );
+
   // Installed, but Ghidra registers it only for Objective-C 2 Mach-O programs.
   const formatSpecificAnalyzer = "Objective-C Message Analyzer";
   const notApplicable = await runHeadless(

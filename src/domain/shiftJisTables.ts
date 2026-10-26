@@ -8,14 +8,6 @@ const SJIS_LEAD_RANGES: readonly (readonly [number, number])[] = [
   [0xe0, 0xfc],
 ];
 
-/** Whether a byte can start a two-byte Shift-JIS character. */
-export const isSjisLeadByte = (b: number): boolean =>
-  (b >= 0x81 && b <= 0x9f) || (b >= 0xe0 && b <= 0xfc);
-
-/** Whether a byte can end a two-byte Shift-JIS character. */
-export const isSjisTrailByte = (b: number): boolean =>
-  b >= 0x40 && b <= 0xfc && b !== 0x7f;
-
 /** Character → Shift-JIS bytes, preferring the first (lowest) code. */
 export const getSjisEncodeMap = (): ReadonlyMap<string, Uint8Array> => {
   if (cachedEncodeMap !== undefined) return cachedEncodeMap;

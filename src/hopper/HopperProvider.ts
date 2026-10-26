@@ -17,10 +17,7 @@ import type {
 } from "../application/AnalysisProvider.js";
 import type { AnalysisProfileCommitment } from "../domain/analysisProfile.js";
 import type { AppConfig } from "../config/types.js";
-import {
-  isElfMetadataArchitecture,
-  type BinaryTarget,
-} from "../domain/binaryTargetTypes.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import { isConsoleTargetFormat } from "../domain/consoleRom.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type { Logger } from "pino";

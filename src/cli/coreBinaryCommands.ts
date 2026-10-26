@@ -31,8 +31,8 @@ import {
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import { javascriptApplicationOptions } from "../cliObservationOptions.js";
 import { AnalysisInputError } from "../domain/analysisErrorCore.js";
-import { localPathStringSchema } from "../domain/localPath.js";
 import type { ExecutableFormatHint } from "../domain/dosCom.js";
+import { localPathStringSchema } from "../domain/localPath.js";
 import { absoluteCallerPath } from "../filesystem/callerPath.js";
 import { registerDecompileDirectoryCommand } from "./decompileDirectoryCommand.js";
 
