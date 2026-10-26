@@ -3,6 +3,8 @@ import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import type { WebExecution } from "../../domain/webExecution.js";
 import type { CdpEvent } from "../CdpConnection.js";
 import type { CdpRuntimeSession } from "./CdpRuntimeSession.js";
+import { BrowserObservationError } from "../../domain/browserObservationError.js";
+import { cdpFrameIdentity } from "../CdpCaptureEventHelpers.js";
 
 type EndReason = WebExecution["window"]["end_reason"];
 /** One finite document-scoped window, with an actual armed point and event-driven termination. */
@@ -23,25 +25,41 @@ export class CdpExecutionWindow {
 
   /** Collection ends on a main-document replacement, never follows source URLs into another context. */
   ingest(event: CdpEvent): void {
-    if (
-      event.method === "Target.detachedFromTarget" ||
-      event.method === "Inspector.targetCrashed"
-    ) {
+    if (event.method === "Target.detachedFromTarget") {
+      this.end("session_detached");
+      return;
+    }
+    if (event.method === "Inspector.targetCrashed") {
       this.end("target_terminated");
       return;
     }
     if (!this.active) return;
     if (event.method === "Runtime.executionContextsCleared")
       this.end("document_changed");
-    if (
-      event.method === "Page.frameNavigated" &&
-      typeof event.params === "object" &&
-      event.params !== null &&
-      "frame" in event.params
-    ) {
-      const frame = event.params.frame;
-      if (typeof frame === "object" && frame !== null && !("parentId" in frame))
+    if (event.method === "Page.frameNavigated") {
+      const identity = cdpFrameIdentity(event, this.session.target.frame_id);
+      if (identity.identityIssue !== null || identity.parentIssue !== null) {
+        this.fail(
+          new BrowserObservationError(this.session.operation, "protocol_error"),
+        );
+        return;
+      }
+      if (identity.selection === "main") {
         this.end("document_changed");
+        return;
+      }
+      if (identity.parentRelation === "child") return;
+      if (
+        identity.selection === "other" &&
+        identity.parentRelation === "root"
+      ) {
+        this.end("document_changed");
+        return;
+      }
+      this.fail(
+        new BrowserObservationError(this.session.operation, "protocol_error"),
+      );
+      return;
     }
     if (
       event.method === "Page.frameDetached" &&
@@ -84,7 +102,7 @@ export class CdpExecutionWindow {
     });
   }
 
-  /** Transport loss ends the window; instrumentation cleanup still requires confirmation. */
+  /** A producer lifecycle fact ends the window; instrumentation cleanup still requires confirmation. */
   end(reason: EndReason): void {
     if (this.reason !== undefined || this.#failure !== undefined) return;
     this.reason = reason;

@@ -23,6 +23,7 @@ import {
   validateArtifactInventorySubject,
   parseArtifactInspectionInventoryResult,
   parseArtifactInventoryResult,
+  ArtifactInventoryValidationError,
   type InventorySet,
 } from "../artifactInventoryEvidence.js";
 import type { ArtifactInspectionResult } from "../artifactInspection.js";
@@ -35,6 +36,7 @@ import {
   completeWithinViewCoverage,
   pageViewCoverage,
 } from "./analysisViewCoverage.js";
+import { analysisViewResultInputError } from "./analysisViewParent.js";
 
 const page = {
   kind: z.literal("inventory"),
@@ -51,6 +53,9 @@ export const artifactInventoryViewRequestSchema = z.discriminatedUnion(
       collection: z.literal("occurrences"),
       occurrence_ids: z.array(prefixedDigestSchema("occ")).optional(),
       logical_paths: z.array(z.string()).optional(),
+      entry_kinds: z
+        .array(artifactOccurrenceSchema.shape.entry_kind)
+        .optional(),
       fields: z.array(artifactOccurrenceSchema.keyof()).optional(),
     }),
     z.strictObject({
@@ -104,6 +109,7 @@ export const artifactInventorySummarySchema = z.strictObject({
     directory: z.number().int().nonnegative(),
     symlink: z.number().int().nonnegative(),
     slice: z.number().int().nonnegative(),
+    metadata: z.number().int().nonnegative().exactOptional(),
   }),
   source_complete: z.boolean(),
   inventory_evidence_ids: z.array(prefixedDigestSchema("ev")).min(1),
@@ -117,10 +123,13 @@ export const artifactInventorySummarySchema = z.strictObject({
   limitation_count: z.number().int().nonnegative(),
 });
 
-const inputError = (message: string): AnalysisInputError =>
+const inputError = (
+  field: "source" | "view",
+  message: string,
+): AnalysisInputError =>
   new AnalysisInputError("inspect_analysis_view", undefined, [
     {
-      path: ["source"],
+      path: [field],
       reason: "invalid_value",
       message,
     },
@@ -140,6 +149,7 @@ interface InventorySource {
   index?: {
     byId: ReadonlyMap<string, number>;
     byPath: ReadonlyMap<string, readonly number[]>;
+    byKind: ReadonlyMap<ArtifactOccurrence["entry_kind"], readonly number[]>;
   };
   counts?: InventoryCounts;
 }
@@ -167,7 +177,7 @@ const parseSource = (
         cached.source.inventory.manifest,
       );
     } catch (cause: unknown) {
-      return sourceFailure(cause);
+      return sourceFailure(parent.normalizedResult, cause);
     }
     return ok(cached.source);
   }
@@ -203,14 +213,18 @@ const parseSourceUncached = (
       inspection: parsed.inspection,
     });
   } catch (cause: unknown) {
-    return sourceFailure(cause);
+    return sourceFailure(parent.normalizedResult, cause);
   }
 };
 
-const sourceFailure = (cause: unknown): Result<never, AnalysisError> => {
-  if (!(cause instanceof TypeError) && !(cause instanceof z.ZodError))
-    throw cause;
-  return err(inputError(cause.message));
+const sourceFailure = (
+  input: unknown,
+  cause: unknown,
+): Result<never, AnalysisError> => {
+  if (cause instanceof z.ZodError)
+    return err(analysisViewResultInputError(input, cause));
+  if (!(cause instanceof ArtifactInventoryValidationError)) throw cause;
+  return err(inputError("source", cause.message));
 };
 
 /** Project exact source records; exhausted pages cover available records, not runtime behavior. */
@@ -222,12 +236,16 @@ export const projectArtifactInventoryView = (
   if (operation !== "inventory_artifact" && operation !== "inspect_artifact")
     return err(
       inputError(
+        "source",
         "Inventory views require inventory_artifact or inspect_artifact Evidence.",
       ),
     );
   if (view.kind !== "summary" && view.kind !== "inventory")
     return err(
-      inputError("Artifact Evidence supports summary and inventory views."),
+      inputError(
+        "view",
+        "Artifact Evidence supports summary and inventory views.",
+      ),
     );
   const parsed = parseSource(parent);
   if (!parsed.ok) return parsed;
@@ -240,15 +258,15 @@ export const projectArtifactInventoryView = (
       inventory.occurrences.find((row) => row.logical_path === ".")
         ?.format_metadata ?? null;
   const rootMetadata = source.rootMetadata;
-  const includeCoverage =
-    view.kind === "inventory" || inventory.manifest.root_format === "godot-pck";
-  const sourceCoverage = includeCoverage
-    ? { source_coverage: inventory.coverage }
-    : {};
-  const counts =
-    includeCoverage || view.kind === "summary"
-      ? inventoryCounts(source)
-      : undefined;
+  // Producer traversal coverage is the owner's fact for every format; missing
+  // coverage would read as unknown, so every view carries it inline.
+  const sourceCoverage = { source_coverage: inventory.coverage };
+  const includeHashCounts =
+    view.kind === "inventory" ||
+    inventory.manifest.root_format === "godot-pck" ||
+    inventory.manifest.root_format === "pyinstaller" ||
+    inventory.manifest.root_format === "node-sea";
+  const counts = inventoryCounts(source);
   const limitations = uniqueSorted([
     ...parent.limitations,
     ...inventory.limitations,
@@ -265,14 +283,12 @@ export const projectArtifactInventoryView = (
     limitations,
     unknowns: [
       "Inventory does not establish application runtime behavior or complete format-specific analysis.",
-      ...(includeCoverage && inventory.coverage.status === "unknown"
+      ...(inventory.coverage.status === "unknown"
         ? [
             "Producer traversal coverage is unknown; missing matches do not prove source absence.",
           ]
         : []),
-      ...(includeCoverage &&
-      counts !== undefined &&
-      (counts.hashes.unavailable > 0 || counts.hashes["not-hashed"] > 0)
+      ...(counts.hashes.unavailable > 0 || counts.hashes["not-hashed"] > 0
         ? [
             "Content hashes are unknown for some recorded files; missing node IDs do not prove content absence.",
           ]
@@ -293,7 +309,6 @@ export const projectArtifactInventoryView = (
     | "unknowns"
   >;
   if (view.kind === "summary") {
-    const counts = inventoryCounts(source);
     const examined =
       inventory.nodes.length +
       inventory.occurrences.length +
@@ -309,8 +324,16 @@ export const projectArtifactInventoryView = (
           edges: inventory.edges.length,
           integrity_contradictions: inventory.integrityContradictions.length,
         },
-        observed_entry_kind_counts: counts.kinds,
-        ...(includeCoverage
+        observed_entry_kind_counts: {
+          file: counts.kinds.file,
+          directory: counts.kinds.directory,
+          symlink: counts.kinds.symlink,
+          slice: counts.kinds.slice,
+          ...(counts.kinds.metadata === 0
+            ? {}
+            : { metadata: counts.kinds.metadata }),
+        },
+        ...(includeHashCounts
           ? { available_hash_status_counts: counts.hashes }
           : {}),
         source_complete: inventory.complete,
@@ -406,7 +429,7 @@ const nodePage = (
 
 const inventoryCounts = (source: InventorySource): InventoryCounts => {
   if (source.counts !== undefined) return source.counts;
-  const kinds = { file: 0, directory: 0, symlink: 0, slice: 0 };
+  const kinds = { file: 0, directory: 0, symlink: 0, slice: 0, metadata: 0 };
   const hashes = {
     verified: 0,
     mismatched: 0,
@@ -435,27 +458,43 @@ const occurrenceIndices = (
   source: InventorySource,
   view: OccurrenceView,
 ): number[] | undefined => {
-  if (view.occurrence_ids === undefined && view.logical_paths === undefined)
+  if (
+    view.occurrence_ids === undefined &&
+    view.logical_paths === undefined &&
+    view.entry_kinds === undefined
+  )
     return undefined;
-  if (view.occurrence_ids?.length === 0 || view.logical_paths?.length === 0)
+  if (
+    view.occurrence_ids?.length === 0 ||
+    view.logical_paths?.length === 0 ||
+    view.entry_kinds?.length === 0
+  )
     return [];
   if (source.index === undefined) {
     const byId = new Map<string, number>();
     const byPath = new Map<string, number[]>();
+    const byKind = new Map<ArtifactOccurrence["entry_kind"], number[]>();
     for (const [index, row] of source.inventory.occurrences.entries()) {
       byId.set(row.occurrence_id, index);
       const existing = byPath.get(row.logical_path);
       if (existing === undefined) byPath.set(row.logical_path, [index]);
       else existing.push(index);
+      const kind = byKind.get(row.entry_kind);
+      if (kind === undefined) byKind.set(row.entry_kind, [index]);
+      else kind.push(index);
     }
-    source.index = { byId, byPath };
+    source.index = { byId, byPath, byKind };
   }
   const lookup = source.index;
   const paths =
     view.logical_paths === undefined ? undefined : new Set(view.logical_paths);
   const selected =
     view.occurrence_ids === undefined
-      ? [...(paths ?? [])].flatMap((path) => lookup.byPath.get(path) ?? [])
+      ? paths === undefined
+        ? [...new Set(view.entry_kinds)].flatMap(
+            (kind) => lookup.byKind.get(kind) ?? [],
+          )
+        : [...paths].flatMap((path) => lookup.byPath.get(path) ?? [])
       : [...new Set(view.occurrence_ids)].flatMap((id) => {
           const index = lookup.byId.get(id);
           return index === undefined ||
@@ -464,7 +503,15 @@ const occurrenceIndices = (
             ? []
             : [index];
         });
-  return selected.sort((left, right) => left - right);
+  const kinds =
+    view.entry_kinds === undefined ? undefined : new Set(view.entry_kinds);
+  return selected
+    .filter(
+      (index) =>
+        kinds === undefined ||
+        kinds.has(source.inventory.occurrences[index]!.entry_kind),
+    )
+    .sort((left, right) => left - right);
 };
 
 const nodeIndices = (

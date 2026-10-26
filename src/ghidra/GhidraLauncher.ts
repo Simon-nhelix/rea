@@ -9,7 +9,7 @@ import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
 import { mkdir, realpath } from "node:fs/promises";
 import { basename, dirname, join, posix, win32 } from "node:path";
 
-import writeFileAtomic from "write-file-atomic";
+import { writeGhidraRuntimeFile } from "./GhidraRuntimeFile.js";
 
 import { windowsPrivateRuntime } from "../windows/WindowsPrivateRuntime.js";
 import {
@@ -24,7 +24,10 @@ import { DarwinProcessOwnershipInspectionError } from "../process/DarwinProcessR
 import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { err, ok, type Result } from "../domain/result.js";
 import type { AnalysisCapturedOutput } from "../domain/analysisErrorBase.js";
-import { execFileOutputFailure } from "../process/ExecFileOutput.js";
+import {
+  execFileOutputFailure,
+  execFileFailureCapturedOutput,
+} from "../process/ExecFileOutput.js";
 import { boundedUtf8Text } from "../process/boundedUtf8Text.js";
 import { redactCapturedTransportCredential } from "../process/ProviderDiagnosticRedaction.js";
 import {
@@ -201,19 +204,7 @@ const ghidraLaunchCommandOutput = (
     return cause.capturedOutput;
   const failure = execFileOutputFailure(cause);
   if (failure === undefined) return undefined;
-  return {
-    stdout: failure.stdout,
-    stderr: failure.stderr,
-    truncated: failure.outputTruncated,
-    ...(failure.stdoutBytes === undefined
-      ? {}
-      : { stdout_bytes: failure.stdoutBytes }),
-    ...(failure.stderrBytes === undefined
-      ? {}
-      : { stderr_bytes: failure.stderrBytes }),
-    exit_code: typeof failure.code === "number" ? failure.code : null,
-    signal: failure.signal,
-  };
+  return execFileFailureCapturedOutput(failure);
 };
 
 /** Static coordinates for an extracted Ghidra release and packaged script. */
@@ -237,12 +228,20 @@ export interface GhidraHeadlessLauncherOptions {
     readonly entryPoint: string;
   };
   readonly consoleRom?: ConsoleTargetAdmission;
+  /** GameCube DOL import: committed language and the canonical section table text. */
+  readonly gamecubeDol?: {
+    readonly languageId: string;
+    readonly compilerSpecId?: string;
+    readonly sectionFile: string;
+  };
   /** Explicit import language committed by the analysis profile. */
   readonly languageOverride?: GhidraLanguageOverride;
   /** Auto-analyzers disabled before default auto-analysis, as configured. */
   readonly disabledAnalyzers?: readonly string[];
   /** Analyzers disabled only when the program has them (console preset). */
   readonly optionalDisabledAnalyzers?: readonly string[];
+  /** Per-function native decompiler limit passed to the bridge; absent is unbounded. */
+  readonly decompileTimeoutSeconds?: number;
   /** Caller seeds committed by the analysis profile, applied before analysis. */
   readonly analysisSeeds?: GhidraSeedCommitment;
   readonly analysisExtensions?: readonly GhidraExtension[];
@@ -331,6 +330,7 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
         );
       }
       let seedPath: string | undefined;
+      let gamecubeDolSectionPath: string | undefined;
       let extensions: readonly GhidraExtension[] = [];
       if (
         this.options.analysisSeeds !== undefined ||
@@ -364,12 +364,28 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
           target_sha256: session.targetSha256,
           provider_version: session.providerVersion,
           profile_digest: session.profileDigest,
+          ...(this.options.decompileTimeoutSeconds === undefined
+            ? {}
+            : {
+                decompile_timeout_seconds: this.options.decompileTimeoutSeconds,
+              }),
           ...(extensions.length === 0
             ? {}
             : { analysis_extensions: extensions }),
         })}\n`,
         platform,
       );
+      if (this.options.gamecubeDol !== undefined) {
+        gamecubeDolSectionPath = join(
+          dirname(paths.descriptorPath),
+          "gamecube-dol-sections.txt",
+        );
+        await writeGhidraRuntimeFile(
+          gamecubeDolSectionPath,
+          this.options.gamecubeDol.sectionFile,
+          platform,
+        );
+      }
       if (isAborted(options.signal))
         return err(
           new AnalysisCancelledError("open_binary", {
@@ -406,6 +422,20 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
                 compilerSpecId: this.options.consoleRom.compilerSpecId,
                 baseAddr: this.options.consoleRom.loadBase,
                 specPath: paths.consoleSpecPath,
+              },
+            }),
+        ...(this.options.gamecubeDol === undefined ||
+        gamecubeDolSectionPath === undefined
+          ? {}
+          : {
+              gamecubeDol: {
+                languageId: this.options.gamecubeDol.languageId,
+                ...(this.options.gamecubeDol.compilerSpecId === undefined
+                  ? {}
+                  : {
+                      compilerSpecId: this.options.gamecubeDol.compilerSpecId,
+                    }),
+                sectionFilePath: gamecubeDolSectionPath,
               },
             }),
         ...(this.options.languageOverride === undefined
@@ -454,6 +484,10 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
           : { javaVmName: this.options.javaVmName }),
         homeRoot: paths.homeRoot,
         tempRoot: paths.tempRoot,
+        argumentFileRoot: session.runtimeRoot,
+        ...(options.resourceScope === undefined
+          ? {}
+          : { resourceScope: options.resourceScope }),
         arguments: headlessArguments,
         environment,
         onStderr: (mode, stderr) => {
@@ -484,7 +518,18 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
           : inspectedJavaLaunch.configuredMaxHeap;
       const command =
         platform === "win32"
-          ? { ...scriptCommand, environment }
+          ? {
+              ...scriptCommand,
+              environment: {
+                ...environment,
+                ...(inspectedJavaLaunch.preparedJdkJavaOptions === undefined
+                  ? {}
+                  : {
+                      JDK_JAVA_OPTIONS:
+                        inspectedJavaLaunch.preparedJdkJavaOptions,
+                    }),
+              },
+            }
           : inspectedJavaLaunch;
       started = await (this.options.spawnProcess ?? spawnOwnedProviderProcess)({
         command: command.command,
@@ -727,6 +772,11 @@ export interface GhidraHeadlessArgumentOptions {
     readonly baseAddr: string;
     readonly specPath: string;
   };
+  readonly gamecubeDol?: {
+    readonly languageId: string;
+    readonly compilerSpecId?: string;
+    readonly sectionFilePath: string;
+  };
   readonly languageOverride?: GhidraLanguageOverride;
   /** Auto-analyzers disabled by the pre-analysis options script. */
   readonly disabledAnalyzers?: readonly string[];
@@ -748,6 +798,20 @@ export const ghidraHeadlessArguments = (
   const override = options.languageOverride;
   const rawBinary = options.rawBinary;
   const consoleRom = options.consoleRom;
+  const gamecubeDol = options.gamecubeDol;
+  if (
+    gamecubeDol !== undefined &&
+    (options.psp === true ||
+      options.dosMz === true ||
+      options.dosCom === true ||
+      options.mipsSoftFloat === true ||
+      rawBinary !== undefined ||
+      consoleRom !== undefined ||
+      override !== undefined)
+  )
+    throw new Error(
+      "A GameCube DOL import cannot be combined with another loader, language override, or analysis lane; its language is committed in the gamecubeDol option.",
+    );
   if (
     options.psp === true &&
     (options.dosMz === true ||
@@ -794,21 +858,23 @@ export const ghidraHeadlessArguments = (
     "rea-project",
     "-import",
     options.targetPath,
-    ...(options.dosMz === true
+    ...(gamecubeDol !== undefined
       ? [
+          // One BinaryLoader block at file offset 0; the pre-script rebuilds the DOL section map.
           "-loader",
-          "MzLoader",
+          "BinaryLoader",
+          "-loader-baseAddr",
+          "0x0",
           "-processor",
-          "x86:LE:16:Real Mode",
-          "-cspec",
-          "default",
+          gamecubeDol.languageId,
+          ...(gamecubeDol.compilerSpecId === undefined
+            ? []
+            : ["-cspec", gamecubeDol.compilerSpecId]),
         ]
-      : options.dosCom === true
+      : options.dosMz === true
         ? [
             "-loader",
-            "BinaryLoader",
-            "-loader-baseAddr",
-            "1000:0100",
+            "MzLoader",
             "-processor",
             "x86:LE:16:Real Mode",
             "-cspec",
@@ -838,35 +904,46 @@ export const ghidraHeadlessArguments = (
                 "-cspec",
                 consoleRom.compilerSpecId,
               ]
-          : rawBinary === undefined
-            ? options.psp === true
-              ? [
-                  "-loader",
-                  "PspElfLoader",
-                  "-processor",
-                  "Allegrex:LE:32:default",
-                  "-cspec",
-                  "default",
-                ]
-              : override !== undefined
-                ? [
-                    "-processor",
-                    override.languageId,
-                    ...(override.compilerSpecId === undefined
-                      ? []
-                      : ["-cspec", override.compilerSpecId]),
-                  ]
-                : []
-            : [
+          : options.dosCom === true
+            ? [
                 "-loader",
                 "BinaryLoader",
                 "-loader-baseAddr",
-                rawBinary.baseAddr,
+                "1000:0100",
                 "-processor",
-                rawBinary.languageId,
+                "x86:LE:16:Real Mode",
                 "-cspec",
-                rawBinary.compilerSpecId,
-              ]),
+                "default",
+              ]
+            : rawBinary === undefined
+              ? options.psp === true
+                ? [
+                    "-loader",
+                    "PspElfLoader",
+                    "-processor",
+                    "Allegrex:LE:32:default",
+                    "-cspec",
+                    "default",
+                  ]
+                : override !== undefined
+                  ? [
+                      "-processor",
+                      override.languageId,
+                      ...(override.compilerSpecId === undefined
+                        ? []
+                        : ["-cspec", override.compilerSpecId]),
+                    ]
+                  : []
+              : [
+                  "-loader",
+                  "BinaryLoader",
+                  "-loader-baseAddr",
+                  rawBinary.baseAddr,
+                  "-processor",
+                  rawBinary.languageId,
+                  "-cspec",
+                  rawBinary.compilerSpecId,
+                ]),
     "-readOnly",
     "-deleteProject",
     "-log",
@@ -897,6 +974,13 @@ export const ghidraHeadlessArguments = (
           scriptPath.join(bridgeDirectory, "ReaGhidraPrepareConsole.java"),
           consoleRom.specPath,
           ...(options.seedPath === undefined ? [] : [options.seedPath]),
+        ]),
+    ...(gamecubeDol === undefined
+      ? []
+      : [
+          "-preScript",
+          scriptPath.join(bridgeDirectory, GHIDRA_BRIDGE_SOURCES.prepareDol),
+          gamecubeDol.sectionFilePath,
         ]),
     // Console preparation owns map/default-context -> seeds -> entry decode.
     // Other loaders apply their seeds here before default auto-analysis.
@@ -1009,18 +1093,6 @@ const createGhidraRuntimeDirectories = async (
       join(paths.configRoot, "ghidra", configReleaseDirectory),
     ].map((path) => mkdir(path, { recursive: true, mode: 0o700 })),
   );
-};
-
-const writeGhidraRuntimeFile = async (
-  path: string,
-  content: string,
-  platform: NodeJS.Platform,
-): Promise<void> => {
-  if (platform === "win32") {
-    windowsPrivateRuntime(dirname(path)).writeFile(basename(path), content);
-    return;
-  }
-  await writeFileAtomic(path, content, { encoding: "utf8", mode: 0o600 });
 };
 
 const ghidraLaunchEnvironment = (

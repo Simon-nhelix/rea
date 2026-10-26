@@ -20,7 +20,10 @@ export const isGhidraPspTarget = (target: BinaryTarget): boolean =>
 export const ghidraProcessorUnsupportedReason = (
   target: BinaryTarget,
 ): string | null => {
-  if (target.kind === "executable" && isConsoleTargetFormat(target.format))
+  if (
+    target.kind === "executable" &&
+    (isConsoleTargetFormat(target.format) || target.format === "gamecube-dol")
+  )
     return null;
   if (target.kind === "executable" && target.architecture === "powerpc")
     return ghidraPowerPcUnsupportedReason(target);

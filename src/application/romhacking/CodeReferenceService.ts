@@ -9,7 +9,7 @@ import {
 } from "../../domain/analysisErrorCore.js";
 import { createEvidence, type Evidence } from "../../domain/evidence.js";
 import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
-import { jsonValueSchema, type JsonValue } from "../../domain/jsonValue.js";
+import type { JsonValue } from "../../domain/jsonValue.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import {
   findCodeReferencesInputSchema,
@@ -604,7 +604,7 @@ export class CodeReferenceService {
       createEvidence(undefined, ROM_CODE_REFERENCE_PROVIDER_IDENTITY, {
         operation: OPERATION,
         parameters: evidenceParameters(input, kinds),
-        result: jsonValueSchema.parse(validated),
+        result: validated,
         confidence: "derived",
         subjectUnavailableReason: `Evidence covers ${regions.length} region(s) across ${input.files.length} file(s); each region's SHA-256 is in result.files.`,
         locations: input.files.map((file) => ({

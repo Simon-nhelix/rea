@@ -1,10 +1,8 @@
-import { isAbsolute } from "node:path";
 import type { ExecutionOptions } from "../AnalysisProvider.js";
 import type { PeResourcesPort } from "./PeResourcesPort.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import {
   AnalysisCancelledError,
-  AnalysisInputError,
   AnalysisOutputError,
 } from "../../domain/analysisErrorCore.js";
 import { createEvidence, type Evidence } from "../../domain/evidence.js";
@@ -15,11 +13,7 @@ import {
   type PeResourceIdentity,
 } from "../../domain/native/peResources.js";
 import { analysisInputErrorFromIssues } from "../../domain/inputIssueProjection.js";
-import {
-  decodePeMachine,
-  peOptionalHeaderMagic,
-  type PeArchitecture,
-} from "../../domain/peMachine.js";
+import { peSubjectArchitecture } from "../../domain/peMachine.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import { completeProviderEvidence } from "../ProviderOperationExecution.js";
 
@@ -47,16 +41,6 @@ export class PeResourcesService {
           cause: input.error,
         }),
       );
-    if (!isAbsolute(input.data.path))
-      return err(
-        new AnalysisInputError(operation, undefined, [
-          {
-            path: ["path"],
-            reason: "invalid_format",
-            message: "Expected an absolute filesystem path on this host.",
-          },
-        ]),
-      );
     const result = await this.provider.inspect(input.data, options);
     if (!result.ok) return result;
     const report = peResourcesSchema.safeParse(result.value);
@@ -76,7 +60,7 @@ export class PeResourcesService {
         ),
       );
     const value = report.data;
-    const architecture = subjectArchitecture(value);
+    const architecture = peSubjectArchitecture(value.machine, value.format);
     return completeProviderEvidence(
       createEvidence(
         {
@@ -100,23 +84,6 @@ export class PeResourcesService {
   }
 }
 
-/**
- * Name the subject architecture from the reported COFF machine. The resource
- * reader does not inspect the CLI header, so a ReadyToRun OS-override machine
- * needs separate proof. An optional-header magic that contradicts the machine
- * is observed conflicting evidence. Both stay unknown.
- */
-const subjectArchitecture = (
-  report: PeResources,
-): PeArchitecture | undefined => {
-  const machine = decodePeMachine(report.machine);
-  if (machine === undefined || machine.nativeOsOverride) return undefined;
-  const magic = report.format === "pe32-plus" ? 0x20b : 0x10b;
-  return magic === peOptionalHeaderMagic(machine.architecture)
-    ? machine.architecture
-    : undefined;
-};
-
 /** Check cross-field invariants before provider output becomes public Evidence. */
 const validReport = (
   report: PeResources,
@@ -125,6 +92,8 @@ const validReport = (
 ): boolean => {
   const inside = ({ offset, bytes }: { offset: number; bytes: number }) =>
     offset <= report.artifact.bytes - bytes;
+  const identityInside = (identity: PeResourceIdentity): boolean =>
+    identity.kind === "id" || inside(identity.location);
   if (
     report.artifact.bytes > maxBytes ||
     report.coverage.resources !== report.resources.length ||
@@ -147,7 +116,16 @@ const validReport = (
       !inside(report.directory.data_directory_location))
   )
     return false;
-  if (!report.directories.every((item) => inside(item.location))) return false;
+  if (
+    !report.directories.every(
+      (item) =>
+        inside(item.location) &&
+        item.path.length === item.entry_locations.length &&
+        item.entry_locations.every(inside) &&
+        item.path.every(identityInside),
+    )
+  )
+    return false;
   if (
     !report.resources.every(
       (item, index) =>
@@ -155,9 +133,7 @@ const validReport = (
         inside(item.data_entry_location) &&
         inside(item.payload.location) &&
         item.entry_locations.every(inside) &&
-        [item.type, item.name, item.language].every(
-          (identity) => identity.kind === "id" || inside(identity.location),
-        ),
+        [item.type, item.name, item.language].every(identityInside),
     )
   )
     return false;

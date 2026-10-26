@@ -21,8 +21,8 @@ import {
 import { inspectVerifierGhidraInstallation } from "./lib/ghidra-installation-inspection.mjs";
 import { SUPPORTED_GHIDRA_VERSION } from "../dist/ghidra/GhidraReleasePolicy.js";
 import { GhidraHeadlessLauncher } from "../dist/ghidra/GhidraLauncher.js";
-import { GHIDRA_PROVIDER_IDENTITY } from "../dist/ghidra/GhidraProviderCapabilities.js";
 import {
+  GHIDRA_PROVIDER_IDENTITY,
   WINDOWS_P0_NATIVE_PE_ARCHITECTURES,
   windowsP0Capabilities,
 } from "../dist/ghidra/GhidraProviderCapabilities.js";
@@ -378,7 +378,7 @@ async function inventory(operation, parameters) {
   const result = parseGhidraInventoryResult(operation, called.value);
   if (!result.ok) throw result.error;
   observed.add(operation);
-  return result.value;
+  return result.value.value;
 }
 
 async function functionOperation(operation, parameters) {

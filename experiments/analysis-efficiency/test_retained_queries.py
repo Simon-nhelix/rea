@@ -111,6 +111,23 @@ assert.deepEqual((await saved()).failure,originalFailure);
 assert.deepEqual(JSON.parse(chunks.join('')),report);
 ''')
 
+    def test_transcript_failure_cannot_skip_cleanup_or_lose_original_failure(self):
+        self.run_finalization('''
+await mkdir(join(output,'transcript.json'));
+const closed=[];
+assert.equal(await finalizeRetainedQueryReceipt({...input,transcript:[{phase:'page'}],
+  client:{close:async()=>{closed.push('client');}},
+  transport:{close:async()=>{closed.push('transport');}}}),false);
+assert.deepEqual(closed,['client','transport']);
+assert.equal(serverLog.writableEnded,true);
+await assert.rejects(stat(account),error=>error.code==='ENOENT');
+assert.deepEqual(report.cleanup_failures,[]);
+assert.match(report.receipt_failures[0],/^transcript-file:/);
+assert.strictEqual(report.failure,originalFailure);
+assert.equal(report.calls[0].elapsed_ms,17);
+assert.deepEqual(await saved(),report);assert.deepEqual(JSON.parse(chunks.join('')),report);
+''')
+
     def test_report_file_refusal_preserves_the_stdout_receipt(self):
         self.run_finalization('''
 await mkdir(join(output,'report.json'));
@@ -163,4 +180,24 @@ assert.match(report.cleanup_failures[0],/client:.*close failed/);
 assert.equal(report.retained_workspace,account);assert.equal(serverLog.writableEnded,true);
 assert.equal((await stat(account)).isDirectory(),true);
 assert.deepEqual(await saved(),report);assert.deepEqual(JSON.parse(chunks.join('')),report);
+''')
+
+    def test_setup_failure_without_acquired_resources_still_publishes_receipts(self):
+        self.run_finalization('''
+assert.equal(await finalizeRetainedQueryReceipt({report,output,stdout,transcript:[]}),true);
+assert.deepEqual(report.cleanup_failures,[]);
+assert.deepEqual((await saved()).failure,originalFailure);
+assert.deepEqual(JSON.parse(await readFile(join(output,'transcript.json'),'utf8')),[]);
+assert.ok((await stat(account)).isDirectory());
+''')
+
+    def test_partial_setup_closes_acquired_transport_and_releases_its_workspace(self):
+        self.run_finalization('''
+let closed=0;
+assert.equal(await finalizeRetainedQueryReceipt({report,output,stdout,account,
+  transport:{close:async()=>{closed++;}}}),true);
+assert.equal(closed,1);
+await assert.rejects(stat(account),{code:'ENOENT'});
+assert.deepEqual((await saved()).failure,originalFailure);
+assert.deepEqual(report.cleanup_failures,[]);
 ''')

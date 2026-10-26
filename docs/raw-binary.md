@@ -1,5 +1,8 @@
 # Headerless raw-binary analysis with Ghidra
 
+Headerless images are covered here. GameCube/Wii DOL images have a header and
+use their own format selection; see [GameCube DOL analysis](ghidra-dol.md).
+
 REA admits a headerless executable or memory snapshot when the caller supplies
 the CPU family, load address and entry point. That interpretation is not
 inferred from a `.bin` suffix or from unrecognized bytes.

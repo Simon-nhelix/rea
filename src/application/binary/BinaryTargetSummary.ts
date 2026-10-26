@@ -13,7 +13,9 @@ export const binaryTargetSummary = (target: BinaryTarget) => ({
   ...(target.format === "raw-binary"
     ? { load_address: target.loadAddress }
     : {}),
-  ...(target.format === "raw-binary" || isConsoleBinaryTarget(target)
+  ...(target.format === "raw-binary" ||
+  target.format === "gamecube-dol" ||
+  isConsoleBinaryTarget(target)
     ? { entry_point: target.entryPoint }
     : {}),
 });

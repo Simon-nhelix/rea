@@ -6,6 +6,7 @@ import {
   AnalysisOutputError,
   AnalysisCapabilityUnavailableError,
   AnalysisResourceConstraintError,
+  resourceConstraintRecovery,
   AnalysisCancelledError,
   AnalysisTimeoutError,
 } from "./analysisErrorCore.js";
@@ -41,6 +42,10 @@ export const redactExplicitFailure = (
 ): AnalysisError => {
   if (values.length === 0) return error;
   const redacted = redactFailure(error, values);
+  // Observation owners already apply format-aware exclusions. Keep their facts
+  // and identity across every diagnostic replacement, including input/capacity.
+  if (redacted !== error && error.partialObservation !== undefined)
+    redacted.retainPartialObservation(error.partialObservation);
   return redacted === error
     ? error
     : mirrorCleanup(error, redacted, (value) =>
@@ -88,6 +93,7 @@ const redactFailure = (
   };
   const context = {
     cause: error,
+    ...(error.limit === undefined ? {} : { limit: error.limit }),
     ...(error.cleanupPrimary === undefined
       ? {}
       : {
@@ -118,12 +124,16 @@ const redactFailure = (
     return new AnalysisCancelledError(error.operation, {
       ...context,
       cause: error.cause,
-      partialObservation: error.partialObservation,
     });
   if (error instanceof AnalysisTimeoutError)
     return new AnalysisTimeoutError(error.operation, error.timeoutMs, {
       ...context,
-      partialObservation: error.partialObservation,
+      ...(error.userMessage === undefined
+        ? {}
+        : { userMessage: text(error.userMessage) }),
+      ...(error.remediationAction === undefined
+        ? {}
+        : { remediationAction: text(error.remediationAction) }),
     });
   if (error instanceof AnalysisAccessDeniedError)
     return new AnalysisAccessDeniedError(
@@ -154,6 +164,9 @@ const redactFailure = (
         ...(issue.expected === undefined
           ? {}
           : { expected: visit(issue.expected) }),
+        ...(issue.observed === undefined
+          ? {}
+          : { observed: visit(issue.observed) }),
       })),
     );
   if (error instanceof AnalysisOutputError)
@@ -181,15 +194,7 @@ const redactFailure = (
       error.resource,
       text(error.reason),
       error.reportedLimits === null ? null : diagnostics(error.reportedLimits),
-      {
-        ...context,
-        ...(error.remediationAction === undefined
-          ? {}
-          : { remediationAction: text(error.remediationAction) }),
-        ...(error.retryable === undefined
-          ? {}
-          : { retryable: error.retryable }),
-      },
+      { ...context, ...resourceConstraintRecovery(error, text) },
     );
   if (error instanceof ProviderCleanupError)
     return new ProviderCleanupError(
@@ -199,17 +204,11 @@ const redactFailure = (
       {
         ...context,
         operation: error.operation,
-        ...(error.partialObservation === undefined
-          ? {}
-          : { partialObservation: error.partialObservation }),
       },
     );
   if (error instanceof ProviderAdapterError)
     return new ProviderAdapterError(error.providerId, error.operation, {
       ...context,
-      ...(error.partialObservation === undefined
-        ? {}
-        : { partialObservation: error.partialObservation }),
       ...(error.userMessage === undefined
         ? {}
         : { userMessage: text(error.userMessage) }),

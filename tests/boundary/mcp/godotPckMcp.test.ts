@@ -2,9 +2,11 @@ import { writeFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { Ajv2020 } from "ajv/dist/2020.js";
+import type { ValidateFunction } from "ajv";
 import { expect, it } from "vitest";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
+import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
 import { buildGodotPck } from "../../fixtures/godotPck.js";
 import { ArtifactProvider } from "../../../src/artifacts/ArtifactProvider.js";
 import { createServer } from "../../../src/server/createServer.js";
@@ -36,7 +38,59 @@ const viewValidators = async (client: Client) => {
   return { validateInput, validateOutput };
 };
 
-it("validates advertised schemas, batches connected facts and reuses one retained inventory after unlink", async () => {
+const retainedInventoryView =
+  (
+    client: Client,
+    evidenceId: string,
+    validators: Awaited<ReturnType<typeof viewValidators>>,
+  ) =>
+  async (query: Record<string, unknown>) => {
+    const arguments_ = {
+      source: { kind: "retained-evidence", evidence_id: evidenceId },
+      view: { kind: "inventory", ...query },
+    };
+    expect(
+      validators.validateInput(arguments_),
+      JSON.stringify(validators.validateInput.errors),
+    ).toBe(true);
+    const reply = await client.callTool({
+      name: "inspect_analysis_view",
+      arguments: arguments_,
+    });
+    expect(reply.isError, JSON.stringify(reply.structuredContent)).not.toBe(
+      true,
+    );
+    expect(
+      validators.validateOutput(reply.structuredContent),
+      JSON.stringify(validators.validateOutput.errors),
+    ).toBe(true);
+    const evidence = parseEvidence(reply.structuredContent);
+    expect(evidence.evidence_links).toContain(evidenceId);
+    return analysisViewResultSchema.parse(evidence.normalized_result);
+  };
+
+const assertInvalidNodeField = async (
+  client: Client,
+  evidenceId: string,
+  validateFullInput?: ValidateFunction,
+) => {
+  const arguments_ = {
+    source: { kind: "retained-evidence", evidence_id: evidenceId },
+    view: { kind: "inventory", collection: "nodes", fields: ["logical_path"] },
+  };
+  if (validateFullInput !== undefined)
+    expect(validateFullInput(arguments_)).toBe(false);
+  const rejected = await client.callTool({
+    name: "inspect_analysis_view",
+    arguments: arguments_,
+  });
+  expect(parseMcpToolError(rejected)).toMatchObject({
+    error: { code: "invalid_request", category: "invalid_input" },
+  });
+};
+
+const profiles = ["full", "compact"] as const;
+it.each(profiles)("reuses retained PCK inventory (%s)", async (profile) => {
   const root = await createTestTempDirectory("rea-pck-mcp-");
   const path = join(root, "game.pck");
   await writeFile(
@@ -47,14 +101,19 @@ it("validates advertised schemas, batches connected facts and reuses one retaine
     ]),
   );
   const session = createTestBinarySession(new ArtifactProvider({}));
-  const server = createServer({ kind: "session", session });
+  const server = createServer(
+    { kind: "session", session },
+    {
+      environment: { ...process.env, REA_MCP_INPUT_SCHEMA_PROFILE: profile },
+    },
+  );
   const client = new Client({ name: "pck-contract-test", version: "1" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
   try {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
-    const { validateInput, validateOutput } = await viewValidators(client);
+    const validators = await viewValidators(client);
     expect(
       (await client.callTool({ name: "open_binary", arguments: { path } }))
         .isError,
@@ -88,46 +147,22 @@ it("validates advertised schemas, batches connected facts and reuses one retaine
       session.evidenceForAnalysis(nested.evidence_id)?.normalized_result,
     ).toBe(nested.normalized_result);
     const graph = nested.normalized_result;
-    const source = {
-      kind: "retained-evidence",
-      evidence_id: parent.evidence_id,
-    };
-    const view = async (query: Record<string, unknown>) => {
-      const arguments_ = { source, view: { kind: "inventory", ...query } };
-      expect(
-        validateInput(arguments_),
-        JSON.stringify(validateInput.errors),
-      ).toBe(true);
-      const reply = await client.callTool({
-        name: "inspect_analysis_view",
-        arguments: arguments_,
-      });
-      expect(reply.isError, JSON.stringify(reply.structuredContent)).not.toBe(
-        true,
-      );
-      expect(
-        validateOutput(reply.structuredContent),
-        JSON.stringify(validateOutput.errors),
-      ).toBe(true);
-      const evidence = parseEvidence(reply.structuredContent);
-      expect(evidence.evidence_links).toContain(parent.evidence_id);
-      return analysisViewResultSchema.parse(evidence.normalized_result);
-    };
-    expect(
-      validateInput({
-        source,
-        view: {
-          kind: "inventory",
-          collection: "nodes",
-          fields: ["logical_path"],
-        },
-      }),
-    ).toBe(false);
+    const view = retainedInventoryView(client, parent.evidence_id, validators);
+    await assertInvalidNodeField(
+      client,
+      parent.evidence_id,
+      profile === "full" ? validators.validateInput : undefined,
+    );
     const wanted = graph.occurrences.filter((row) => row.logical_path !== ".");
     const occurrences = await view({
       collection: "occurrences",
       logical_paths: wanted.map((row) => row.logical_path),
-      fields: ["logical_path", "declared_integrity", "format_metadata"],
+      fields: [
+        "logical_path",
+        "source_path",
+        "declared_integrity",
+        "format_metadata",
+      ],
     });
     expect(occurrences.kind).toBe("inventory");
     if (occurrences.kind !== "inventory")
@@ -138,6 +173,7 @@ it("validates advertised schemas, batches connected facts and reuses one retaine
         artifact_id: row.artifact_id,
         parent_occurrence_id: row.parent_occurrence_id,
         logical_path: row.logical_path,
+        source_path: row.source_path,
         declared_integrity: row.declared_integrity,
         format_metadata: row.format_metadata,
       })),

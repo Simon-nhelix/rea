@@ -1,4 +1,6 @@
+import { artifactTargetRefusal } from "../../domain/apple/artifactTargetApplicability.js";
 import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
+import type { ResolvedAppBundleResourceRoot } from "../AppBundleExecutable.js";
 import { binaryTargetSummary } from "./BinaryTargetSummary.js";
 import type { JsonValue } from "../../domain/jsonValue.js";
 import type { ProviderOperationHealth } from "../../domain/providerOperationHealth.js";
@@ -17,9 +19,12 @@ import type {
   SessionProviderRouter,
 } from "./SessionProviderRouter.js";
 import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
+import type { BinarySessionDetail } from "../../contracts/sessionStatusContract.js";
 
 interface BinarySessionStatusInput {
   readonly target: BinaryTarget | undefined;
+  readonly bundleResourceRoot?: ResolvedAppBundleResourceRoot;
+  readonly resourceCapabilities?: readonly CapabilityDescriptor[];
   readonly route: SessionProviderRoute;
   readonly router: Pick<SessionProviderRouter, "candidateStatuses">;
   readonly runtimeUnavailability: ReadonlyMap<
@@ -31,12 +36,15 @@ interface BinarySessionStatusInput {
   readonly requestActivitySnapshots: readonly ProviderRequestActivitySnapshot[];
   readonly providerOperationHealth?: ProviderOperationHealth | null;
   readonly cleanupPending?: boolean;
+  readonly detail?: BinarySessionDetail;
   readonly signal?: AbortSignal;
 }
 
 /** Project internal provider routing state into the caller-visible session status. */
 export const binarySessionStatus = async ({
   target,
+  bundleResourceRoot,
+  resourceCapabilities = [],
   route,
   router,
   runtimeUnavailability,
@@ -45,14 +53,30 @@ export const binarySessionStatus = async ({
   requestActivitySnapshots,
   providerOperationHealth,
   cleanupPending = false,
+  detail = "complete",
   signal,
 }: BinarySessionStatusInput): Promise<JsonValue> => {
-  const routeCapabilities = [...route.capabilities.values()]
+  const routeCapabilities = (
+    bundleResourceRoot === undefined
+      ? [...route.capabilities.values()]
+      : [...resourceCapabilities]
+  )
     .filter(({ operation }) => operation !== "inventory_artifact")
     .sort((left, right) =>
       compareUnicodeCodePoints(left.operation, right.operation),
     )
     .map((descriptor) => {
+      const targetRefusal =
+        target === undefined
+          ? undefined
+          : artifactTargetRefusal(descriptor.operation, target);
+      if (targetRefusal !== undefined && descriptor.available)
+        return {
+          ...descriptor,
+          available: false as const,
+          availabilityCode: targetRefusal.code,
+          reason: targetRefusal.reason,
+        };
       const unavailable = runtimeUnavailability.get(descriptor.operation);
       return unavailable === undefined
         ? descriptor
@@ -64,29 +88,43 @@ export const binarySessionStatus = async ({
     });
   const capabilities = providerCapabilitySets(routeCapabilities);
   const analysisProviderBinding =
-    route.binding === null
+    bundleResourceRoot !== undefined
       ? null
-      : {
-          provider: providerSummary(route.binding.identity),
-          selection_source: route.binding.selectionSource,
-          analysis_profile: structuredClone(route.binding.profile),
-        };
-  const analysisProviderCandidates = (
-    await router.candidateStatuses(route, signal)
-  ).map((candidate) => ({
-    provider: providerSummary(candidate.provider),
-    availability: structuredClone(candidate.availability),
-    target_support: structuredClone(candidate.targetSupport),
-    selected: candidate.selected,
-    capabilities: providerCapabilitySets(
-      candidate.capabilities
-        .slice()
-        .filter(({ operation }) => operation !== "inventory_artifact")
-        .sort((left, right) =>
-          compareUnicodeCodePoints(left.operation, right.operation),
-        ),
-    ),
-  }));
+      : route.binding === null
+        ? null
+        : {
+            provider: providerSummary(route.binding.identity),
+            selection_source: route.binding.selectionSource,
+            analysis_profile: structuredClone(route.binding.profile),
+          };
+  const analysisProviderCandidates =
+    bundleResourceRoot !== undefined
+      ? []
+      : (await router.candidateStatuses(route, signal)).map((candidate) =>
+          detail === "summary"
+            ? {
+                provider: providerSummary(candidate.provider),
+                availability: providerStateSummary(candidate.availability),
+                target_support: providerStateSummary(candidate.targetSupport),
+                selected: candidate.selected,
+              }
+            : {
+                provider: providerSummary(candidate.provider),
+                availability: structuredClone(candidate.availability),
+                target_support: structuredClone(candidate.targetSupport),
+                selected: candidate.selected,
+                capabilities: providerCapabilitySets(
+                  candidate.capabilities
+                    .slice()
+                    .filter(
+                      ({ operation }) => operation !== "inventory_artifact",
+                    )
+                    .sort((left, right) =>
+                      compareUnicodeCodePoints(left.operation, right.operation),
+                    ),
+                ),
+              },
+        );
   const common = {
     cleanup_pending: cleanupPending,
     capabilities,
@@ -105,7 +143,20 @@ export const binarySessionStatus = async ({
     ),
   };
   return target === undefined
-    ? { open: false, ...common }
+    ? bundleResourceRoot === undefined
+      ? { open: false, ...common }
+      : {
+          open: true,
+          ...common,
+          session_kind: "bundle_resources",
+          resource_root: {
+            caller_path: bundleResourceRoot.callerPath,
+            canonical_path: bundleResourceRoot.canonicalPath,
+            info_plist_path: bundleResourceRoot.infoPlistPath,
+            layout: bundleResourceRoot.layout,
+            executable_sha256: bundleResourceRoot.executableSha256,
+          },
+        }
     : {
         open: true,
         ...common,
@@ -147,6 +198,19 @@ const requestActivityStatus = (
     providers,
   };
 };
+
+/** Keep a provider-owned status, code, and reason; diagnostics stay in complete detail. */
+const providerStateSummary = <
+  State extends {
+    readonly status: string;
+    readonly code: string | null;
+    readonly reason: string | null;
+  },
+>({
+  status,
+  code,
+  reason,
+}: State) => ({ status, code, reason });
 
 const providerSummary = ({
   id,

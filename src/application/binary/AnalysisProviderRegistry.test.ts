@@ -5,6 +5,7 @@ import {
   createAnalysisExecution,
   type AnalysisClient,
   type AnalysisProviderCandidate,
+  type AnalysisProviderInspectionOptions,
   type CapabilityDescriptor,
   type ProviderAvailability,
   type ProviderIdentity,
@@ -14,9 +15,12 @@ import { createAnalysisProfile } from "../../domain/analysisProfile.js";
 import type { BinaryTarget } from "../../domain/binaryTargetTypes.js";
 import { ProviderAdapterError } from "../../domain/providerAdapterError.js";
 import { ProviderCleanupError } from "../../domain/providerCleanupError.js";
+import {
+  AnalysisUnsupportedTargetError,
+  AnalysisCancelledError,
+} from "../../domain/analysisErrorCore.js";
 import { ProviderSelectionError } from "../../domain/providerSelectionError.js";
 import { projectAnalysisError } from "../../domain/analysisErrorProjection.js";
-import { AnalysisCancelledError } from "../../domain/analysisErrorCore.js";
 import { err, ok } from "../../domain/result.js";
 
 const DATABASE_TARGET: BinaryTarget = {
@@ -229,6 +233,51 @@ describe("inspection without deep binding", () => {
 });
 
 describe("analysis provider registry: selection failures", () => {
+  it("offers only admitted providers for ambiguous automatic selection", async () => {
+    const alpha = candidate("alpha");
+    const beta = candidate("beta");
+    const ghidra = candidate("ghidra", {
+      available: false,
+      unconfigured: true,
+    });
+    const kuna = candidate("kuna", {
+      available: false,
+      unconfigured: true,
+    });
+    const registry = new AnalysisProviderRegistry([
+      alpha.provider,
+      beta.provider,
+      ghidra.provider,
+      kuna.provider,
+    ]);
+
+    const ambiguous = await registry.select(DATABASE_TARGET);
+    expect(ambiguous.ok).toBe(false);
+    if (!ambiguous.ok)
+      expect(projectAnalysisError(ambiguous.error)).toMatchObject({
+        details: {
+          selection_reason: "ambiguous",
+          candidate_ids: ["alpha", "beta"],
+          rejections: [
+            { provider_id: "ghidra", code: "not_configured" },
+            { provider_id: "kuna", code: "not_configured" },
+          ],
+        },
+      });
+
+    for (const selected of [
+      await registry.select(DATABASE_TARGET, "alpha"),
+      await registry.select(DATABASE_TARGET, "beta"),
+    ])
+      expect(selected).toMatchObject({ ok: true });
+    expect([
+      ...alpha.created,
+      ...beta.created,
+      ...ghidra.created,
+      ...kuna.created,
+    ]).toEqual([]);
+  });
+
   it("returns actionable unknown, unavailable, and unsupported failures", async () => {
     const unavailable = candidate("alpha", { available: false });
     const registry = new AnalysisProviderRegistry([unavailable.provider]);
@@ -465,6 +514,7 @@ const candidate = (
   id: string,
   options: {
     readonly available?: boolean;
+    readonly unconfigured?: boolean;
     readonly profile?: "resolved" | "missing" | "error";
   } = {},
 ): CandidateFixture => {
@@ -488,7 +538,7 @@ const candidate = (
           }
         : {
             status: "unavailable",
-            code: "runtime_missing",
+            code: options.unconfigured ? "not_configured" : "runtime_missing",
             reason: `${id} runtime is unavailable`,
             diagnostics: { executable_path: `/opt/${id}/bin/analyze` },
           },
@@ -560,6 +610,73 @@ const capability = (provider: ProviderIdentity): CapabilityDescriptor => ({
   limitations: [],
 });
 
+describe("analysis provider registry: explicit profile refusals", () => {
+  const refusing = (refusal: AnalysisUnsupportedTargetError) => ({
+    ...candidate("ghidra").provider,
+    resolveAnalysisProfile: () => Promise.resolve(err(refusal)),
+  });
+
+  it("keeps a refusing provider's reason, recovery and evidence in the selection failure", async () => {
+    const capturedOutput = {
+      stdout: "",
+      stderr: "x86-64 only",
+      truncated: false,
+    };
+    const refusal = new AnalysisUnsupportedTargetError(
+      "resolve_analysis_profile",
+      DATABASE_TARGET.path,
+      "The configured extension supports x86-64 only.",
+      {
+        remediationAction: "Omit the extension setting for this target.",
+        capturedOutput,
+        diagnostics: { extension: "fixture" },
+      },
+    );
+    const selected = await new AnalysisProviderRegistry([
+      refusing(refusal),
+    ]).select(DATABASE_TARGET, "ghidra");
+    if (selected.ok) throw new Error("expected a profile refusal");
+    expect(selected.error).toBeInstanceOf(ProviderSelectionError);
+    expect(selected.error.cause).toBe(refusal);
+    expect(projectAnalysisError(selected.error)).toMatchObject({
+      code: "capability_unavailable",
+      message: refusal.message,
+      remediation: { action: "Omit the extension setting for this target." },
+      details: {
+        selection_reason: "target_unsupported",
+        requested_provider_id: "ghidra",
+        candidate_ids: ["ghidra"],
+        rejections: [
+          {
+            provider_id: "ghidra",
+            code: "target_format_unsupported",
+            reason: "The configured extension supports x86-64 only.",
+          },
+        ],
+        captured_output: capturedOutput,
+        diagnostics: { extension: "fixture" },
+      },
+    });
+  });
+
+  it("returns a refusal with unconfirmed cleanup unchanged", async () => {
+    const refusal = new AnalysisUnsupportedTargetError(
+      "resolve_analysis_profile",
+      DATABASE_TARGET.path,
+      "The configured extension supports x86-64 only.",
+      { cleanup: { reason: "probe close failed", resources: ["/tmp/probe"] } },
+    );
+    const selected = await new AnalysisProviderRegistry([
+      refusing(refusal),
+    ]).select(DATABASE_TARGET, "ghidra");
+    if (selected.ok) throw new Error("expected a profile refusal");
+    expect(selected.error).toBe(refusal);
+    expect(projectAnalysisError(selected.error)).toMatchObject({
+      code: "cleanup_incomplete",
+      details: { cleanup: "incomplete", resources: ["/tmp/probe"] },
+    });
+  });
+});
 describe("profile resolution terminal facts", () => {
   it.each([false, true])(
     "preserves a physical profile failure across late caller abort (throws: %s)",
@@ -779,7 +896,9 @@ it("joins cancelled readiness finalization and shutdown before admitting another
   const registry = new AnalysisProviderRegistry([
     {
       ...base,
-      inspectAvailability: async ({ signal } = {}) => {
+      inspectAvailability: async ({
+        signal,
+      }: AnalysisProviderInspectionOptions = {}) => {
         calls++;
         if (calls === 1) {
           observed = signal;
@@ -936,7 +1055,9 @@ it("registers selection before async readiness can race shutdown", async () => {
   const registry = new AnalysisProviderRegistry([
     {
       ...base,
-      inspectAvailability: async ({ signal } = {}) => {
+      inspectAvailability: async ({
+        signal,
+      }: AnalysisProviderInspectionOptions = {}) => {
         calls++;
         observed = signal;
         return base.inspectAvailability();

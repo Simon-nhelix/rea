@@ -2,11 +2,15 @@ import { z } from "zod";
 import { CONSOLE_TARGET_FORMATS } from "./consoleRom.js";
 import { err, ok, type Result } from "./result.js";
 
-/** Explicit executable or console ROM interpretation selected by the caller. */
+/**
+ * Explicit executable or console ROM interpretation selected by the caller.
+ * GameCube DOL has no magic, so `gamecube-dol` is never auto-detected.
+ */
 export const executableFormatHintSchema = z.enum([
   "dos-com",
   "raw-binary",
   ...CONSOLE_TARGET_FORMATS,
+  "gamecube-dol",
 ]);
 /** Explicit executable interpretation for raw, DOS COM, or console targets. */
 export type ExecutableFormatHint = z.infer<typeof executableFormatHintSchema>;

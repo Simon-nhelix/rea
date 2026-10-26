@@ -30,7 +30,7 @@ import { parseAnalysisSnapshot } from "../../../src/domain/analysisSnapshot.js";
 import { INVESTIGATION_EXAMPLES } from "../../../src/contracts/investigationExamples.js";
 import {
   expandProviderCapabilities,
-  toolAvailabilityInventory,
+  toolAvailabilitySummaryInventory,
 } from "../../../src/contracts/toolOutputSchemaPrimitives.js";
 import { toolContract } from "../../../src/contracts/toolContracts.js";
 import { ok as resultOk } from "../../../src/domain/result.js";
@@ -134,7 +134,7 @@ describe("MCP snapshot lifecycle ordering", () => {
         })
       ).isError,
     ).toBe(true);
-    expect(await readFile(snapshotPath)).toEqual(bytes);
+    expect(Buffer.compare(await readFile(snapshotPath), bytes)).toBe(0);
     expect(
       (
         await mcp.callTool({
@@ -201,7 +201,7 @@ describe("public provider availability", () => {
     const status = structured(
       await mcp.callTool({ name: "binary_session", arguments: {} }),
     );
-    const availability = toolAvailabilityInventory.parse(
+    const availability = toolAvailabilitySummaryInventory.parse(
       (status.result as { tool_availability: unknown }).tool_availability,
     );
     expect(
@@ -229,7 +229,7 @@ describe("target-free MCP fixture host isolation", () => {
     const status = structured(
       await mcp.callTool({ name: "binary_session", arguments: {} }),
     );
-    const availability = toolAvailabilityInventory.parse(
+    const availability = toolAvailabilitySummaryInventory.parse(
       (status.result as { tool_availability: unknown }).tool_availability,
     );
     for (const name of [
@@ -578,10 +578,26 @@ describe("json depth bounds over MCP", () => {
         right: input.right,
       },
     });
-    const text = JSON.stringify(result.content);
-    expect(result.isError, text).toBe(true);
-    expect(text).toContain("Input validation");
-    expect(text).toContain("maximum nesting depth");
+    expect(result.isError, JSON.stringify(result.content)).toBe(true);
+    expect(parseMcpToolError(result)).toMatchObject({
+      error: {
+        code: "invalid_request",
+        recovery: {
+          kind: "inspect_input_contract",
+          operation: "compare_process_captures",
+        },
+        details: {
+          operation: "compare_process_captures",
+          issues: [
+            {
+              path: [],
+              reason: "invalid_value",
+              message: `left.parameters: JSON value exceeds maximum nesting depth of ${MAX_JSON_DEPTH}. This release has no runtime override.`,
+            },
+          ],
+        },
+      },
+    });
   }, 10_000);
 });
 

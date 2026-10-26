@@ -27,23 +27,30 @@ export const providerSelectionOption = analysisProviderSelectorSchema
     "Bind deep analysis to a provider ID or use deterministic auto selection",
   );
 
+/** Optional path to the local analysis snapshot loaded or updated by a command. */
+export const snapshotSelectionOption = z
+  .string()
+  .min(1)
+  .optional()
+  .describe("Load and update a local analysis snapshot");
+
 /** Explicit interpretation for headerless native executable formats. */
 export const formatSelectionOption = executableFormatHintSchema
   .optional()
   .describe(
-    "Explicit format selection, including dos-com, raw-binary, and console formats; omission preserves format detection",
+    "Explicit format selection, including dos-com, raw-binary, console formats, and gamecube-dol (never auto-detected); omission preserves format detection",
   );
 
 export const architectureSelectionOption = binaryArchitectureSchema
   .optional()
   .describe(
-    "Caller-supplied CPU family; required with --target-format raw-binary",
+    "Caller-supplied CPU family; required with --target-format raw-binary, must be omitted with gamecube-dol",
   );
 
 export const entryPointSelectionOption = rawBinaryEntryPointSchema
   .optional()
   .describe(
-    "Caller-supplied code entry address (0xhex); required with --target-format raw-binary",
+    "Caller-supplied code entry address (0xhex); required with --target-format raw-binary, optional with console formats and gamecube-dol",
   );
 
 export const loadAddressSelectionOption = rawBinaryLoadAddressSchema

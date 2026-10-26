@@ -23,9 +23,11 @@ export const ghidraPowerPcUnsupportedReason = (
     target.architecture !== "powerpc"
   )
     return null;
+  const missingMetadata =
+    "PowerPC analysis requires ELF header metadata; a family name alone does not select a processor variant.";
+  if (target.format !== "elf") return missingMetadata;
   const metadata = target.powerpc;
-  if (target.format !== "elf" || metadata === undefined)
-    return "PowerPC analysis requires ELF header metadata; a family name alone does not select a processor variant.";
+  if (metadata === undefined) return missingMetadata;
   if (metadata.elfClass !== 32)
     return "This Ghidra PowerPC lane supports ELF32 only; PPC64 remains unsupported.";
   if (metadata.byteOrder !== "big")
@@ -60,6 +62,7 @@ export const ghidraPowerPcProfileParameters = (
     target.kind !== "executable" ||
     isConsoleTargetFormat(target.format) ||
     target.architecture !== "powerpc" ||
+    target.format !== "elf" ||
     target.powerpc === undefined
   )
     return {};
