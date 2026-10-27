@@ -74,6 +74,9 @@ export const readStableFilePrefix = async (
   return { bytes, size: before.size };
 };
 
+/** One positional read stays below the 2 GiB per-call limit of fs.read. */
+const MAX_READ_BYTES = 64 * 1024 * 1024;
+
 const readExtent = async (
   file: FileHandle,
   path: string,
@@ -88,7 +91,7 @@ const readExtent = async (
     const read = await file.read({
       buffer: bytes,
       offset,
-      length: bytes.length - offset,
+      length: Math.min(bytes.length - offset, MAX_READ_BYTES),
       position: offset,
     });
     if (read.bytesRead === 0) throw new RegularFileChangedError(path);

@@ -2625,63 +2625,101 @@ const parsedMappingIntervals = (
  * Resolve a console virtual address to a file offset using the admitted fileMappings
  * plus bank-window and FastROM mirror rules for SNES/GB/NES/WSC.
  */
+/** Where a pointer value was read, for console rules that resolve it inside the table's bank. */
+export interface ConsolePointerSource {
+  readonly tableFileOffset: number;
+  /** Pointer width in bytes; bank-local rules apply to 16-bit pointers only. */
+  readonly pointerBytes: number;
+}
+
+/**
+ * Resolve a 16-bit pointer inside the bank its table occupies. Returns the
+ * file offset, null when the bank is unknowable (the table cannot know which
+ * bank is switched in), or undefined when no bank-local rule applies.
+ */
+const resolveBankLocalPointer = (
+  admission: ConsoleTargetAdmission,
+  vaddr: bigint,
+  tableFileOffset: number,
+  maxFileBytes: number | undefined,
+): number | null | undefined => {
+  const fits = (resolved: number) =>
+    maxFileBytes === undefined || resolved < maxFileBytes;
+  if (
+    admission.format === "gb" &&
+    vaddr >= 0x4000n &&
+    vaddr < 0x8000n &&
+    tableFileOffset >= 0x4000
+  ) {
+    const bankBase = Math.floor(tableFileOffset / 0x4000) * 0x4000;
+    const resolved = bankBase + Number(vaddr - 0x4000n);
+    return fits(resolved) ? resolved : undefined;
+  }
+  if (admission.format === "snes" && vaddr >= 0x8000n && vaddr <= 0xffffn) {
+    const smcOffset = Number(admission.romMetadata.copier_header_bytes ?? 0);
+    if (tableFileOffset < smcOffset) return undefined;
+    const isHiRom = admission.romMetadata.mapping_mode === "HiROM";
+    const bankSize = isHiRom ? 0x10000 : 0x8000;
+    const bankIndex = Math.floor((tableFileOffset - smcOffset) / bankSize);
+    const offsetWithinBank = isHiRom ? Number(vaddr) : Number(vaddr - 0x8000n);
+    const resolved = smcOffset + bankIndex * bankSize + offsetWithinBank;
+    return fits(resolved) ? resolved : undefined;
+  }
+  if (admission.format === "nes" && vaddr >= 0x8000n && vaddr < 0xc000n) {
+    // NROM (mapper 0) switches no banks: the admitted mapping is the CPU view.
+    if (
+      admission.romMetadata.ines_header === true &&
+      admission.romMetadata.mapper === 0
+    )
+      return undefined;
+    const prgOffset = admission.fileMappings[0]?.fileOffset ?? 16;
+    const prgSize = Number(admission.romMetadata.prg_rom_bytes ?? 0);
+    if (
+      prgSize <= 0x4000 ||
+      tableFileOffset < prgOffset ||
+      tableFileOffset >= prgOffset + prgSize
+    )
+      return undefined;
+    const bankStart =
+      prgOffset + Math.floor((tableFileOffset - prgOffset) / 0x4000) * 0x4000;
+    // A table in the fixed last bank sees whichever bank is switched in at
+    // $8000, which the bytes alone do not tell.
+    if (bankStart + 0x4000 >= prgOffset + prgSize) return null;
+    const resolved = bankStart + Number(vaddr - 0x8000n);
+    return resolved < prgOffset + prgSize && fits(resolved)
+      ? resolved
+      : undefined;
+  }
+  return undefined;
+};
+
 export const resolveConsoleFileOffset = (
   admission: ConsoleTargetAdmission,
   virtualAddress: bigint | number,
   options?: {
-    readonly tableFileOffset?: number | undefined;
+    /** Set when the address is a pointer value read from a table. */
+    readonly pointer?: ConsolePointerSource | undefined;
     readonly fileBytes?: number | undefined;
   },
 ): number | null => {
   const vaddr = BigInt(virtualAddress);
   if (vaddr < 0n) return null;
-  const tableFileOffset = options?.tableFileOffset;
-  const maxFileBytes = options?.fileBytes;
+  const pointer = options?.pointer;
 
-  // 1. Bank-local 16-bit pointer resolution when a tableFileOffset is in a known bank
-  if (tableFileOffset !== undefined && tableFileOffset >= 0) {
-    if (
-      admission.format === "gb" &&
-      vaddr >= 0x4000n &&
-      vaddr < 0x8000n &&
-      tableFileOffset >= 0x4000
-    ) {
-      const bankBase = Math.floor(tableFileOffset / 0x4000) * 0x4000;
-      const resolved = bankBase + Number(vaddr - 0x4000n);
-      if (maxFileBytes === undefined || resolved < maxFileBytes) {
-        return resolved;
-      }
-    }
-    if (admission.format === "snes" && vaddr >= 0x8000n && vaddr <= 0xffffn) {
-      const smcOffset = Number(admission.romMetadata.copier_header_bytes ?? 0);
-      if (tableFileOffset >= smcOffset) {
-        const isHiRom = admission.romMetadata.mapping_mode === "HiROM";
-        const bankSize = isHiRom ? 0x10000 : 0x8000;
-        const bankIndex = Math.floor((tableFileOffset - smcOffset) / bankSize);
-        const offsetWithinBank = isHiRom
-          ? Number(vaddr)
-          : Number(vaddr - 0x8000n);
-        const resolved = smcOffset + bankIndex * bankSize + offsetWithinBank;
-        if (maxFileBytes === undefined || resolved < maxFileBytes) {
-          return resolved;
-        }
-      }
-    }
-    if (admission.format === "nes" && vaddr >= 0x8000n && vaddr < 0xc000n) {
-      const prgOffset = admission.fileMappings[0]?.fileOffset ?? 16;
-      const prgSize = Number(admission.romMetadata.prg_rom_bytes ?? 0);
-      if (prgSize > 0x4000 && tableFileOffset >= prgOffset) {
-        const bankIndex = Math.floor((tableFileOffset - prgOffset) / 0x4000);
-        const resolved =
-          prgOffset + bankIndex * 0x4000 + Number(vaddr - 0x8000n);
-        if (
-          resolved < prgOffset + prgSize &&
-          (maxFileBytes === undefined || resolved < maxFileBytes)
-        ) {
-          return resolved;
-        }
-      }
-    }
+  // 1. A 16-bit pointer resolves inside its table's bank; wider pointers
+  // carry their own bank and resolve through the mappings.
+  if (
+    pointer !== undefined &&
+    pointer.pointerBytes === 2 &&
+    pointer.tableFileOffset >= 0
+  ) {
+    const bankLocal = resolveBankLocalPointer(
+      admission,
+      vaddr,
+      pointer.tableFileOffset,
+      options?.fileBytes,
+    );
+    if (bankLocal !== undefined) return bankLocal;
   }
 
   // 2. Direct lookup across admitted fileMappings (parsed once per admission)

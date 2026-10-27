@@ -172,6 +172,28 @@ describe("data track user data", () => {
     expect(user.mismatchedSectors).toBe(1);
     expect(user.firstMismatchedSector).toBe(2);
   });
+
+  it("projects a track in parts into one caller buffer", () => {
+    const raw = new Uint8Array(RAW_CD_SECTOR_BYTES * 2);
+    raw.set(modeOneSector(100, 0x11), 0);
+    raw.set(modeOneSector(101, 0x22), RAW_CD_SECTOR_BYTES);
+    const layout = {
+      mode: "MODE1/2352",
+      rawSectorBytes: RAW_CD_SECTOR_BYTES,
+      userDataOffset: 16,
+      sectorCount: 1,
+    } as const;
+    const whole = Buffer.alloc(2 * CD_USER_DATA_BYTES);
+    for (const sector of [0, 1])
+      extractDataTrackUserData(
+        raw.subarray(sector * RAW_CD_SECTOR_BYTES),
+        layout,
+        whole.subarray(sector * CD_USER_DATA_BYTES),
+      );
+    expect(whole[0]).toBe(0x11);
+    expect(whole[CD_USER_DATA_BYTES]).toBe(0x22);
+    expect(whole[2 * CD_USER_DATA_BYTES - 1]).toBe(0x22);
+  });
 });
 
 describe("PC Engine CD IPL record", () => {
@@ -264,14 +286,18 @@ describe("Dreamcast GDI, raw sector detection, IP.BIN, SYSTEM.CNF, and ISO9660",
 
   it("auto-detects raw 2352-byte Mode 1 sectors", () => {
     const raw = modeOneSector(0, 0xaa);
-    expect(detectRawSectorLayout("track.bin", raw)).toMatchObject({
+    expect(detectRawSectorLayout("track.bin", raw, raw.length)).toMatchObject({
       track: 1,
       mode: "MODE1/2352",
       rawSectorBytes: 2352,
       userDataOffset: 16,
       sectorCount: 1,
     });
-    expect(detectRawSectorLayout("track.bin", new Uint8Array(2352))).toBe(
+    // The layout needs only the first sector's header and the file length.
+    expect(
+      detectRawSectorLayout("track.bin", raw.subarray(0, 16), 3 * 2352),
+    ).toMatchObject({ sectorCount: 3 });
+    expect(detectRawSectorLayout("track.bin", new Uint8Array(2352), 2352)).toBe(
       undefined,
     );
   });

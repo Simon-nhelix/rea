@@ -340,6 +340,11 @@ export const findOrphanStringsInPointerGaps = (input: {
       const address =
         toVirtualAddress(item.fileOffset) ??
         `0x${item.fileOffset.toString(16)}`;
+      // The slot ends after the terminator padding that follows the string;
+      // bytes the gap scan could not decode are not free.
+      let slotEnd = item.fileOffset + item.byteLength;
+      while (slotEnd + unitSize <= nextStop && isPaddingAt(slotEnd))
+        slotEnd += unitSize;
       orphans.push({
         after_entry_index: afterEntryIndex,
         gap_index: g,
@@ -348,7 +353,7 @@ export const findOrphanStringsInPointerGaps = (input: {
         byte_length: item.byteLength,
         allocated_budget_bytes: Math.max(
           item.byteLength,
-          nextStop - item.fileOffset,
+          slotEnd - item.fileOffset,
         ),
         text: item.text,
         ...(item.controlCodes === undefined

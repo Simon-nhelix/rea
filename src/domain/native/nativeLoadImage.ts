@@ -119,7 +119,7 @@ export const nativeRawLoadImageSchema = z.strictObject({
   file_bytes: integer.min(1),
   entry: z.strictObject({
     address: nativeAddressObservationSchema,
-    file_offset: z.literal(0),
+    file_offset: integer,
   }),
   observations: nativeLoadImageObservationSchema,
   checks: z.array(nativeLoadImageCheckSchema),

@@ -123,6 +123,19 @@ Use `--segment 0:<length>` to state explicitly that pointers are offsets within
 the whole raw file. `--infer-base-address` returns ranked overlay candidates;
 the inferred address remains a heuristic requiring independent confirmation.
 
+`allocated_budget_bytes` (and manuscript `max_bytes`) is the distance to the
+next target among the entries examined in that call, cut to the target's string
+and the terminator padding directly after it. Text that a pointer outside the
+examined page or table refers to therefore stays outside the slot. When the
+examined bytes cannot settle that bound (a decode that stopped before the
+string's end, or a provider preview that ended inside the padding), the budget
+is `null` rather than a guess. A slot with no following target keeps the
+decoded string length. Native 16-bit pointers resolve inside the bank of their
+table entry on `snes`, `gb` and `nes`; wider pointers carry their own bank. NES
+NROM (mapper 0) maps `$8000-$FFFF` linearly, and a table in the fixed last PRG
+bank reports an unknown target for `$8000-$BFFF`, because the switched-in bank
+is not in the bytes.
+
 `scan-pointer-table --include-orphan-strings --include-manuscript` also extracts
 terminated strings between successive pointer targets. Known orphan starts cut
 the preceding pointer's `allocated_budget_bytes` and manuscript `max_bytes`, so
@@ -238,10 +251,12 @@ against: `lines`, `pages` through the line list, `character_length` (code
 points, counting no code and no argument byte), `longest_line_characters`, and
 `control_codes` with each occurrence's `offset`, `byte_length` and
 `arguments_hex`. A code whose arguments run past the read window is reported
-with `arguments_truncated`. The string terminator ends the string without
-appearing in the text or in the occurrence list; a declared code of the same
-byte takes precedence, because the declaration states what that byte means
-here.
+with `arguments_truncated`. Codes match only between whole glyphs, so a code
+byte never splits a Shift-JIS, EUC-JP or UTF-8 character or a multi-byte `.tbl`
+entry. The string terminator ends the string without appearing in the text or
+in the occurrence list, and a `.tbl` end token ends it as in a plain decode; a
+declared code of the same byte takes precedence, because the declaration states
+what that byte means here.
 
 ```sh
 cat > codes.json <<'JSON'

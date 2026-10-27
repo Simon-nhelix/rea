@@ -138,8 +138,9 @@ describe("RomHackingTools scan_pointer_table", () => {
               {
                 address: String(args.address),
                 requested_bytes: 64,
-                returned_bytes: 5,
-                bytes_hex: "97458ed200",
+                returned_bytes: 64,
+                // 勇者, its terminator, then zero padding past the next target.
+                bytes_hex: `97458ed2${"00".repeat(60)}`,
                 complete: true,
               },
               mockProvider,
@@ -438,6 +439,45 @@ describe("RomHackingTools Mode A local pointer scan", () => {
   });
   afterAll(cleanupLocalRom);
 
+  it("keeps a page's slot budgets off text that other pages point to", async () => {
+    // Entries 2 and 3 point at 0x100 and 0x120; 魔法 at 0x110 belongs to
+    // entry 1, which this page does not read.
+    const page = await executeScanPointerTable(
+      countingAnalysis,
+      {
+        table_offset: 0,
+        count: 2,
+        start_index: 2,
+        pointer_size: 4,
+        endian: "little",
+        base_address: "0x0",
+        encoding: "sjis",
+        terminator_byte: 0x00,
+        preview_bytes: 8,
+        resolve_xrefs: false,
+        include_hex: false,
+        include_manuscript: true,
+        manuscript_only: false,
+      },
+      undefined,
+      target,
+    );
+    expect(page.ok).toBe(true);
+    if (!page.ok) return;
+    const data = page.value as {
+      entries: Array<{ index: number; allocated_budget_bytes: number | null }>;
+      manuscript_records: Array<{ id: string; max_bytes: number | null }>;
+    };
+    expect(data.entries).toMatchObject([
+      { index: 2, allocated_budget_bytes: 0x10 },
+      { index: 3, allocated_budget_bytes: 5 },
+    ]);
+    expect(data.manuscript_records[0]).toMatchObject({
+      id: "ptr_0002",
+      max_bytes: 0x10,
+    });
+  });
+
   it("pages pointer scans with global indexes and deduped full manuscript", async () => {
     localRomFixture.providerCalls = 0;
     const baseInput = {
@@ -553,8 +593,9 @@ describe("RomHackingTools provider batching", () => {
               {
                 address: String(args.address),
                 requested_bytes: 64,
-                returned_bytes: 5,
-                bytes_hex: "97458ed200",
+                returned_bytes: 64,
+                // 勇者, its terminator, then zero padding past the next target.
+                bytes_hex: `97458ed2${"00".repeat(60)}`,
                 complete: true,
               },
               mockProvider,

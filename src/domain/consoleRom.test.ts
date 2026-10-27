@@ -513,9 +513,16 @@ describe("consoleRom multi-bank and overlay coordinate resolution", () => {
       // Bank-local 16-bit pointer ($8100) inside a table located in Bank 2
       expect(
         resolveConsoleFileOffset(snes.value, 0x8100, {
-          tableFileOffset: 512 + 0x10000,
+          pointer: { tableFileOffset: 512 + 0x10000, pointerBytes: 2 },
         }),
       ).toBe(512 + 0x10100);
+      // A 24-bit pointer carries its bank: $00:8100 is bank 0 wherever the
+      // table sits.
+      expect(
+        resolveConsoleFileOffset(snes.value, 0x008100, {
+          pointer: { tableFileOffset: 512 + 0x10000, pointerBytes: 3 },
+        }),
+      ).toBe(512 + 0x100);
       expect(resolveConsoleVirtualAddress(snes.value, 512 + 0x10100)).toBe(
         "0x28100",
       );
@@ -589,7 +596,7 @@ describe("PCE reset mapping provenance", () => {
       ]) {
         expect(
           resolveConsoleFileOffset(admitted.value, address, {
-            tableFileOffset: copierBytes + 0x2b00,
+            pointer: { tableFileOffset: copierBytes + 0x2b00, pointerBytes: 2 },
             fileBytes: copierBytes + 0x40000,
           }),
         ).toBeNull();
@@ -836,5 +843,49 @@ describe("consoleRom Nintendo 64", () => {
         fileBytes: 0x1000,
       }).ok,
     ).toBe(false);
+  });
+});
+
+describe("console pointer bank rules", () => {
+  it("resolves NES table pointers by mapper bank switching", () => {
+    const nesHeader = (mapper: number, prgUnits: number) => {
+      const header = Buffer.alloc(0x20, 0);
+      header.write("NES\x1a", 0, "ascii");
+      header[4] = prgUnits;
+      header[6] = (mapper & 0x0f) << 4;
+      header[7] = mapper & 0xf0;
+      return header;
+    };
+    const admit = (mapper: number, prgUnits: number) => {
+      const admitted = admitConsoleTarget({
+        format: "nes",
+        headerBytes: nesHeader(mapper, prgUnits),
+        fileBytes: 16 + prgUnits * 0x4000,
+      });
+      if (!admitted.ok) throw new Error(admitted.error.reason);
+      return admitted.value;
+    };
+    const from = (tableFileOffset: number) => ({
+      pointer: { tableFileOffset, pointerBytes: 2 },
+    });
+    // NROM-256 maps $8000-$FFFF linearly; a table at $C100 still reads $8200
+    // from the first 16 KiB.
+    const nrom = admit(0, 2);
+    expect(resolveConsoleFileOffset(nrom, 0x8200, from(16 + 0x4100))).toBe(
+      16 + 0x200,
+    );
+    // UxROM: a table in a switchable bank reads $8000-$BFFF in its own bank.
+    const uxrom = admit(2, 8);
+    expect(
+      resolveConsoleFileOffset(uxrom, 0x8200, from(16 + 3 * 0x4000 + 0x10)),
+    ).toBe(16 + 3 * 0x4000 + 0x200);
+    // From the fixed last bank, the switched-in bank is unknown.
+    expect(
+      resolveConsoleFileOffset(uxrom, 0x8200, from(16 + 7 * 0x4000 + 0x10)),
+    ).toBeNull();
+    // Pointers into the fixed bank resolve through the mapping.
+    expect(resolveConsoleFileOffset(uxrom, 0xc010, from(16 + 3 * 0x4000))).toBe(
+      16 + 7 * 0x4000 + 0x10,
+    );
   });
 });

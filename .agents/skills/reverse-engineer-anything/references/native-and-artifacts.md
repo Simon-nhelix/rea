@@ -702,9 +702,10 @@ analysis, and code cave discovery:
   [console localization](https://github.com/morluto/rea/blob/main/docs/console-localization.md#overlay-relative-pointer-tables).
 - `scan_pointer_table` (CLI `rea scan-pointer-table <path> [address]`): decode a
   pointer table by virtual `address` or ROM file `table_offset` (including
-  automatic bank-local 16-bit pointer resolution for `snes`, `gb`, `nes`, and
-  `pce`), compute each slot's `allocated_budget_bytes` from adjacent target
-  distances, and optionally emit `locbatch.py`-ready `manuscript_records` with
+  automatic bank-local resolution of 16-bit pointers for `snes`, `gb`, and
+  `nes`), compute each slot's `allocated_budget_bytes` from the next examined
+  target, cut to the string and its trailing terminator padding (`null` when
+  the examined bytes cannot settle it), and optionally emit `locbatch.py`-ready `manuscript_records` with
   `include_manuscript: true` (CLI `--include-manuscript`). Page tables larger
   than `count` with `start_index` (entry and manuscript indexes stay global),
   and use `manuscript_only: true` to suppress `entries` when only the

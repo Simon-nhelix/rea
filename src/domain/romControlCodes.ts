@@ -198,13 +198,34 @@ export interface RomTextSegments {
 }
 
 /**
+ * What the encoding owner reads at one glyph boundary: a glyph, a glyph that
+ * also ends the string (a .tbl end token), or the string terminator, which
+ * ends the string without being text. Lengths stay within the buffer.
+ */
+export type RomGlyphUnit = {
+  readonly kind: "glyph" | "end-glyph" | "terminator";
+  readonly length: number;
+};
+
+/** Reads the unit at `at`; undefined means the byte is not decodable. */
+export type RomGlyphReader = (
+  bytes: Uint8Array,
+  at: number,
+) => RomGlyphUnit | undefined;
+
+const singleByteGlyph: RomGlyphReader = () => ({ kind: "glyph", length: 1 });
+
+/**
  * Split a buffer into glyph runs and declared codes. Nothing is decoded here;
  * the caller's own text decoder owns that, and this owns code boundaries.
+ * Codes match only at glyph boundaries, so a code byte never splits a
+ * multi-byte glyph; a declared code wins over the glyph or terminator at
+ * the same boundary, because the declaration states what the bytes mean.
  */
 export const segmentRomTextByControlCodes = (
   bytes: Uint8Array,
   table: RomControlCodeTable,
-  stepBytes = 1,
+  readGlyph: RomGlyphReader = singleByteGlyph,
 ): RomTextSegments => {
   const segments: RomTextSegment[] = [];
   let textStart = 0;
@@ -220,7 +241,21 @@ export const segmentRomTextByControlCodes = (
   while (pos < bytes.length) {
     const code = matchRomControlCodeAt(bytes, pos, table);
     if (code === undefined) {
-      pos += stepBytes;
+      const unit = readGlyph(bytes, pos);
+      if (unit?.kind === "terminator") {
+        flushText(pos);
+        return {
+          segments,
+          byteLength: Math.min(bytes.length, pos + unit.length),
+          stop: "end-code",
+        };
+      }
+      // An undecodable byte stays in the run, as one byte.
+      pos = Math.min(bytes.length, pos + Math.max(1, unit?.length ?? 1));
+      if (unit?.kind === "end-glyph") {
+        flushText(pos);
+        return { segments, byteLength: pos, stop: "end-code" };
+      }
       continue;
     }
     flushText(pos);
@@ -285,20 +320,21 @@ export interface RomTextWithControlCodes {
 }
 
 /**
- * Decode one string that mixes glyphs and declared codes. `decodeText` is the
- * caller's encoding-specific decoder for a run of glyph bytes; this function
- * owns only where those runs begin and end.
+ * Decode one string that mixes glyphs and declared codes. `decodeText` and
+ * `readGlyph` are the caller's encoding-specific decoder for a run of glyph
+ * bytes and its glyph boundaries; this function owns only where those runs
+ * begin and end.
  */
 export const decodeRomTextWithControlCodes = (
   bytes: Uint8Array,
   table: RomControlCodeTable,
   decodeText: (run: Uint8Array) => string,
-  stepBytes = 1,
+  readGlyph?: RomGlyphReader,
 ): RomTextWithControlCodes => {
   const { segments, byteLength, stop } = segmentRomTextByControlCodes(
     bytes,
     table,
-    stepBytes,
+    readGlyph,
   );
   const parts: string[] = [];
   const uses: RomControlCodeUse[] = [];
@@ -359,38 +395,6 @@ export const decodeRomTextWithControlCodes = (
     byte_length: byteLength,
     control_codes: uses,
     stop,
-  };
-};
-
-/**
- * Treat the string terminator as an end code, so one pass over the bytes finds
- * both the codes and the string end. A declared code with the same bytes wins,
- * because the caller's declaration states what that byte means in this game.
- */
-export const withTerminatorAsEndCode = (
-  table: RomControlCodeTable,
-  terminatorByte: number | null,
-  name = "terminator",
-): RomControlCodeTable => {
-  if (terminatorByte === null) return table;
-  const existing = table.byFirstByte.get(terminatorByte);
-  if (existing?.some((code) => code.bytes.length === 1) === true) return table;
-  const terminator: RomControlCode = {
-    bytes: Uint8Array.of(terminatorByte),
-    name,
-    argumentBytes: 0,
-    role: "end",
-    reported: false,
-  };
-  const byFirstByte = new Map<number, ReadonlyArray<RomControlCode>>(
-    table.byFirstByte,
-  );
-  // Longer declared codes starting with this byte keep their precedence.
-  byFirstByte.set(terminatorByte, [...(existing ?? []), terminator]);
-  return {
-    codes: [...table.codes, terminator],
-    byFirstByte,
-    maxByteLength: Math.max(table.maxByteLength, 1),
   };
 };
 

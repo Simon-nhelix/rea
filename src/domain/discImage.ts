@@ -265,7 +265,9 @@ export interface DataTrackUserData {
  * Concatenate the 2048-byte user data of every track sector. `trackBytes`
  * starts at the track's INDEX 01 sector. Raw sectors are checked for the sync
  * pattern and mode byte; Mode 2 Form 2 sectors have no 2048-byte user area
- * and are reported as mismatched.
+ * and are reported as mismatched. `into` receives the user data from its
+ * start instead of a new buffer, so a caller can project a track in parts;
+ * bytes of sectors missing from `trackBytes` are left as they are there.
  */
 export const extractDataTrackUserData = (
   trackBytes: Uint8Array,
@@ -273,8 +275,9 @@ export const extractDataTrackUserData = (
     DataTrackLayout,
     "mode" | "rawSectorBytes" | "userDataOffset" | "sectorCount"
   >,
+  into?: Buffer,
 ): DataTrackUserData => {
-  const out = Buffer.alloc(layout.sectorCount * CD_USER_DATA_BYTES);
+  const out = into ?? Buffer.alloc(layout.sectorCount * CD_USER_DATA_BYTES);
   let mismatchedSectors = 0;
   let firstMismatchedSector: number | null = null;
   const expectedMode =
@@ -496,19 +499,24 @@ export const resolveGdiDataTrack = (
 };
 
 /** Auto-detect a raw 2352-byte Mode 1 or Mode 2 Form 1 .bin image from sector 0's sync header. */
+/** Leading bytes `detectRawSectorLayout` reads: the first sector's sync and mode. */
+export const RAW_SECTOR_HEADER_BYTES = 16;
+
 export const detectRawSectorLayout = (
   fileName: string,
-  bytes: Uint8Array,
+  header: Uint8Array,
+  byteLength: number,
 ): DataTrackLayout | undefined => {
   if (
-    bytes.length < RAW_CD_SECTOR_BYTES ||
-    bytes.length % RAW_CD_SECTOR_BYTES !== 0
+    byteLength < RAW_CD_SECTOR_BYTES ||
+    byteLength % RAW_CD_SECTOR_BYTES !== 0 ||
+    header.length < RAW_SECTOR_HEADER_BYTES
   )
     return undefined;
   for (let i = 0; i < SYNC.length; i++) {
-    if (bytes[i] !== SYNC[i]) return undefined;
+    if (header[i] !== SYNC[i]) return undefined;
   }
-  const modeByte = bytes[15];
+  const modeByte = header[15];
   if (modeByte !== 1 && modeByte !== 2) return undefined;
   const mode: DataTrackMode = modeByte === 1 ? "MODE1/2352" : "MODE2/2352";
   return {
@@ -518,7 +526,7 @@ export const detectRawSectorLayout = (
     rawSectorBytes: RAW_CD_SECTOR_BYTES,
     userDataOffset: modeByte === 1 ? 16 : 24,
     firstSectorInFile: 0,
-    sectorCount: bytes.length / RAW_CD_SECTOR_BYTES,
+    sectorCount: byteLength / RAW_CD_SECTOR_BYTES,
     firstLba: 0,
     otherDataTracks: [],
   };

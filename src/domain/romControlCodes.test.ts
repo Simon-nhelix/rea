@@ -5,8 +5,8 @@ import {
   parseRomControlCodes,
   romControlCodeSchema,
   segmentRomTextByControlCodes,
-  withTerminatorAsEndCode,
   type RomControlCodeInput,
+  type RomGlyphReader,
 } from "./romControlCodes.js";
 
 /** One code as a caller writes it, before the schema applies its defaults. */
@@ -145,13 +145,21 @@ describe("decoding text that mixes glyphs and codes", () => {
   });
 });
 
-describe("the terminator as an end code", () => {
-  it("ends the string, and a declared code of the same byte wins", () => {
-    const plain = withTerminatorAsEndCode(table(), 0x00);
+/** One byte per glyph, ending at `terminator`, as a byte encoding reports it. */
+const endingAt =
+  (terminator: number): RomGlyphReader =>
+  (bytes, at) =>
+    bytes[at] === terminator
+      ? { kind: "terminator", length: 1 }
+      : { kind: "glyph", length: 1 };
+
+describe("glyph boundaries from the encoding owner", () => {
+  it("ends at the terminator, and a declared code of the same byte wins", () => {
     const ended = decodeRomTextWithControlCodes(
       Uint8Array.from([0x41, 0x00, 0x42]),
-      plain,
+      table(),
       ascii,
+      endingAt(0x00),
     );
     // The terminator ends the string without appearing inside it.
     expect(ended.text).toBe("A");
@@ -160,31 +168,47 @@ describe("the terminator as an end code", () => {
     expect(ended.stop).toBe("end-code");
 
     // The game uses 00 as a line break and FF to end; 00 must not end here.
-    const declared = withTerminatorAsEndCode(
-      table({ hex: "00", name: "LINE", role: "line-break" }),
-      0x00,
-    );
     const kept = decodeRomTextWithControlCodes(
       Uint8Array.from([0x41, 0x00, 0x42]),
-      declared,
+      table({ hex: "00", name: "LINE", role: "line-break" }),
       ascii,
+      endingAt(0x00),
     );
     expect(kept.lines).toEqual(["A", "B"]);
     expect(kept.stop).toBe("buffer-end");
   });
 
   it("keeps a longer declared code ahead of the terminator byte", () => {
-    const codes = withTerminatorAsEndCode(
-      table({ hex: "FFFE", name: "LINE", role: "line-break" }),
-      0xff,
-    );
     const decoded = decodeRomTextWithControlCodes(
       Uint8Array.from([0x41, 0xff, 0xfe, 0x42, 0xff, 0x43]),
-      codes,
+      table({ hex: "FFFE", name: "LINE", role: "line-break" }),
       ascii,
+      endingAt(0xff),
     );
     expect(decoded.lines).toEqual(["A", "B"]);
     expect(decoded.byte_length).toBe(5);
     expect(decoded.stop).toBe("end-code");
+  });
+
+  it("matches codes only between glyphs and stops after an end glyph", () => {
+    // 82 F1 is one two-byte glyph; F1 alone is a declared code.
+    const twoByte: RomGlyphReader = (bytes, at) =>
+      bytes[at] === 0x82
+        ? { kind: "glyph", length: 2 }
+        : bytes[at] === 0xee
+          ? { kind: "end-glyph", length: 1 }
+          : { kind: "glyph", length: 1 };
+    const { segments, byteLength, stop } = segmentRomTextByControlCodes(
+      Uint8Array.from([0x82, 0xf1, 0xf1, 0x05, 0x41, 0xee, 0x42]),
+      table({ hex: "F1", name: "COLOR", argument_bytes: 1 }),
+      twoByte,
+    );
+    expect(segments).toMatchObject([
+      { kind: "text", offset: 0, length: 2 },
+      { kind: "code", offset: 2, length: 2, argumentsHex: "05" },
+      { kind: "text", offset: 4, length: 2 },
+    ]);
+    expect(byteLength).toBe(6);
+    expect(stop).toBe("end-code");
   });
 });

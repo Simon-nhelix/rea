@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants as bufferConstants } from "node:buffer";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { open, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, resolve } from "node:path";
 import { AnalysisInputError } from "../../domain/analysisErrorCore.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
@@ -14,10 +14,12 @@ import {
   parsePceCdIpl,
   parsePlayStationSystemCnf,
   parseSegaIpBin,
+  RAW_SECTOR_HEADER_BYTES,
   resolveDiscLocations,
   resolveFirstDataTrack,
   resolveGdiDataTrack,
   type DataTrackLayout,
+  type DataTrackUserData,
   type DiscResolvedLocation,
   type Iso9660FileSystem,
   type PceCdIpl,
@@ -25,6 +27,12 @@ import {
   type SegaIpBin,
 } from "../../domain/discImage.js";
 import { detectN64ByteOrder, unswapN64Bytes } from "../../domain/consoleRom.js";
+import {
+  RegularFileCapacityError,
+  readStableFileBytes,
+  readStableFilePrefix,
+} from "../../filesystem/readStableFileBytes.js";
+import { RegularFileChangedError } from "../../filesystem/RegularFile.js";
 import type { EvidenceSubjectTarget } from "../../domain/evidence.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import type { RomByteSourceDescription } from "../../domain/romHacking.js";
@@ -93,8 +101,15 @@ export const locateLocalByteOffset = (
 
 const MAX_CUE_SHEET_BYTES = 1024 * 1024;
 
-const sha256 = (bytes: Uint8Array): string =>
-  createHash("sha256").update(bytes).digest("hex");
+/** Bytes per hash update; one update takes at most 2 GiB. */
+const HASH_UPDATE_BYTES = 64 * 1024 * 1024;
+
+const sha256 = (bytes: Uint8Array): string => {
+  const hash = createHash("sha256");
+  for (let at = 0; at < bytes.length; at += HASH_UPDATE_BYTES)
+    hash.update(bytes.subarray(at, at + HASH_UPDATE_BYTES));
+  return hash.digest("hex");
+};
 
 const inputError = (
   operation: string,
@@ -106,24 +121,154 @@ const inputError = (
     ...(cause === undefined ? {} : { cause }),
   });
 
+const readFailure = (
+  operation: string,
+  path: string,
+  cause: unknown,
+): AnalysisInputError =>
+  cause instanceof RegularFileCapacityError
+    ? inputError(
+        operation,
+        `${path} is ${cause.observedBytes} bytes, larger than one in-memory buffer`,
+      )
+    : cause instanceof RegularFileChangedError
+      ? inputError(operation, `${path} changed while it was read`, cause)
+      : inputError(operation, `Failed to read ${path}`, cause);
+
+/** Read a whole regular file in bounded positional reads, so files over 2 GiB load. */
 const readWholeFile = async (
   operation: string,
   path: string,
 ): Promise<Result<Buffer, AnalysisError>> => {
+  let handle;
   try {
-    const metadata = await stat(path);
-    if (!metadata.isFile())
+    handle = await open(path, "r");
+    if (!(await handle.stat()).isFile())
       return err(inputError(operation, `${path} is not a regular file`));
-    if (metadata.size > bufferConstants.MAX_LENGTH)
-      return err(
-        inputError(
-          operation,
-          `${path} is ${metadata.size} bytes, larger than one in-memory buffer`,
+    return ok(
+      await readStableFileBytes(handle, path, bufferConstants.MAX_LENGTH, {
+        symlinks: "follow",
+      }),
+    );
+  } catch (cause) {
+    return err(readFailure(operation, path, cause));
+  } finally {
+    await handle?.close();
+  }
+};
+
+/** The raw 2352-byte sector layout of a `.bin`, read from its first sector. */
+const detectRawBinLayout = async (
+  operation: string,
+  path: string,
+): Promise<Result<DataTrackLayout | undefined, AnalysisError>> => {
+  let handle;
+  try {
+    handle = await open(path, "r");
+    if (!(await handle.stat()).isFile())
+      return err(inputError(operation, `${path} is not a regular file`));
+    const prefix = await readStableFilePrefix(
+      handle,
+      path,
+      RAW_SECTOR_HEADER_BYTES,
+      { symlinks: "follow" },
+    );
+    return ok(
+      detectRawSectorLayout(basename(path), prefix.bytes, Number(prefix.size)),
+    );
+  } catch (cause) {
+    return err(readFailure(operation, path, cause));
+  } finally {
+    await handle?.close();
+  }
+};
+
+/** Raw sectors read per positional read while projecting a data track. */
+const TRACK_READ_SECTORS = 16 * 1024;
+
+/**
+ * Hash a whole raw disc image and project one data track onto 2048-byte user
+ * data in bounded reads, so the raw image is never held in memory.
+ */
+const readTrackUserData = async (
+  operation: string,
+  imagePath: string,
+  layout: DataTrackLayout,
+): Promise<
+  Result<
+    { readonly imageSha256: string; readonly userData: DataTrackUserData },
+    AnalysisError
+  >
+> => {
+  const userBytes = layout.sectorCount * CD_USER_DATA_BYTES;
+  if (userBytes > bufferConstants.MAX_LENGTH)
+    return err(
+      inputError(
+        operation,
+        `${imagePath} holds ${userBytes} bytes of user data, larger than one in-memory buffer`,
+      ),
+    );
+  let handle;
+  try {
+    const file = await open(imagePath, "r");
+    handle = file;
+    const size = (await file.stat()).size;
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(
+      TRACK_READ_SECTORS * layout.rawSectorBytes,
+    );
+    let position = 0;
+    /** Read and hash the next bytes in file order, up to `length`. */
+    const readNext = async (length: number): Promise<Buffer> => {
+      let filled = 0;
+      while (filled < length && position < size) {
+        const { bytesRead } = await file.read(
+          chunk,
+          filled,
+          Math.min(length - filled, size - position),
+          position,
+        );
+        if (bytesRead === 0) throw new RegularFileChangedError(imagePath);
+        filled += bytesRead;
+        position += bytesRead;
+      }
+      const bytes = chunk.subarray(0, filled);
+      hash.update(bytes);
+      return bytes;
+    };
+    const hashUntil = async (end: number): Promise<void> => {
+      while (position < Math.min(end, size))
+        await readNext(Math.min(chunk.length, end - position));
+    };
+    await hashUntil(layout.firstSectorInFile * layout.rawSectorBytes);
+    const bytes = Buffer.alloc(userBytes);
+    let mismatchedSectors = 0;
+    let firstMismatchedSector: number | null = null;
+    for (let sector = 0; sector < layout.sectorCount;) {
+      const count = Math.min(TRACK_READ_SECTORS, layout.sectorCount - sector);
+      // A short read leaves missing sectors zero and counts them mismatched.
+      const part = extractDataTrackUserData(
+        await readNext(count * layout.rawSectorBytes),
+        { ...layout, sectorCount: count },
+        bytes.subarray(
+          sector * CD_USER_DATA_BYTES,
+          (sector + count) * CD_USER_DATA_BYTES,
         ),
       );
-    return ok(await readFile(path));
+      mismatchedSectors += part.mismatchedSectors;
+      if (firstMismatchedSector === null && part.firstMismatchedSector !== null)
+        firstMismatchedSector = sector + part.firstMismatchedSector;
+      sector += count;
+    }
+    await hashUntil(size);
+    return ok({
+      imageSha256: hash.digest("hex"),
+      userData: { bytes, mismatchedSectors, firstMismatchedSector },
+    });
   } catch (cause) {
-    return err(inputError(operation, `Failed to read ${path}`, cause));
+    return err(readFailure(operation, imagePath, cause));
+  } finally {
+    await handle?.close();
   }
 };
 
@@ -190,21 +335,14 @@ export const readCueDataTrack = async (
   if (!layout.ok)
     return err(inputError(operation, `${cuePath}: ${layout.error}`));
   const imagePath = filePath(layout.value.fileName);
-  const image = await readWholeFile(operation, imagePath);
-  if (!image.ok) return image;
-  const start = layout.value.firstSectorInFile * layout.value.rawSectorBytes;
-  const userData = extractDataTrackUserData(
-    image.value.subarray(
-      start,
-      start + layout.value.sectorCount * layout.value.rawSectorBytes,
-    ),
-    layout.value,
-  );
+  const track = await readTrackUserData(operation, imagePath, layout.value);
+  if (!track.ok) return track;
+  const { imageSha256, userData } = track.value;
   return ok({
     cuePath,
     cueSha256: sha256(cueBytes),
     imagePath,
-    imageSha256: sha256(image.value),
+    imageSha256,
     layout: layout.value,
     userData: userData.bytes,
     mismatchedSectors: userData.mismatchedSectors,
@@ -259,19 +397,14 @@ export const readGdiDataTrack = async (
   if (!layout.ok)
     return err(inputError(operation, `${gdiPath}: ${layout.error}`));
   const imagePath = filePath(layout.value.fileName);
-  const image = await readWholeFile(operation, imagePath);
-  if (!image.ok) return image;
-  const userData = extractDataTrackUserData(
-    image.value.subarray(
-      layout.value.firstSectorInFile * layout.value.rawSectorBytes,
-    ),
-    layout.value,
-  );
+  const track = await readTrackUserData(operation, imagePath, layout.value);
+  if (!track.ok) return track;
+  const { imageSha256, userData } = track.value;
   return ok({
     cuePath: gdiPath,
     cueSha256: sha256(gdiBytes),
     imagePath,
-    imageSha256: sha256(image.value),
+    imageSha256,
     layout: layout.value,
     userData: userData.bytes,
     mismatchedSectors: userData.mismatchedSectors,
@@ -359,35 +492,38 @@ export const openLocalByteSource = async (
     if (!disc.ok) return disc;
     return ok(discSourceFromRead(canonical, reason, disc.value));
   }
-  const bytes = await readWholeFile(operation, canonical);
-  if (!bytes.ok) return bytes;
   const rawLayout =
     extname(canonical).toLowerCase() === ".bin"
-      ? detectRawSectorLayout(basename(canonical), bytes.value)
-      : undefined;
-  if (rawLayout !== undefined) {
-    const imageSha = sha256(bytes.value);
-    const userData = extractDataTrackUserData(bytes.value, rawLayout);
+      ? await detectRawBinLayout(operation, canonical)
+      : ok(undefined);
+  if (!rawLayout.ok) return rawLayout;
+  if (rawLayout.value !== undefined) {
+    const layout = rawLayout.value;
+    const track = await readTrackUserData(operation, canonical, layout);
+    if (!track.ok) return track;
+    const { imageSha256: imageSha, userData } = track.value;
     return ok(
       discSourceFromRead(canonical, reason, {
         cuePath: canonical,
         cueSha256: imageSha,
         imagePath: canonical,
         imageSha256: imageSha,
-        layout: rawLayout,
+        layout,
         userData: userData.bytes,
         mismatchedSectors: userData.mismatchedSectors,
         firstMismatchedSector: userData.firstMismatchedSector,
         tracks: [
           {
-            track: rawLayout.track,
-            mode: rawLayout.mode,
+            track: layout.track,
+            mode: layout.mode,
             file: basename(canonical),
           },
         ],
       }),
     );
   }
+  const bytes = await readWholeFile(operation, canonical);
+  if (!bytes.ok) return bytes;
   // Byteswapped and little-endian Nintendo 64 dumps are restored to the
   // native big-endian bytes the ROM tools decode; the digest and reported
   // file offsets still identify the original dump.

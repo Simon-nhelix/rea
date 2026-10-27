@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 import {
   computePointerSlotBudgets,
   decodeRomStringFromBytes,
+  decodeRomStringWithControlCodes,
   encodeRomQueryString,
   extractRomStringsFromBuffer,
   findCodeCavesInSlice,
   findCodeCavesInSliceTopK,
   formatHexPattern,
   formatRomScanCursor,
+  measurePointerSlotOccupancy,
   normalizeRomTextEncoding,
   parseCustomCharTable,
   parseRomScanCursor,
@@ -17,6 +19,7 @@ import {
   scanRomStrings,
   searchRomStringsInputSchema,
 } from "./romHacking.js";
+import { parseRomControlCodes } from "./romControlCodes.js";
 import { NO_ROM_TEXT_FILTERS } from "./romTextQuality.js";
 
 describe("romHacking input defaults", () => {
@@ -173,11 +176,13 @@ describe("romHacking budgets and code caves", () => {
         target_file_offset: 0x1000,
         target_address: "0x8001000",
         preview_byte_length: 8,
+        occupancy: { bytes: 16, complete: true },
       },
       {
         target_file_offset: 0x1010,
         target_address: "0x8001010",
         preview_byte_length: 6,
+        occupancy: { bytes: 6, complete: true },
       },
     ]);
     expect(budgets).toEqual([16, 6]);
@@ -222,6 +227,152 @@ describe("romHacking budgets and code caves", () => {
     });
     expect(top.total).toBe(3);
     expect(top.caves.map((cave) => cave.byte_length)).toEqual([96, 48]);
+  });
+});
+
+describe("pointer slot budgets", () => {
+  const zeroUnit = { size: 1, value: 0x00 } as const;
+
+  it("stops a slot at text that no examined entry points to", () => {
+    // "AB" 00 00 at 0x100, then "CD" 00 that a pointer on another page uses,
+    // then padding up to the next examined target at 0x140.
+    const window = Uint8Array.from([0x41, 0x42, 0x00, 0x00, 0x43, 0x44, 0x00]);
+    const occupancy = measurePointerSlotOccupancy({
+      window,
+      stringByteLength: 3,
+      ended: true,
+      unit: zeroUnit,
+      windowMayContinue: false,
+    });
+    expect(occupancy).toEqual({ bytes: 4, complete: true });
+    const budgets = computePointerSlotBudgets([
+      {
+        target_file_offset: 0x100,
+        target_address: "0x100",
+        preview_byte_length: 3,
+        occupancy,
+      },
+      {
+        target_file_offset: 0x140,
+        target_address: "0x140",
+        preview_byte_length: 3,
+        occupancy: { bytes: 3, complete: true },
+      },
+    ]);
+    expect(budgets).toEqual([4, 3]);
+  });
+
+  it("reports an unknown budget when the examined bytes cannot settle it", () => {
+    // The preview window ends inside the padding run, before the next target.
+    const occupancy = measurePointerSlotOccupancy({
+      window: Uint8Array.from([0x41, 0x00, 0x00, 0x00]),
+      stringByteLength: 2,
+      ended: true,
+      unit: zeroUnit,
+      windowMayContinue: true,
+    });
+    expect(occupancy).toEqual({ bytes: 4, complete: false });
+    const entries = [
+      {
+        target_file_offset: 0x10,
+        target_address: "0x10",
+        preview_byte_length: 2,
+        occupancy,
+      },
+      {
+        target_file_offset: 0x30,
+        target_address: "0x30",
+        preview_byte_length: 2,
+        occupancy: null,
+      },
+    ];
+    expect(computePointerSlotBudgets(entries)).toEqual([null, 2]);
+    // A next target inside the examined run is still a settled bound.
+    expect(
+      computePointerSlotBudgets([
+        entries[0]!,
+        { ...entries[1]!, target_file_offset: 0x13, target_address: "0x13" },
+      ]),
+    ).toEqual([3, 2]);
+    // A string whose end the decode never reached has no free padding.
+    expect(
+      measurePointerSlotOccupancy({
+        window: Uint8Array.from([0x41, 0xf0, 0x00, 0x00]),
+        stringByteLength: 1,
+        ended: false,
+        unit: zeroUnit,
+        windowMayContinue: false,
+      }),
+    ).toEqual({ bytes: 1, complete: false });
+  });
+});
+
+describe("control codes inside multi-byte encodings", () => {
+  const codes = (json: unknown) => {
+    const parsed = parseRomControlCodes(json as never);
+    if (!parsed.ok) throw new Error(parsed.error);
+    return parsed.value;
+  };
+
+  it("never matches a code on the second byte of a Shift-JIS glyph", () => {
+    // あ (82A0), ん (82F1), {COLOR 01}, こ (82B1), terminator.
+    const bytes = Uint8Array.from([
+      0x82, 0xa0, 0x82, 0xf1, 0xf1, 0x01, 0x82, 0xb1, 0x00, 0x41,
+    ]);
+    const decoded = decodeRomStringWithControlCodes(
+      bytes,
+      "sjis",
+      0x00,
+      undefined,
+      codes([{ hex: "F1", name: "COLOR", argument_bytes: 1, role: "plain" }]),
+    );
+    expect(decoded.text).toBe("あん{COLOR}こ");
+    expect(decoded.byte_length).toBe(9);
+    expect(decoded.stop).toBe("end-code");
+    expect(decoded.control_codes).toEqual([
+      { name: "COLOR", offset: 4, byte_length: 2, arguments_hex: "01" },
+    ]);
+  });
+
+  it("ends at a .tbl end token and keeps a glyph mapped to the 00 terminator", () => {
+    const tbl = parseCustomCharTable("00=あ\n01=A\n02=B\n/FF=\n");
+    if (!tbl.ok) throw new Error(tbl.error);
+    const wait = codes([
+      { hex: "F0", name: "WAIT", argument_bytes: 0, role: "plain" },
+    ]);
+    const ended = decodeRomStringWithControlCodes(
+      Uint8Array.from([0x01, 0xf0, 0x02, 0xff, 0x01, 0x01]),
+      "tbl",
+      null,
+      tbl.value,
+      wait,
+    );
+    expect(ended.byte_length).toBe(4);
+    expect(ended.stop).toBe("end-code");
+    expect(ended.text.startsWith("A{WAIT}B")).toBe(true);
+    // The plain decoder reads 00 as あ under the default terminator; so does
+    // the control-code decoder.
+    const zero = decodeRomStringWithControlCodes(
+      Uint8Array.from([0x01, 0x00, 0xf0, 0x02, 0xff]),
+      "tbl",
+      0x00,
+      tbl.value,
+      wait,
+    );
+    expect(zero.byte_length).toBe(5);
+    expect(zero.text.startsWith("Aあ{WAIT}B")).toBe(true);
+    expect(
+      decodeRomStringFromBytes(
+        Uint8Array.from([0x01, 0x00, 0x02, 0xff]),
+        "tbl",
+        0x00,
+        tbl.value,
+      ),
+    ).toMatchObject({
+      decoded: expect.stringMatching(/^AあB/u),
+      byteLength: 4,
+      terminated: true,
+    });
   });
 });
 

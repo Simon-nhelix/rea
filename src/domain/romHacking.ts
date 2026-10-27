@@ -5,9 +5,9 @@ import {
   matchRomControlCodeAt,
   romControlCodeFields,
   type RomControlCodeTable,
+  type RomGlyphReader,
   type RomTextWithControlCodes,
   romControlCodeUseSchema,
-  withTerminatorAsEndCode,
   withWordFormatControlCodes,
 } from "./romControlCodes.js";
 import {
@@ -29,7 +29,11 @@ import {
   type RomTextFilters,
 } from "./romTextQuality.js";
 import { DATA_TRACK_MODES, type DataTrackMode } from "./discImage.js";
-import { pointerTableCoverageSchema } from "./romPointerSegments.js";
+import {
+  isTerminatorAt,
+  pointerTableCoverageSchema,
+  type RomTerminatorUnit,
+} from "./romPointerSegments.js";
 
 /** Supported ROM text encodings for localization and string extraction. */
 export const ROM_TEXT_ENCODINGS = [
@@ -216,14 +220,20 @@ const decodeTextWord = (
 const decodeWordString = (
   bytes: Uint8Array,
   format: RomWordFormat,
-): { readonly text: string; readonly byteLength: number } => {
+): {
+  readonly text: string;
+  readonly byteLength: number;
+  readonly terminated: boolean;
+} => {
   const parts: string[] = [];
   let group: number | undefined;
   let pos = 0;
+  let terminated = false;
   while (pos + 1 < bytes.length) {
     const word = readWord(bytes, pos, format.littleEndian);
     if (word === format.terminatorWord) {
       pos += 2;
+      terminated = true;
       break;
     }
     if (word === format.newlineWord) {
@@ -238,7 +248,7 @@ const decodeWordString = (
     parts.push(decoded.text);
     pos += 2;
   }
-  return { text: parts.join(""), byteLength: pos };
+  return { text: parts.join(""), byteLength: pos, terminated };
 };
 
 const encodeWordQuery = (
@@ -344,6 +354,40 @@ export interface CustomCharTable {
   readonly maxTokenLength: number;
   readonly endTokens: ReadonlySet<TblByteKey>;
 }
+
+/** The longest .tbl entry at `pos`, and whether it is an end token. */
+const matchTblEntryAt = (
+  table: CustomCharTable,
+  bytes: Uint8Array,
+  pos: number,
+):
+  | { readonly text: string; readonly length: number; readonly end: boolean }
+  | undefined => {
+  const maxLen = Math.min(table.maxByteLength, bytes.length - pos);
+  for (let len = maxLen; len >= 1; len--) {
+    const bucket = table.decodeByLength.get(len);
+    if (bucket === undefined) continue;
+    const key = tblByteKey(bytes, pos, len);
+    const text = bucket.get(key);
+    if (text !== undefined)
+      return { text, length: len, end: table.endTokens.has(key) };
+  }
+  return undefined;
+};
+
+/**
+ * Whether the terminator byte at a .tbl position ends the string. A default
+ * 0x00 terminator yields to a glyph mapped there; any other terminator wins
+ * over every entry except an end token, which ends the string itself.
+ */
+const tblTerminatorEnds = (
+  terminatorByte: number | null,
+  byte: number | undefined,
+  entry: { readonly end: boolean } | undefined,
+): boolean =>
+  terminatorByte !== null &&
+  byte === terminatorByte &&
+  (entry === undefined || (terminatorByte !== 0x00 && !entry.end));
 
 /** Parse a standard ROM hacking .tbl character table (e.g. "8140= ", "00=[END]"). */
 export const parseCustomCharTable = (
@@ -593,6 +637,8 @@ export const decodeRomStringFromBytes = (
   readonly decoded: string;
   readonly byteLength: number;
   readonly rawHex: string;
+  /** The decode reached the string's terminator or .tbl end token. */
+  readonly terminated: boolean;
 } => {
   const canonical = normalizeRomTextEncoding(encoding);
   if (isWordRomTextEncoding(canonical)) {
@@ -607,53 +653,41 @@ export const decodeRomStringFromBytes = (
     }
     const decoded =
       format === undefined
-        ? { text: "", byteLength: 0 }
+        ? { text: "", byteLength: 0, terminated: false }
         : decodeWordString(bytes, format);
     const slice = bytes.subarray(0, decoded.byteLength);
     return {
       decoded: decoded.text,
       byteLength: slice.length,
       rawHex: formatHexPattern(slice),
+      terminated: decoded.terminated,
     };
   }
   if (canonical === "tbl" && customTable !== undefined) {
     let pos = 0;
+    let terminated = false;
     const parts: string[] = [];
     while (pos < bytes.length) {
-      let matchedText: string | undefined;
-      let matchedLen = 0;
-      let hitEndToken = false;
-      const maxLen = Math.min(customTable.maxByteLength, bytes.length - pos);
-      for (let len = maxLen; len >= 1; len--) {
-        const bucket = customTable.decodeByLength.get(len);
-        if (bucket === undefined) continue;
-        const byteKey = tblByteKey(bytes, pos, len);
-        const found = bucket.get(byteKey);
-        if (found !== undefined) {
-          matchedText = found;
-          matchedLen = len;
-          hitEndToken = customTable.endTokens.has(byteKey);
-          break;
-        }
-      }
-      if (
-        terminatorByte !== null &&
-        bytes[pos] === terminatorByte &&
-        (matchedText === undefined || (terminatorByte !== 0x00 && !hitEndToken))
-      ) {
+      const entry = matchTblEntryAt(customTable, bytes, pos);
+      if (tblTerminatorEnds(terminatorByte, bytes[pos], entry)) {
         pos += 1;
+        terminated = true;
         break;
       }
-      if (matchedText === undefined) break;
-      parts.push(matchedText);
-      pos += matchedLen;
-      if (hitEndToken) break;
+      if (entry === undefined) break;
+      parts.push(entry.text);
+      pos += entry.length;
+      if (entry.end) {
+        terminated = true;
+        break;
+      }
     }
     const slice = bytes.subarray(0, Math.max(pos, 1));
     return {
       decoded: parts.join(""),
       byteLength: slice.length,
       rawHex: formatHexPattern(slice),
+      terminated,
     };
   }
 
@@ -679,6 +713,7 @@ export const decodeRomStringFromBytes = (
       decoded: decoder.decode(content),
       byteLength: consumed.length,
       rawHex: formatHexPattern(consumed),
+      terminated: foundTerminator,
     };
   }
 
@@ -709,12 +744,90 @@ export const decodeRomStringFromBytes = (
     decoded: decoder.decode(content),
     byteLength: consumed.length,
     rawHex: formatHexPattern(consumed),
+    terminated: foundTerminator,
   };
 };
+
+const inRange = (byte: number | undefined, low: number, high: number) =>
+  byte !== undefined && byte >= low && byte <= high;
+
+/** Bytes of the multi-byte glyph at `at`, or 0 when it is not well formed. */
+const multiByteGlyphLength = (
+  canonical: CanonicalRomTextEncoding,
+  bytes: Uint8Array,
+  at: number,
+): number => {
+  const b0 = bytes[at];
+  if (b0 === undefined) return 0;
+  const b1 = bytes[at + 1];
+  if (canonical === "sjis" || canonical === "cp932") {
+    if (!inRange(b0, 0x81, 0x9f) && !inRange(b0, 0xe0, 0xfc)) return 1;
+    return inRange(b1, 0x40, 0xfc) && b1 !== 0x7f ? 2 : 0;
+  }
+  if (canonical === "euc-jp") {
+    if (b0 < 0x80) return 1;
+    if (b0 === 0x8e) return inRange(b1, 0xa1, 0xdf) ? 2 : 0;
+    if (b0 === 0x8f)
+      return inRange(b1, 0xa1, 0xfe) && inRange(bytes[at + 2], 0xa1, 0xfe)
+        ? 3
+        : 0;
+    return inRange(b0, 0xa1, 0xfe) && inRange(b1, 0xa1, 0xfe) ? 2 : 0;
+  }
+  if (canonical === "ascii") return 1;
+  // UTF-8, also the fallback of a .tbl encoding without a table.
+  const continuation = b0 < 0x80 ? 0 : b0 >= 0xf0 ? 3 : b0 >= 0xe0 ? 2 : 1;
+  if (continuation === 0) return 1;
+  if (b0 < 0xc2 || b0 > 0xf4) return 0;
+  for (let k = 1; k <= continuation; k++)
+    if (!inRange(bytes[at + k], 0x80, 0xbf)) return 0;
+  return continuation + 1;
+};
+
+/**
+ * Glyph boundaries of a byte encoding, ending at the terminator where the
+ * plain decoder of that encoding ends.
+ */
+const byteGlyphReader = (
+  canonical: CanonicalRomTextEncoding,
+  terminatorByte: number | null,
+  customTable: CustomCharTable | undefined,
+): RomGlyphReader => {
+  if (canonical === "tbl" && customTable !== undefined)
+    return (bytes, at) => {
+      const entry = matchTblEntryAt(customTable, bytes, at);
+      if (tblTerminatorEnds(terminatorByte, bytes[at], entry))
+        return { kind: "terminator", length: 1 };
+      if (entry === undefined) return undefined;
+      return { kind: entry.end ? "end-glyph" : "glyph", length: entry.length };
+    };
+  if (canonical === "utf-16le" || canonical === "utf-16be")
+    return (bytes, at) => {
+      if (at + 1 >= bytes.length) return undefined;
+      return terminatorByte !== null &&
+        bytes[at] === terminatorByte &&
+        bytes[at + 1] === terminatorByte
+        ? { kind: "terminator", length: 2 }
+        : { kind: "glyph", length: 2 };
+    };
+  return (bytes, at) => {
+    if (terminatorByte !== null && bytes[at] === terminatorByte)
+      return { kind: "terminator", length: 1 };
+    const length = multiByteGlyphLength(canonical, bytes, at);
+    return length === 0 ? undefined : { kind: "glyph", length };
+  };
+};
+
+/** Word encodings advance one 16-bit word at a time. */
+const wordGlyphReader: RomGlyphReader = (bytes, at) => ({
+  kind: "glyph",
+  length: Math.min(2, bytes.length - at),
+});
 
 /**
  * Decode one ROM string with declared control codes held apart from the glyph
  * runs, so argument bytes are never read as text and line breaks are visible.
+ * Codes match only at glyph boundaries of the encoding, and the string ends
+ * where its terminator or .tbl end token ends it.
  */
 export const decodeRomStringWithControlCodes = (
   bytes: Uint8Array,
@@ -751,14 +864,15 @@ export const decodeRomStringWithControlCodes = (
             ? undefined
             : { ...format, terminatorWord: null },
         ).decoded,
-      2,
+      wordGlyphReader,
     );
   }
   return decodeRomTextWithControlCodes(
     bytes,
-    withTerminatorAsEndCode(codes, terminatorByte),
+    codes,
     // Each run already ends at a code or the buffer, so no terminator applies.
     (run) => decodeRomStringFromBytes(run, encoding, null, customTable).decoded,
+    byteGlyphReader(canonical, terminatorByte, customTable),
   );
 };
 
@@ -1190,35 +1304,16 @@ function* scanByteStrings(
             continue;
           }
         }
-        let matchedText: string | undefined;
-        let matchedLen = 0;
-        let hitEnd = false;
-        const maxLen = Math.min(customTable.maxByteLength, bytes.length - pos);
-        for (let len = maxLen; len >= 1; len--) {
-          const bucket = customTable.decodeByLength.get(len);
-          if (bucket === undefined) continue;
-          const byteKey = tblByteKey(bytes, pos, len);
-          const found = bucket.get(byteKey);
-          if (found !== undefined) {
-            matchedText = found;
-            matchedLen = len;
-            hitEnd = customTable.endTokens.has(byteKey);
-            break;
-          }
-        }
-        if (
-          terminatorByte !== null &&
-          bytes[pos] === terminatorByte &&
-          (matchedText === undefined || (terminatorByte !== 0x00 && !hitEnd))
-        ) {
+        const entry = matchTblEntryAt(customTable, bytes, pos);
+        if (tblTerminatorEnds(terminatorByte, bytes[pos], entry)) {
           pos++;
           terminated = true;
           break;
         }
-        if (matchedText === undefined) break;
-        chars.push(matchedText);
-        pos += matchedLen;
-        if (hitEnd) {
+        if (entry === undefined) break;
+        chars.push(entry.text);
+        pos += entry.length;
+        if (entry.end) {
           terminated = true;
           break;
         }
@@ -1994,15 +2089,65 @@ export const scanPointerTableResultSchema = z.strictObject({
   source: romByteSourceSchema.optional(),
 });
 
+/** Bytes examined at each pointer target when measuring its in-place slot. */
+export const POINTER_SLOT_BUDGET_LIMIT = 4096;
+
 /**
- * Compute per-entry in-place byte budgets (distance to the next higher target offset
- * within the same string block, up to 4096 bytes; falls back to preview_byte_length).
+ * Bytes at one pointer target that hold its string and the terminator padding
+ * right after it. `complete` is false when that run may continue past the
+ * examined bytes, or when the decode stopped before the string ended.
+ */
+export interface PointerSlotOccupancy {
+  readonly bytes: number;
+  readonly complete: boolean;
+}
+
+/**
+ * Measure a target's occupied bytes from a decode of `window` (bytes starting
+ * at the target). Only terminator units directly after an ended string count
+ * as free padding; any other byte may belong to text another pointer, outside
+ * the examined entries, refers to.
+ */
+export const measurePointerSlotOccupancy = (input: {
+  readonly window: Uint8Array;
+  /** Decoded byte length, including the string's terminator or end code. */
+  readonly stringByteLength: number;
+  /** The decode reached the string's terminator, end token or end code. */
+  readonly ended: boolean;
+  readonly unit: RomTerminatorUnit | undefined;
+  /** Bytes after the window exist but were not examined. */
+  readonly windowMayContinue: boolean;
+}): PointerSlotOccupancy => {
+  const { window, unit } = input;
+  let end = Math.min(input.stringByteLength, window.length);
+  if (!input.ended)
+    return {
+      bytes: end,
+      complete: end >= window.length && !input.windowMayContinue,
+    };
+  if (unit === undefined) return { bytes: end, complete: true };
+  while (end + unit.size <= window.length && isTerminatorAt(window, end, unit))
+    end += unit.size;
+  return {
+    bytes: end,
+    complete: !(input.windowMayContinue && end + unit.size > window.length),
+  };
+};
+
+/**
+ * Compute per-entry in-place byte budgets: the distance to the next higher
+ * target offset (up to 4096 bytes), cut to the target's occupied bytes, so a
+ * slot never runs over text that pointers outside the examined entries may
+ * refer to. An occupancy that cannot settle the bound makes the budget null
+ * (unknown). Without a next target, falls back to preview_byte_length.
  */
 export const computePointerSlotBudgets = (
   entries: readonly {
     readonly target_file_offset: number | null;
     readonly target_address: string;
     readonly preview_byte_length: number | null;
+    /** Null when no bytes at the target were examined. */
+    readonly occupancy: PointerSlotOccupancy | null;
   }[],
 ): readonly (number | null)[] => {
   const useFileOffsets = entries.some((e) => e.target_file_offset !== null);
@@ -2023,18 +2168,20 @@ export const computePointerSlotBudgets = (
     const curr = sortedUnique[i]!;
     const next = sortedUnique[i + 1]!;
     const delta = next - curr;
-    if (delta > 0 && delta <= 4096) {
+    if (delta > 0 && delta <= POINTER_SLOT_BUDGET_LIMIT) {
       nextCoordMap.set(curr, delta);
     }
   }
 
   return entries.map((entry, idx) => {
     const coord = coords[idx] ?? null;
-    if (coord !== null) {
-      const budget = nextCoordMap.get(coord);
-      if (budget !== undefined) return budget;
-    }
-    return entry.preview_byte_length;
+    const distance = coord === null ? undefined : nextCoordMap.get(coord);
+    if (distance === undefined) return entry.preview_byte_length;
+    const occupied = entry.occupancy;
+    if (occupied === null) return null;
+    if (occupied.complete || occupied.bytes >= distance)
+      return Math.min(distance, occupied.bytes);
+    return null;
   });
 };
 
