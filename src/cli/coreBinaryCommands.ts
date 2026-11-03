@@ -1,3 +1,4 @@
+import { projectCliAnalysisResult } from "./projectCliAnalysisResult.js";
 import { z } from "incur";
 import { realpath, stat } from "node:fs/promises";
 import { findAppBundleResourceRoot } from "../application/AppBundleExecutable.js";
@@ -166,14 +167,16 @@ const registerOverviewCommands = (
           "binary_overview",
           {},
           directAnalysisOptionsFromCli(logger, options),
-        );
+        ).then(projectCliAnalysisResult);
       });
     },
   });
   cli.command(CLI_COMMANDS.inspect, {
     description: "Inspect an app overview with evidence",
     args: z.object({
-      path: z.string().describe("App, program, or analysis database path"),
+      path: localPathStringSchema.describe(
+        "App, program, or analysis database path",
+      ),
     }),
     options: overviewOptions,
     run: ({ args, options }) =>
@@ -183,7 +186,7 @@ const registerOverviewCommands = (
           "binary_overview",
           {},
           directAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -196,7 +199,7 @@ const registerDecompileCommand = (
   cli.command(CLI_COMMANDS.decompile, {
     description: `Read one part of an app as code. ${decompileSelectorGuidance} Equal positional and --procedure values are accepted; conflicts fail.`,
     args: z.object({
-      path: z.string().describe("App or program path"),
+      path: localPathStringSchema.describe("App or program path"),
       address: z
         .string()
         .min(1)
@@ -244,7 +247,7 @@ const registerDecompileCommand = (
             ),
           },
           directAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -291,7 +294,7 @@ const registerXrefsCommand = (
   cli.command(CLI_COMMANDS.xrefs, {
     description: `List bounded references to an analyzed address. ${namedAddressGuidance} ${equalSelectorGuidance}`,
     args: z.object({
-      path: z.string().describe("App or program path"),
+      path: localPathStringSchema.describe("App or program path"),
       address: z
         .string()
         .min(1)
@@ -323,7 +326,7 @@ const registerXrefsCommand = (
             ),
           },
           directAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -336,7 +339,7 @@ const registerTraceCommand = (
   cli.command(CLI_COMMANDS.trace, {
     description: `Trace a literal feature through analyzed references. ${querySelectorGuidance} ${equalSelectorGuidance}`,
     args: z.object({
-      path: z.string().describe("App or program path"),
+      path: localPathStringSchema.describe("App or program path"),
       query: z
         .string()
         .min(1)
@@ -373,7 +376,7 @@ const registerTraceCommand = (
             case_sensitive: options.caseSensitive,
           },
           directAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -386,7 +389,7 @@ const registerFunctionCommand = (
   cli.command(CLI_COMMANDS.function, {
     description: `Analyze one complete function with evidence. ${addressOrProcedureGuidance} ${equalSelectorGuidance}`,
     args: z.object({
-      path: z.string().describe("App or program path"),
+      path: localPathStringSchema.describe("App or program path"),
       address: z
         .string()
         .min(1)
@@ -445,7 +448,7 @@ const registerInstructionsCommand = (
   cli.command(CLI_COMMANDS.instructions, {
     description: `Read every raw instruction without decompiling. ${addressOrProcedureGuidance} ${equalSelectorGuidance}`,
     args: z.object({
-      path: z.string().describe("App or program path"),
+      path: localPathStringSchema.describe("App or program path"),
       address: z
         .string()
         .min(1)
@@ -477,7 +480,7 @@ const registerInstructionsCommand = (
             ),
           },
           directAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };
@@ -490,7 +493,7 @@ const registerSearchCommand = (
   cli.command(CLI_COMMANDS.search, {
     description: `Search every analyzed string or procedure name. ${patternSelectorGuidance} ${equalSelectorGuidance}`,
     args: z.object({
-      path: z.string().describe("App or program path"),
+      path: localPathStringSchema.describe("App or program path"),
       pattern: z
         .string()
         .min(1)
@@ -538,7 +541,7 @@ const registerSearchCommand = (
             case_sensitive: options.caseSensitive,
           },
           directAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       ),
   });
 };

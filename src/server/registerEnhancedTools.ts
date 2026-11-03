@@ -18,11 +18,13 @@ import {
   composedLimitationBudget,
   executeComposedWorkflow,
   createWorkflowEvidence,
+  retainPartialWorkflowEvidence,
   workflowSnapshotRecord,
   recordWorkflowUnknowns,
 } from "../application/WorkflowEvidence.js";
 import { toolContract } from "../contracts/toolContracts.js";
 import type { ToolContract } from "../contracts/toolContractTypes.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { AnalysisProfileCommitment } from "../domain/analysisProfile.js";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import { ok } from "../domain/result.js";
@@ -34,6 +36,7 @@ import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
 import { executeFunctionAnalysisEvidence } from "../application/FunctionAnalysisEvidence.js";
 import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
 import type { EvidenceLookup } from "../application/EvidenceInputResolver.js";
+import { retainAnalysisResultSources } from "../application/investigation/recordEvidenceSources.js";
 import {
   requireAnalysisViewRetention,
   summarizeRetainedAnalysis,
@@ -133,10 +136,11 @@ export const registerEnhancedTools = (
   server.registerTool(
     batchDecompile.name,
     toolRegistrationOptions(batchDecompile),
-    (input, context) =>
+    ({ detail, ...input }, context) =>
       executeEnhancedTool(registration, batchDecompile, {
         validatedCall: { name: "batch_decompile", input },
         context,
+        detail,
       }),
   );
   server.registerTool(
@@ -306,7 +310,7 @@ const executeEnhancedTool = async (
             progress,
           }),
       };
-      const result = await logToolExecution(registration.logger, name, () =>
+      let result = await logToolExecution(registration.logger, name, () =>
         executeComposedWorkflow(
           analysis,
           (observed) =>
@@ -316,6 +320,17 @@ const executeEnhancedTool = async (
             ).executeValidated(validatedCall, context.mcpReq.signal),
           composedLimitationBudget(name),
         ),
+      );
+      retainPartialWorkflowEvidence(result, {
+        target: registration.activeTarget?.(),
+        operation: name,
+        parameters,
+        upstreamProfile: registration.analysisProfile?.(name),
+      });
+      result = retainAnalysisResultSources(
+        name,
+        registration.recordEvidence,
+        result,
       );
       await reportOperationEnd(progress, name, result.ok);
       if (result.ok) {
@@ -375,7 +390,7 @@ const executeEnhancedTool = async (
             : recorded,
         );
       }
-      return registration.delivery.toCallToolResult(result, contract);
+      return deliverEnhancedFailure(registration, contract, result.error);
     },
   );
   return admitted.ok
@@ -439,7 +454,7 @@ const deliverFunctionAnalysis = async (
   },
 ): Promise<CallToolResult> => {
   const { detail, parameters, context, progress } = request;
-  const result = await logToolExecution(
+  let result = await logToolExecution(
     registration.logger,
     "analyze_function",
     () =>
@@ -453,9 +468,14 @@ const deliverFunctionAnalysis = async (
         },
       ),
   );
+  result = retainAnalysisResultSources(
+    "analyze_function",
+    registration.recordEvidence,
+    result,
+  );
   await reportOperationEnd(progress, "analyze_function", result.ok);
   if (!result.ok)
-    return registration.delivery.toCallToolResult(result, contract);
+    return deliverEnhancedFailure(registration, contract, result.error);
   if (detail === "summary") {
     const summary = summarizeRetainedAnalysis(result.value, {
       recordEvidence: registration.recordEvidence,
@@ -475,6 +495,23 @@ const deliverFunctionAnalysis = async (
     registration.recordEvidence?.(result.value),
   );
 };
+
+/**
+ * Deliver an analysis failure with any partial Evidence it carries, whether a
+ * stopped workflow or its failing read produced that partial.
+ */
+const deliverEnhancedFailure = (
+  registration: EnhancedToolRegistration & {
+    readonly delivery: ToolResultDelivery;
+  },
+  contract: ToolContract,
+  error: AnalysisError,
+): CallToolResult =>
+  registration.delivery.toPartialErrorToolResult(
+    error,
+    contract.returnsTargetContent,
+    registration.recordEvidence,
+  );
 
 const jsonParameters = (
   input: Readonly<Record<string, JsonValue | undefined>>,

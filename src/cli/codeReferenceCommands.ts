@@ -1,3 +1,4 @@
+import { projectCliAnalysisResult } from "./projectCliAnalysisResult.js";
 import { z } from "incur";
 import type { Logger } from "pino";
 import { CodeReferenceService } from "../application/romhacking/CodeReferenceService.js";
@@ -136,7 +137,7 @@ export const registerCodeReferenceCommands = (
             "rom-code-references",
             "find_code_references",
             signal,
-          ),
+          ).then(projectCliAnalysisResult),
         ),
       ),
   });

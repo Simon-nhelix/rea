@@ -1,4 +1,7 @@
-import { dosMzImageByteLength } from "./dosMz.js";
+import {
+  dosMzDeclaredImageByteLength,
+  readDosMzDeclarations,
+} from "./dosMz.js";
 import { err, ok, type Result } from "./result.js";
 
 /**
@@ -158,7 +161,9 @@ export const locateDosLinearHeader = (
           });
       }
     }
-    const extent = dosMzImageByteLength(header);
+    const declarations = readDosMzDeclarations(header);
+    if (!declarations.ok) break;
+    const extent = dosMzDeclaredImageByteLength(declarations.value);
     if (!extent.ok) break;
     const next = container + extent.value;
     if (next <= container || next + 4 > bytes.length) break;

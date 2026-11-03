@@ -11,8 +11,12 @@ export const executableFormatHintSchema = z.enum([
   "raw-binary",
   ...CONSOLE_TARGET_FORMATS,
   "gamecube-dol",
+  "esp-flash-image",
 ]);
-/** Explicit executable interpretation for raw, DOS COM, or console targets. */
+/**
+ * Explicit interpretation for formats with no identifying header, console
+ * formats, or, for esp-flash-image, a dump read with caller inputs.
+ */
 export type ExecutableFormatHint = z.infer<typeof executableFormatHintSchema>;
 
 /** Validate the single 64 KiB COM segment, excluding its 256-byte PSP prefix. */

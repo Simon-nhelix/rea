@@ -6,12 +6,14 @@ import { silentLogger } from "../logger.js";
 import { ghidraProfileInstallationHost as host } from "./GhidraInstallation.fixture.js";
 import { GhidraProvider } from "./GhidraProvider.js";
 
-// Digests were computed by the unmodified upstream resolver (3ae7daa10,
-// raw branch inline) and must not change when the binary-loader policy is shared.
+// Digests commit to the current shared policy, including the instruction
+// status, load-image relocation-symbol and procedure search revisions that
+// prevent reuse of snapshots with earlier results. The raw lane also commits
+// its file-offset-zero load address (v5), so a load-address change is a new profile.
 const RAW_DIGESTS = {
-  "6502": "adbec31711f31471f9cdbdbb2fc743a0ce6b46c9be5568bf90a3f51ef46e376d",
+  "6502": "d74f37861a50954ff6727e3f786214210c56c6df960c7bb1ab03c996a11c2988",
   "x86-disabled-analyzer":
-    "493a02888eca575be286b5a96041af8007444586854edb974d6a0c12fd2768c4",
+    "0d36d30f69a51712e152aecf6bfb4d009ece16c1bc36566f543ebfa168c828f8",
 } as const;
 
 const configFor = (environment: NodeJS.ProcessEnv) => {
@@ -30,10 +32,12 @@ const raw = (architecture: "6502" | "x86", entryPoint: string): BinaryTarget =>
     availableArchitectures: [architecture],
     entryPoint,
     entryPointSource: entryPoint,
+    loadAddress: entryPoint,
+    loadAddressSource: entryPoint,
   }) as unknown as BinaryTarget;
 
 describe("raw-binary analysis profile digest", () => {
-  it("keeps the 6502 raw profile digest from before the shared policy refactor", async () => {
+  it("commits the 6502 raw profile to the current shared policy", async () => {
     const ghidra = new GhidraProvider(configFor({}), silentLogger, {}, host);
     const resolved = await ghidra.resolveAnalysisProfile(raw("6502", "0x8001"));
     if (!resolved.ok) throw resolved.error;
@@ -43,7 +47,10 @@ describe("raw-binary analysis profile digest", () => {
       loader: "BinaryLoader",
       language_id: "6502:LE:16:default",
       language_selection: "caller-supplied-v1",
-      load_image_evidence: "independent-raw-mapping-context-v4",
+      load_image_evidence: "independent-raw-load-entry-context-v5",
+      load_image_observations:
+        "source-mappings-entry-context-relocation-symbol-v3",
+      instruction_status: "unlisted-address-without-decode-v1",
       analyzer_preset: "ghidra-default",
     });
   });

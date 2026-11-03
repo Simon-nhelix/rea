@@ -1,5 +1,9 @@
+import { safeParseUtf8Json } from "../../domain/safeJson.js";
 import { join } from "node:path";
-import { readStableArtifact } from "../../artifacts/readStableArtifact.js";
+import {
+  completedStableArtifact,
+  readStableArtifact,
+} from "../../artifacts/readStableArtifact.js";
 import { OwnedCommandFailure } from "../../process/OwnedCommand.js";
 import {
   PWNTOOLS_MEMORY_FAILURE_EXIT,
@@ -27,6 +31,7 @@ export interface PwntoolsLimitReport {
 
 /** Private failure-branch evidence; a bare launcher exit code is insufficient. */
 export interface PwntoolsFailureEvidence {
+  readonly finalizationFailures?: Readonly<Record<string, string>>;
   readonly limits?: PwntoolsLimitReport;
   readonly marker?: {
     readonly resource: "memory" | "file-size" | null;
@@ -40,6 +45,7 @@ export const readPwntoolsFailureEvidence = async (
   rootPath?: string,
   resources?: ArtifactResourceScope,
 ): Promise<PwntoolsFailureEvidence> => {
+  const finalizationFailures: Record<string, string> = {};
   let limitReport: PwntoolsLimitReport | undefined;
   let marker: PwntoolsFailureEvidence["marker"];
   if (
@@ -56,7 +62,13 @@ export const readPwntoolsFailureEvidence = async (
         undefined,
         undefined,
         resources,
-      );
+      ).catch((cause: unknown) => {
+        const completed = completedStableArtifact(cause);
+        if (completed === undefined) throw cause;
+        finalizationFailures["resource.failure"] =
+          cause instanceof Error ? cause.message : String(cause);
+        return completed;
+      });
       const expected =
         cause.snapshot.exitCode === PWNTOOLS_MEMORY_FAILURE_EXIT ? "M" : "F";
       if (!reported.bytes.equals(Buffer.from(expected, "ascii")))
@@ -93,11 +105,17 @@ export const readPwntoolsFailureEvidence = async (
         undefined,
         undefined,
         resources,
-      );
+      ).catch((cause: unknown) => {
+        const completed = completedStableArtifact(cause);
+        if (completed === undefined) throw cause;
+        finalizationFailures["limits.json"] =
+          cause instanceof Error ? cause.message : String(cause);
+        return completed;
+      });
+      const decoded = safeParseUtf8Json(reported.bytes);
+      if (!decoded.ok) throw decoded.cause;
       limitReport = {
-        limits: pwntoolsResourceLimitsSchema.parse(
-          JSON.parse(reported.bytes.toString("utf8")),
-        ),
+        limits: pwntoolsResourceLimitsSchema.parse(decoded.value),
         failure: null,
       };
     } catch (reportFailure: unknown) {
@@ -111,6 +129,9 @@ export const readPwntoolsFailureEvidence = async (
     }
   }
   return {
+    ...(Object.keys(finalizationFailures).length === 0
+      ? {}
+      : { finalizationFailures }),
     ...(limitReport === undefined ? {} : { limits: limitReport }),
     ...(marker === undefined ? {} : { marker }),
   };

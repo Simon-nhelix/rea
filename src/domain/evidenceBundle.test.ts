@@ -46,6 +46,36 @@ describe("evidence bundle artifact manifest", () => {
   );
 });
 
+describe("artifact manifest projection", () => {
+  it("round-trips GameCube DOL Evidence through retained bundles and target selection", () => {
+    const record = createEvidence(
+      {
+        path: "/tmp/game.dol",
+        sha256: targetDigest,
+        format: "gamecube-dol",
+        architecture: "powerpc",
+      },
+      provider,
+      {
+        operation: "inspect_artifact",
+        parameters: {},
+        result: { observed: true },
+      },
+    );
+    const bundle = createImmutableEvidenceBundle([record]);
+    expect(bundle.artifacts).toEqual([
+      {
+        digest: { sha256: targetDigest },
+        format: "gamecube-dol",
+        architecture: "powerpc",
+      },
+    ]);
+    const restored = parseEvidenceBundle(JSON.parse(JSON.stringify(bundle)));
+    expect(restored.records[0]?.evidence_id).toBe(record.evidence_id);
+    expect(evidenceBundleForTarget(restored, targetDigest)).toEqual(bundle);
+  });
+});
+
 describe("evidence bundle failure classification", () => {
   it("tags valid-shaped bundles that fail canonical ordering", () => {
     const records = ["first", "second"].map((label) =>

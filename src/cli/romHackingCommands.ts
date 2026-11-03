@@ -1,3 +1,4 @@
+import { projectCliAnalysisResult } from "./projectCliAnalysisResult.js";
 import { readFile } from "node:fs/promises";
 
 import { z } from "incur";
@@ -469,7 +470,7 @@ export const registerRomHackingCommands = (
               ? undefined
               : { path: options.output, overwrite: options.overwrite },
           ),
-        );
+        ).then(projectCliAnalysisResult);
       });
     },
   });
@@ -671,7 +672,7 @@ export const registerRomHackingCommands = (
               ? undefined
               : { path: options.output, overwrite: options.overwrite },
           ),
-        );
+        ).then(projectCliAnalysisResult);
       });
     },
   });
@@ -883,7 +884,7 @@ export const registerRomHackingCommands = (
             ...romWordFormatArguments(options),
           },
           romAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       );
     },
   });
@@ -992,7 +993,7 @@ export const registerRomHackingCommands = (
             resolve_xrefs: resolvedXrefs,
           },
           romAnalysisOptionsFromCli(logger, options),
-        ),
+        ).then(projectCliAnalysisResult),
       );
     },
   });

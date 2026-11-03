@@ -1,27 +1,29 @@
 import { procedureInfoSchema } from "../domain/native/procedureInfo.js";
 import { z } from "zod";
+import { investigationStatisticsSchema } from "../domain/investigationLifecycle.js";
+import { utcDateTimeSchema } from "../domain/offsetDateTime.js";
+import { analysisCleanupRetrySchema } from "../domain/analysisErrorRecovery.js";
 
-import { functionDossierSchema } from "../domain/hopperValues.js";
+import { functionDossierSchema } from "../domain/native/functionDossier.js";
 import { analysisProfileSchema } from "../domain/analysisProfile.js";
 import {
   evidenceSchema,
   validateAnalysisProfileProvider,
 } from "../domain/evidence.js";
-import { jsonValueSchema } from "../domain/jsonValue.js";
+import { jsonObjectSchema } from "../domain/jsonValue.js";
 import {
   PROVIDER_REJECTION_CODES,
   type ProviderRejectionCode,
-} from "./providerSelection.js";
+} from "../domain/providerSelection.js";
 import {
   PROVIDER_FAILURE_STAGES,
   PROVIDER_OPERATION_STATES,
   PROVIDER_RETRY_ACTIONS,
 } from "../domain/providerOperationHealth.js";
-import { analysisErrorProjectionSchema } from "./errorSchemas.js";
-import { relationshipCoverageSchema } from "../domain/relationshipCoverage.js";
-import { CONSOLE_TARGET_FORMATS } from "../domain/consoleRom.js";
-import { ZIP_PACKAGE_FORMATS } from "../domain/zipPackageFormat.js";
-import { objcClassImportIdentitySchema } from "../domain/native/objcSwiftMetadata.js";
+import {
+  objcClassDiscoveryCoverageSchema,
+  objcClassImportIdentitySchema,
+} from "../domain/native/objcSwiftMetadata.js";
 import { BINARY_SESSION_SUMMARY_OMITTED_FIELDS } from "./sessionStatusContract.js";
 
 /** Specialize the single normalized result inside a complete Evidence record. */
@@ -48,34 +50,8 @@ export const requireOutputSchema = <
   return schema;
 };
 
-export const targetFormatSchema = z.enum([
-  "hopper",
-  "analysis-database",
-  "mach-o",
-  "mach-o-universal",
-  "elf",
-  "pe",
-  "dos-mz",
-  "dos-com",
-  "raw-binary",
-  ...CONSOLE_TARGET_FORMATS,
-  "gamecube-dol",
-  ...ZIP_PACKAGE_FORMATS,
-  "asar",
-  "godot-pck",
-  "dmg",
-  "pkg",
-  "plist",
-  "javascript",
-  "source-map",
-]);
-
-export const targetKindSchema = z.enum([
-  "executable",
-  "database",
-  "archive",
-  "artifact",
-]);
+/** The readiness owner's repair instruction; never the failure description. */
+const providerRemediation = z.string().min(1);
 
 const providerCapabilityFacts = {
   operation: z.string(),
@@ -103,6 +79,7 @@ export const providerCapability = z.discriminatedUnion("available", [
     available: z.literal(false),
     reason: z.string().nullable(),
     availability_code: z.enum(PROVIDER_REJECTION_CODES).nullable(),
+    remediation: providerRemediation.exactOptional(),
   }),
 ]);
 export type ProviderCapability = z.output<typeof providerCapability>;
@@ -136,6 +113,7 @@ const providerCapabilityGroup = z.discriminatedUnion("available", [
     available: z.literal(false),
     reason: z.string().nullable(),
     availability_code: z.enum(PROVIDER_REJECTION_CODES).nullable(),
+    remediation: providerRemediation.exactOptional(),
   }),
 ]);
 
@@ -161,6 +139,9 @@ export const expandProviderCapabilities = (
           available: group.available,
           reason: group.reason,
           availability_code: group.availability_code,
+          ...("remediation" in group && group.remediation !== undefined
+            ? { remediation: group.remediation }
+            : {}),
           effects: Object.fromEntries(
             PROVIDER_EFFECT_NAMES.map((name) => [
               name,
@@ -182,13 +163,13 @@ const processCoordinates = {
 const processLineageObservation = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("unavailable"),
-    observed_at: z.iso.datetime(),
+    observed_at: utcDateTimeSchema,
     ...processCoordinates,
     reason: z.string().min(1),
   }),
   z.object({
     status: z.literal("verified"),
-    observed_at: z.iso.datetime(),
+    observed_at: utcDateTimeSchema,
     ...processCoordinates,
     launcher_parent_pid: z.int().min(0),
     descendants: z.array(
@@ -257,8 +238,6 @@ const providerRejectionCode: z.ZodType<ProviderRejectionCode> = z.enum(
   PROVIDER_REJECTION_CODES,
 );
 
-const providerDiagnostics = z.record(z.string(), jsonValueSchema);
-
 const providerAvailabilityStates = {
   unknown: z.object({
     status: z.literal("unknown"),
@@ -279,13 +258,14 @@ const providerAvailabilityStates = {
 
 const providerAvailability = z.discriminatedUnion("status", [
   providerAvailabilityStates.unknown.extend({
-    diagnostics: providerDiagnostics,
+    diagnostics: jsonObjectSchema,
   }),
   providerAvailabilityStates.available.extend({
-    diagnostics: providerDiagnostics,
+    diagnostics: jsonObjectSchema,
   }),
   providerAvailabilityStates.unavailable.extend({
-    diagnostics: providerDiagnostics,
+    remediation: providerRemediation,
+    diagnostics: jsonObjectSchema,
   }),
 ]);
 
@@ -315,13 +295,13 @@ const providerTargetSupportStates = {
 
 const providerTargetSupport = z.discriminatedUnion("status", [
   providerTargetSupportStates.unknown.extend({
-    diagnostics: providerDiagnostics,
+    diagnostics: jsonObjectSchema,
   }),
   providerTargetSupportStates.supported.extend({
-    diagnostics: providerDiagnostics,
+    diagnostics: jsonObjectSchema,
   }),
   providerTargetSupportStates.unsupported.extend({
-    diagnostics: providerDiagnostics,
+    diagnostics: jsonObjectSchema,
   }),
 ]);
 
@@ -334,7 +314,7 @@ export const analysisProviderCandidate = z.object({
   capabilities: z.array(providerCapabilitySet),
 });
 
-/** Summary candidate: the same status, code, and reason without diagnostics or capabilities. */
+/** Summary candidate: the same status, code, and reason without remediation, diagnostics or capabilities. */
 export const analysisProviderCandidateSummary = z.strictObject({
   provider: providerIdentity,
   availability: z.discriminatedUnion("status", [
@@ -563,7 +543,9 @@ export function expandToolAvailability(
 /** Session status facts shared by every detail level and session kind. */
 export const sessionProviderFacts = z
   .object({
+    investigation: investigationStatisticsSchema,
     cleanup_pending: z.boolean(),
+    cleanup_retry: analysisCleanupRetrySchema.optional(),
     capabilities: z.array(providerCapabilitySet),
     analysis_run: analysisRun,
     analysis_activity: analysisActivity,
@@ -654,12 +636,6 @@ export const sessionStatusDetailShapes = [
   },
 ] as const;
 
-/** Session status for either detail level, keyed by `detail`. */
-export const sessionProvider = z.discriminatedUnion("detail", [
-  sessionProviderFacts.extend(sessionStatusDetailShapes[0]),
-  sessionProviderFacts.extend(sessionStatusDetailShapes[1]),
-]);
-
 export const nullableText = z.string().nullable();
 export const addressedEntry = z.object({
   address: z.string(),
@@ -716,17 +692,7 @@ export const objcClassDiscoveryOutput = evidenceResultOf(
           .optional(),
       }),
     ),
-    identity_coverage: z.strictObject({
-      status: z.enum([
-        "complete",
-        "partial",
-        "unsupported",
-        "not_requested",
-        "unknown",
-        "not_applicable",
-      ]),
-      reason: z.string().nullable(),
-    }),
+    identity_coverage: objcClassDiscoveryCoverageSchema,
   }),
 );
 

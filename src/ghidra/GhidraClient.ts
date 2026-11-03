@@ -1,3 +1,4 @@
+import { ghidraAsciiLiteralCandidate } from "./GhidraLiteralSearch.js";
 import {
   fileSnapshotPartialObservationSchema,
   type FileSnapshotPartialObservation,
@@ -39,7 +40,7 @@ import {
   type ProviderProcessSnapshot,
   ProviderProcessSupervisor,
 } from "../process/ProviderProcess.js";
-import { DEFAULT_GHIDRA_STARTUP_TIMEOUT_MS } from "../config/providerStartupTimeout.js";
+import { DEFAULT_GHIDRA_STARTUP_TIMEOUT_MS } from "../domain/analysisResourceLimits.js";
 import { DEFAULT_BRIDGE_MAX_REQUEST } from "../config/bridgeMaxRequestBytes.js";
 import type {
   GhidraClientOptions,
@@ -373,7 +374,10 @@ export class GhidraClient {
     return this.#parseSessionInfo(result.value);
   }
 
-  /** Execute one admitted operation through the serial per-Program queue. */
+  /** Execute one admitted operation through the serial per-Program queue.
+   * Insensitive literal searches return conservative native candidates; the
+   * inventory adapter owns shared matching and retains these raw source rows.
+   */
   async callTool(
     operation: GhidraOperation,
     parameters: Readonly<Record<string, JsonValue>>,
@@ -385,12 +389,7 @@ export class GhidraClient {
   ): Promise<Result<JsonValue, GhidraSessionError>> {
     const started = await this.start(options.signal, options.progress);
     if (!started.ok) return started;
-    return this.#requestQueue.run(operation, parameters, {
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-      ...(options.decompileTimeoutSeconds === undefined
-        ? {}
-        : { decompileTimeoutSeconds: options.decompileTimeoutSeconds }),
-    });
+    return this.#callTool(operation, parameters, options);
   }
 
   /** Dispatch against the connected bridge without invoking startup or retry. */
@@ -400,10 +399,38 @@ export class GhidraClient {
     options: { readonly signal?: AbortSignal } = {},
   ): Promise<Result<JsonValue, GhidraSessionError> | undefined> {
     if (!this.isReady()) return Promise.resolve(undefined);
+    return this.#callTool(operation, parameters, options);
+  }
+
+  async #callTool(
+    operation: GhidraOperation,
+    parameters: Readonly<Record<string, JsonValue>>,
+    options: {
+      readonly signal?: AbortSignal;
+      readonly decompileTimeoutSeconds?: number | null;
+    },
+  ): Promise<Result<JsonValue, GhidraSessionError>> {
+    const pattern =
+      (operation === "search_procedures" || operation === "search_strings") &&
+      parameters.mode === "literal" &&
+      parameters.case_sensitive === false &&
+      typeof parameters.pattern === "string"
+        ? parameters.pattern
+        : undefined;
     return this.#requestQueue.run(
       operation,
-      parameters,
-      options.signal === undefined ? {} : { signal: options.signal },
+      pattern !== undefined
+        ? {
+            ...parameters,
+            literal_ascii_candidate: ghidraAsciiLiteralCandidate(pattern),
+          }
+        : parameters,
+      {
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+        ...(options.decompileTimeoutSeconds === undefined
+          ? {}
+          : { decompileTimeoutSeconds: options.decompileTimeoutSeconds }),
+      },
     );
   }
 
@@ -1107,7 +1134,9 @@ export class GhidraClient {
     const parsed = parseGhidraSessionInfo(value, {
       runId,
       expectedReadOnly:
+        this.#options.existingProject === true ||
         this.#options.transport === "authenticated-loopback-tcp",
+      expectedExistingProject: this.#options.existingProject === true,
       providerVersion: this.#options.providerVersion,
       profileDigest: this.#options.profileDigest,
       targetSha256: this.#options.targetSha256,

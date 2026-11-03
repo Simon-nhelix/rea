@@ -138,14 +138,17 @@ const applicationLocationSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 
-/** Explicit source-location availability for one graph fact. */
-const applicationLocationReferenceSchema = z.discriminatedUnion("available", [
-  z.strictObject({
-    available: z.literal(true),
-    value: applicationLocationSchema,
-  }),
-  unavailableFactSchema,
-]);
+/** Source-location availability and coordinates retained on each graph fact. */
+export const applicationGraphEvidenceLocationSchema = z.discriminatedUnion(
+  "available",
+  [
+    z.strictObject({
+      available: z.literal(true),
+      value: applicationLocationSchema,
+    }),
+    unavailableFactSchema,
+  ],
+);
 
 /** Versioned extractor coordinates attached to every graph fact. */
 const applicationExtractorSchema = z.strictObject({
@@ -241,7 +244,7 @@ const applicationGraphEvidenceBaseSchema = z.strictObject({
   state: applicationFactStateSchema,
   confidence: applicationConfidenceSchema,
   artifact: applicationArtifactReferenceSchema,
-  location: applicationLocationReferenceSchema,
+  location: applicationGraphEvidenceLocationSchema,
   extractor: applicationExtractorSchema,
   coverage: applicationCoverageSchema,
   limitations: z.array(boundedTextSchema),
@@ -251,10 +254,6 @@ const applicationGraphEvidenceBaseSchema = z.strictObject({
 /** Shared provenance fields apart from the fact-specific evidence location. */
 export const applicationGraphEvidenceContextSchema =
   applicationGraphEvidenceBaseSchema.omit({ location: true });
-
-/** Exact coordinates retained on each graph fact. */
-export const applicationGraphEvidenceLocationSchema =
-  applicationLocationReferenceSchema;
 
 type EvidenceValue = z.infer<typeof applicationGraphEvidenceBaseSchema>;
 

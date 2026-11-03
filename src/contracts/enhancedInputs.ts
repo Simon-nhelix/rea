@@ -9,6 +9,7 @@ import {
   scanPointerTableInputSchema,
   searchRomStringsInputSchema,
 } from "../domain/romHacking.js";
+import { nativeInvestigationTraceLimitsSchema } from "../domain/native/nativeInvestigationGraph.js";
 const traceLiteralInputSchema = z.strictObject({
   query: z.string().min(1),
   case_sensitive: z.boolean().default(false),
@@ -70,16 +71,13 @@ export const enhancedInputSchemas = {
       .optional(),
     direction: callRelationshipDirectionSchema,
   }),
-  trace_native_ui_action: z.strictObject({
+  trace_native_ui_action: nativeInvestigationTraceLimitsSchema.extend({
     action: z
       .string()
       .min(1)
       .describe(
         "A unique compiled UI action selector, interface object ID, native symbol or exact function address",
       ),
-    max_depth: z.int().min(0).max(32).default(8),
-    max_nodes: z.int().min(1).max(2_000).default(250),
-    max_edges: z.int().min(1).max(5_000).default(500),
   }),
   search_rom_strings: searchRomStringsInputSchema,
   scan_pointer_table: scanPointerTableInputSchema,
