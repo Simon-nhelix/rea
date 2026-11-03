@@ -365,6 +365,11 @@ first (reported file offsets and digests still identify the original dump).
 DMA-loaded overlays keep cartridge-image coordinates here, not the RDRAM
 addresses the game loads them to.
 
+DOS programs use `--architecture x86-16` (MZ/COM) or `x86-32` (DOS extender
+LE/LX). The header supplies the load address, and relocations or fixups are
+applied before the scan; see [DOS localization scans](ghidra-dos.md#localization-scans)
+for coordinates, `--data-segment`, and far-pointer tables.
+
 ## Processor prerequisites
 
 These are optional source corrections for an existing, caller-owned Ghidra

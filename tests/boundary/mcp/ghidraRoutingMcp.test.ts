@@ -87,6 +87,7 @@ describe("Ghidra MCP capability routing", () => {
                   gb: "sm83",
                   wsc: "x86",
                   n64: "r4300",
+                  "dos-le": "x86",
                 } as const
               )[format],
               entry_point: "0x8000",

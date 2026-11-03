@@ -1,3 +1,4 @@
+import { DOS_REAL_MODE_LOAD_SEGMENT } from "../domain/dosRealModeImage.js";
 import { createHash } from "node:crypto";
 import {
   nativeLoadImageSchema,
@@ -75,7 +76,7 @@ export const prepareGhidraDosLoadImage = (
   const header = parsed.value;
   if (header.imageBytes > bytes.length)
     return err("DOS MZ initialized image was not completely captured");
-  const loadSegment = 0x1000;
+  const loadSegment = DOS_REAL_MODE_LOAD_SEGMENT;
   const modified = Buffer.from(bytes.subarray(0, header.imageBytes));
   const applied = [];
   for (let index = 0; index < header.relocationCount; index += 1) {

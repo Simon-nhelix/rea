@@ -17,7 +17,7 @@ import {
 import {
   resolveConsoleFileOffset,
   resolveConsoleVirtualAddress,
-  unswapN64Bytes,
+  consoleLoadedFileBytes,
   type ConsolePointerSource,
 } from "../../domain/consoleRom.js";
 import {
@@ -39,7 +39,9 @@ import {
   normalizeRomTextEncoding,
   parseCustomCharTable,
   parseRomScanCursor,
+  pointerFormAddress,
   readPointerValue,
+  type PointerForm,
   requiresRomCharTable,
   resolveRomWordFormat,
   scanRomStrings,
@@ -78,6 +80,12 @@ import {
   type RomByteSourceDescription,
 } from "./LocalByteSource.js";
 import { jsonValueSchema, type JsonValue } from "../../domain/jsonValue.js";
+import {
+  dosRealModeFileOffset,
+  dosRealModeLinearAddress,
+  dosRealModeRelocatedFileBytes,
+  parseDosRealModeImage,
+} from "../../domain/dosRealModeImage.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 
@@ -125,6 +133,12 @@ interface LocalRomContext {
 /** A parsed target, or a local file read as plain bytes. */
 export type RomToolTarget = BinaryTarget | LocalByteSource;
 
+/** DOS MZ and COM programs, scanned at their real-mode linear addresses. */
+const isDosRealModeTarget = (
+  target: BinaryTarget,
+): target is BinaryTarget & { readonly format: "dos-mz" | "dos-com" } =>
+  target.format === "dos-mz" || target.format === "dos-com";
+
 const ROM_BYTES_CACHE_LIMIT = 4;
 const romBytesCache = new Map<string, Buffer>();
 
@@ -146,14 +160,17 @@ const readRomBytesCached = async (
   } catch {
     return undefined;
   }
-  // Undo the byte permutation the console admission declared (byteswapped
-  // or little-endian dumps) so scans decode native bytes; the cache key
-  // still identifies the original file.
-  if (
-    isConsoleBinaryTarget(target) &&
-    target.consoleRom.fileByteSwap !== undefined
-  ) {
-    romBytes = unswapN64Bytes(romBytes, target.consoleRom.fileByteSwap);
+  // Read what the console loader sees at the original file offsets (native
+  // N64 byte order, applied dos-le fixups); the cache key still identifies
+  // the original file.
+  if (isConsoleBinaryTarget(target)) {
+    const loaded = consoleLoadedFileBytes(target.consoleRom, romBytes);
+    if (!loaded.ok) return undefined;
+    romBytes = loaded.value;
+  } else if (isDosRealModeTarget(target)) {
+    const image = parseDosRealModeImage(target.format, romBytes);
+    if (!image.ok) return undefined;
+    romBytes = dosRealModeRelocatedFileBytes(romBytes, image.value);
   }
   romBytesCache.set(key, romBytes);
   while (romBytesCache.size > ROM_BYTES_CACHE_LIMIT) {
@@ -213,12 +230,29 @@ const loadLocalRomContext = async (
   }
   if (
     target.kind !== "executable" ||
-    (!isConsoleBinaryTarget(target) && target.format !== "raw-binary")
+    (!isConsoleBinaryTarget(target) &&
+      target.format !== "raw-binary" &&
+      !isDosRealModeTarget(target))
   ) {
     return undefined;
   }
   const romBytes = await readRomBytesCached(target);
   if (romBytes === undefined) return undefined;
+  if (isDosRealModeTarget(target)) {
+    const image = parseDosRealModeImage(target.format, romBytes);
+    if (!image.ok) return undefined;
+    return {
+      romBytes,
+      toFileOffset: (virtualAddress) =>
+        virtualAddress > BigInt(Number.MAX_SAFE_INTEGER)
+          ? null
+          : dosRealModeFileOffset(image.value, Number(virtualAddress)),
+      toVirtualAddress: (fileOffset) => {
+        const linear = dosRealModeLinearAddress(image.value, fileOffset);
+        return linear === null ? null : `0x${linear.toString(16)}`;
+      },
+    };
+  }
   if (isConsoleBinaryTarget(target)) {
     const admission = target.consoleRom;
     return {
@@ -527,6 +561,33 @@ const resolvePointerBase = (
   return fail(
     "base_mode segment needs segment_start (one segment) or segment_align (every aligned segment start).",
   );
+};
+
+/** x86 far pointers are 4-byte little-endian offset:segment words read in address mode. */
+const checkPointerForm = (
+  operation: string,
+  input: {
+    readonly pointer_form?: PointerForm | undefined;
+    readonly pointer_size: 2 | 3 | 4;
+    readonly endian: "little" | "big";
+    readonly infer_base_address?: boolean | undefined;
+  },
+  pointerBase: PointerBase,
+): Result<null, AnalysisError> => {
+  if (input.pointer_form !== "x86-far") return ok(null);
+  const problem =
+    input.pointer_size !== 4
+      ? "pointer_form x86-far needs pointer_size 4 (offset word, then segment word)."
+      : input.endian !== "little"
+        ? "pointer_form x86-far needs endian little."
+        : pointerBase.mode !== "address"
+          ? "pointer_form x86-far needs base_mode address."
+          : input.infer_base_address === true
+            ? "pointer_form x86-far does not infer a base address; give base_address (0x0 when the file's segments are loaded as REA reports them)."
+            : undefined;
+  return problem === undefined
+    ? ok(null)
+    : err(new AnalysisInputError(operation, { userMessage: problem }));
 };
 
 const SEGMENT_NEEDS_LOCAL_BYTES =
@@ -1612,6 +1673,12 @@ export const executeScanPointerTable = async (
   );
   if (!pointerBaseResult.ok) return pointerBaseResult;
   const pointerBase = pointerBaseResult.value;
+  const pointerFormCheck = checkPointerForm(
+    "scan_pointer_table",
+    input,
+    pointerBase,
+  );
+  if (!pointerFormCheck.ok) return pointerFormCheck;
   const segment =
     pointerBase.mode === "segment" && "start" in pointerBase
       ? pointerBase
@@ -1730,7 +1797,7 @@ export const executeScanPointerTable = async (
         if (segment === undefined) {
           const resolvedTarget = resolvePointerTargetInFile(
             baseAddrResult.value,
-            rawValue,
+            pointerFormAddress(rawValue, input.pointer_form),
             localRom.romBytes.length,
             localRom.toFileOffset,
             { tableFileOffset: entryFileOffset, pointerBytes: pointerWidth },
@@ -2029,6 +2096,9 @@ export const executeScanPointerTable = async (
         endian,
         base_address: `0x${baseAddrResult.value.toString(16)}`,
         base_mode: pointerBase.mode,
+        ...(input.pointer_form === "x86-far"
+          ? { pointer_form: input.pointer_form }
+          : {}),
         ...(segment === undefined
           ? {}
           : { segment_start: segment.start, segment_length: segment.length }),
@@ -2105,7 +2175,7 @@ export const executeScanPointerTable = async (
       index: input.start_index + localIndex,
       entry_address: `0x${(tableAddrResult.value + BigInt(input.start_index * stride + byteOffset)).toString(16)}`,
       raw_pointer: `0x${rawValue.toString(16).padStart(pointerWidth * 2, "0")}`,
-      target_address: `0x${(baseAddrResult.value + rawValue).toString(16)}`,
+      target_address: `0x${(baseAddrResult.value + pointerFormAddress(rawValue, input.pointer_form)).toString(16)}`,
     });
   }
 
@@ -2292,6 +2362,9 @@ export const executeScanPointerTable = async (
     pointer_size: pointerWidth,
     endian,
     base_address: `0x${baseAddrResult.value.toString(16)}`,
+    ...(input.pointer_form === "x86-far"
+      ? { pointer_form: input.pointer_form }
+      : {}),
     stride,
     encoding: input.encoding,
     entries: input.manuscript_only ? [] : enrichedEntries,
@@ -2484,6 +2557,12 @@ export const executeDiscoverPointerTables = async (
   );
   if (!pointerBaseResult.ok) return pointerBaseResult;
   const pointerBase = pointerBaseResult.value;
+  const pointerFormCheck = checkPointerForm(
+    "discover_pointer_tables",
+    input,
+    pointerBase,
+  );
+  if (!pointerFormCheck.ok) return pointerFormCheck;
 
   const tableResult = await loadCustomTable(
     "discover_pointer_tables",
@@ -2733,7 +2812,7 @@ export const executeDiscoverPointerTables = async (
       if (rawVal === 0n) return null;
       return resolvePointerTargetInFile(
         effectiveBaseAddr,
-        rawVal,
+        pointerFormAddress(rawVal, input.pointer_form),
         romBuffer.length,
         toFileOffset,
         { tableFileOffset: entryOffset, pointerBytes: pointerWidth },
@@ -2888,11 +2967,14 @@ export const executeDiscoverPointerTables = async (
           segmentStart === null
             ? resolvePointerTargetInFile(
                 effectiveBaseAddr,
-                readPointerValue(
-                  romBuffer,
-                  entryFileOffset,
-                  pointerWidth,
-                  endian,
+                pointerFormAddress(
+                  readPointerValue(
+                    romBuffer,
+                    entryFileOffset,
+                    pointerWidth,
+                    endian,
+                  ),
+                  input.pointer_form,
                 ),
                 romBuffer.length,
                 toFileOffset,
@@ -3150,6 +3232,9 @@ export const executeDiscoverPointerTables = async (
     stride,
     bytes_scanned: Math.max(0, scanEndOffset - scanStartOffset),
     base_mode: pointerBase.mode,
+    ...(input.pointer_form === "x86-far"
+      ? { pointer_form: input.pointer_form }
+      : {}),
     ...(pointerBase.mode === "address"
       ? {}
       : "start" in pointerBase

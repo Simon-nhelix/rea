@@ -22,7 +22,7 @@ const hex16 = (value: number): string =>
 const hex24 = (value: number): string =>
   `0x${(value & 0xffffff).toString(16).padStart(6, "0")}`;
 
-const formatBytes = (
+export const formatBytes = (
   bytes: Uint8Array,
   offset: number,
   length: number,
@@ -49,7 +49,7 @@ export const callerSignatureAt = (
   return hexParts.join("");
 };
 
-const makeTargetFinder = (scanTargets: readonly ScanTarget[]) => {
+export const makeTargetFinder = (scanTargets: readonly ScanTarget[]) => {
   const targets: Target[] = scanTargets.map((target, index) => ({
     start: target.address >>> 0,
     length: target.length,
@@ -796,7 +796,10 @@ export const scanArmOrThumbRegion = (
 };
 
 export const scanArchitectureRegion = (
-  architecture: Exclude<CodeReferenceArchitecture, "mips-le" | "mips-be">,
+  architecture: Exclude<
+    CodeReferenceArchitecture,
+    "mips-le" | "mips-be" | "x86-16" | "x86-32"
+  >,
   region: ScanRegion,
   scanTargets: readonly ScanTarget[],
   kinds: ReadonlySet<CodeReferenceKind>,

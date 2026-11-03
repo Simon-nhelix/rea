@@ -1,3 +1,4 @@
+import { dosFarPointerLinearAddress } from "./dosRealModeImage.js";
 import { z } from "zod";
 import { err, ok, type Result } from "./result.js";
 import {
@@ -1856,6 +1857,28 @@ export const searchRomStringsResultSchema = z.strictObject({
 /** How raw pointer values become file offsets (shared by the pointer tools). */
 export const POINTER_BASE_MODES = ["address", "segment"] as const;
 
+/** How a raw pointer word encodes an address (shared by the pointer tools). */
+export const POINTER_FORMS = ["linear", "x86-far"] as const;
+export type PointerForm = (typeof POINTER_FORMS)[number];
+
+const pointerFormFields = {
+  pointer_form: z
+    .enum(POINTER_FORMS)
+    .optional()
+    .describe(
+      "How a raw pointer value encodes an address: linear (default) = the value itself; x86-far = a 4-byte little-endian DOS real-mode offset:segment pointer whose address is segment * 16 + offset (base_mode address, pointer_size 4).",
+    ),
+};
+
+/** The address a raw pointer value names before base_address is added. */
+export const pointerFormAddress = (
+  raw: bigint,
+  form: PointerForm | undefined,
+): bigint =>
+  form === "x86-far"
+    ? BigInt(dosFarPointerLinearAddress(Number(raw & 0xffffffffn)))
+    : raw;
+
 const pointerSegmentFields = {
   base_mode: z
     .enum(POINTER_BASE_MODES)
@@ -1927,6 +1950,7 @@ export const scanPointerTableInputSchema = z.strictObject({
       "Base address added to each raw pointer value (e.g. 0x08000000 for 16-bit relative offsets).",
     ),
   ...pointerSegmentFields,
+  ...pointerFormFields,
   stride: z
     .number()
     .int()
@@ -2073,6 +2097,7 @@ export const scanPointerTableResultSchema = z.strictObject({
   endian: z.enum(["little", "big"]),
   base_address: z.string(),
   base_mode: z.enum(POINTER_BASE_MODES).optional(),
+  pointer_form: z.enum(POINTER_FORMS).optional(),
   segment_start: z.number().int().min(0).optional(),
   segment_length: z.number().int().min(1).optional(),
   stride: z.number().int().min(1),
@@ -2246,6 +2271,7 @@ export const discoverPointerTablesInputSchema = z.strictObject({
     .optional()
     .describe("Bytes per table entry; defaults to pointer_size."),
   ...pointerSegmentFields,
+  ...pointerFormFields,
   segment_align: z
     .number()
     .int()
@@ -2379,6 +2405,7 @@ export const discoverPointerTablesResultSchema = z.strictObject({
   stride: z.number().int().min(1),
   bytes_scanned: z.number().int().min(0),
   base_mode: z.enum(POINTER_BASE_MODES).optional(),
+  pointer_form: z.enum(POINTER_FORMS).optional(),
   segment_start: z.number().int().min(0).optional(),
   segment_length: z.number().int().min(1).optional(),
   segment_align: z.number().int().min(1).optional(),

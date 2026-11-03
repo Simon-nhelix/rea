@@ -27,8 +27,9 @@ The DOS MZ parser validates page counts, initialized module length, header and
 relocation-table bounds, relocation destinations, and the initialized entry
 point using the available structural bytes and actual file length. It reports
 those DOS facts separately from Windows-header evidence. A recognized PE
-signature remains PE; recognized NE, LE, and LX headers are explicitly
-unsupported. A nonzero Windows-header pointer without a recognized signature
+signature remains PE; a recognized NE header is explicitly unsupported, and
+LE/LX headers select the [DOS extender LE/LX](#dos-extender-lelx-programs)
+target instead of the MZ stub. A nonzero Windows-header pointer without a recognized signature
 usually remains an unresolved candidate, even when the DOS structure validates:
 automatic target selection fails closed and reports both observations. When a
 nonempty relocation table ends inside a complete DOS header, the remaining
@@ -172,11 +173,69 @@ program's recovered code. Retain both artifact digests and the transformation
 evidence; REA never silently replaces the admitted target. Appended overlays
 are separate from the initialized MZ module. Headerless COM requires the
 [explicit COM interpretation](#headerless-com-images); REA does not guess it
-from the filename or unrecognized bytes. DOS extenders without an admitted
-MZ real-mode entry remain outside this import boundary.
+from the filename or unrecognized bytes. DOS/4GW-style LE/LX programs are
+admitted separately (below); other DOS extender formats (DOS/16M `BW`,
+Phar Lap `P2`/`P3`, NE) remain outside this import boundary.
 
 DOS MZ is available through Ghidra, with no Hopper support claim. It is outside
 the Windows native PE P0 boundary. macOS x64 DOS verification remains unverified.
+
+## DOS extender LE/LX programs
+
+A 32-bit DOS program built for DOS/4GW, DOS/32A, PMODE/W or CauseWay usually
+has an MZ stub followed by an `LE` or `LX` header. REA finds the header through
+`e_lfanew`, or after a bound extender stub when `e_lfanew` is zero, and admits
+the file as format `dos-le` (`x86:LE:32:default`). Each object is mapped flat at
+its relocation base; the zero-filled tail of an object has no file bytes.
+
+Internal fixups (`offset32`, `relative32`, 16-bit offsets and 16:32 pointers)
+are applied as loader patches, so Ghidra reads the addresses the extender
+writes at load time. Local scans (`search-rom-strings`, `scan-pointer-table`,
+`discover-pointer-tables`, `find-code-references`) read a relocated copy of the
+file at the original file offsets. Import and entry-table fixups are counted
+but not applied.
+
+## Localization scans
+
+Local scans use the same linear addresses as Ghidra:
+
+- MZ: the load module starts at `0x10000` (segment `0x1000`), and segment
+  relocations are applied before scanning. The header and appended overlays
+  have no address.
+- COM: the image starts at `0x10100`, after the 256-byte program segment
+  prefix.
+- LE/LX: each object sits at its relocation base, with internal fixups
+  applied.
+
+A real-mode far pointer (offset word, then segment word) names
+`segment * 16 + offset`. Read such a table with `pointer_form: "x86-far"`
+(CLI `--pointer-form x86-far`, pointer size 4, little endian, `base_mode`
+`address`). A near pointer is an offset inside a data segment: pass
+`base_address` as `DS * 16`, for example `0x10100` for DS `0x1010`.
+
+```bash
+rea scan-pointer-table /path/GAME.EXE 0x10120 --count 3 --pointer-size 4 \
+  --pointer-form x86-far --format json
+rea discover-pointer-tables /path/GAME.EXE --pointer-size 4 \
+  --pointer-form x86-far --min-entries 3 --format json
+```
+
+`find-code-references --architecture x86-16` scans an MZ or COM program for
+near calls and jumps, far calls and jumps, absolute data operands
+(`address_pair`) and relocated far pointers (`pointer_word`). Near data
+operands become `DS * 16 + offset`; DS comes from `--data-segment`, or from the
+startup `mov r16, imm` / `mov ds, r16` of an MZ program (reported in
+`files[].data_segment`), or is `0x1000` for COM. `--architecture x86-32` scans
+LE/LX objects for `call`/`jmp`/`jcc` targets, absolute operands, and pointer
+words at `offset32` fixup sites. Both are byte-by-byte candidate scans, not
+instruction-boundary recovery; confirm hits in Ghidra or romlab.
+
+```bash
+rea find-code-references --architecture x86-16 --file /path/GAME.EXE \
+  --target 0x10100+0x16:strings --format json
+rea find-code-references --architecture x86-32 --file /path/GAME.EXE \
+  --target 0x20020:table --format json
+```
 
 ## Real verification
 

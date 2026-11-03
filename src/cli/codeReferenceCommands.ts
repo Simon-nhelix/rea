@@ -42,7 +42,7 @@ export const registerCodeReferenceCommands = (
   const service = new CodeReferenceService();
   cli.command(CLI_COMMANDS.findCodeReferences, {
     description:
-      "Find static call/jump, address-formation, PC-literal, block-transfer, and pointer-word references to addresses across code files (MIPS, SuperH, 65816, 6502/HuC6280, ARM/Thumb)",
+      "Find static call/jump, address-formation, PC-literal, block-transfer, and pointer-word references to addresses across code files (MIPS, SuperH, 65816, 6502/HuC6280, ARM/Thumb, x86 DOS)",
     options: z.object({
       file: z
         .array(z.string())
@@ -58,13 +58,19 @@ export const registerCodeReferenceCommands = (
         .enum(CODE_REFERENCE_ARCHITECTURES)
         .default("mips-le")
         .describe(
-          "Instruction set to scan (mips-le, mips-be, sh2-be, sh4-le, 65816, 6502, huc6280, arm-le, thumb-le)",
+          "Instruction set to scan (mips-le, mips-be, sh2-be, sh4-le, 65816, 6502, huc6280, arm-le, thumb-le, x86-16, x86-32)",
         ),
       gp: z
         .string()
         .optional()
         .describe(
           "Value of $gp for gp-relative references; found automatically from lui/addiu $gp when omitted",
+        ),
+      dataSegment: z
+        .string()
+        .optional()
+        .describe(
+          "x86-16: loaded DS segment for near data operands (e.g. 0x1010); read from MZ startup code when omitted",
         ),
       gpRelative: z
         .boolean()
@@ -114,6 +120,9 @@ export const registerCodeReferenceCommands = (
                   architecture: options.architecture,
                   ...(options.gp === undefined ? {} : { gp: options.gp }),
                   gp_relative: options.gpRelative,
+                  ...(options.dataSegment === undefined
+                    ? {}
+                    : { data_segment: options.dataSegment }),
                   resolve_call_arguments: options.resolveCallArguments,
                   include_caller_signatures: options.includeCallerSignatures,
                   ...(options.kind === undefined

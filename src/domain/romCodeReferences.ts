@@ -68,6 +68,7 @@ import {
   callerSignatureAt,
   scanArchitectureRegion,
 } from "./romCodeReferenceArchScanners.js";
+import { scanX86Region } from "./romCodeReferenceX86Scanner.js";
 
 export const CODE_REFERENCE_ARCHITECTURES = [
   "mips-le",
@@ -79,6 +80,8 @@ export const CODE_REFERENCE_ARCHITECTURES = [
   "huc6280",
   "arm-le",
   "thumb-le",
+  "x86-16",
+  "x86-32",
 ] as const;
 
 export const codeReferenceArchitectureSchema = z.enum(
@@ -108,7 +111,7 @@ export const findCodeReferencesInputSchema = z.strictObject({
   architecture: codeReferenceArchitectureSchema
     .default("mips-le")
     .describe(
-      "Instruction set: mips-le (PS1/PS2/PSP), sh2-be (Saturn), sh4-le (Dreamcast), 65816 (SNES), 6502 (NES), huc6280 (PC Engine), arm-le / thumb-le (GBA/NDS).",
+      "Instruction set: mips-le (PS1/PS2/PSP), sh2-be (Saturn), sh4-le (Dreamcast), 65816 (SNES), 6502 (NES), huc6280 (PC Engine), arm-le / thumb-le (GBA/NDS), x86-16 (DOS MZ/COM real mode), x86-32 (DOS extender LE/LX).",
     ),
   gp: addressSchema
     .optional()
@@ -119,6 +122,13 @@ export const findCodeReferencesInputSchema = z.strictObject({
     .boolean()
     .default(true)
     .describe("Set false to skip gp_relative detection entirely."),
+  data_segment: z
+    .string()
+    .regex(/^(0[xX])?[0-9a-fA-F]{1,4}$/u)
+    .optional()
+    .describe(
+      "x86-16 only: loaded DS segment (load segment 0x1000 already added, e.g. 0x1010) that near data offsets are relative to. When omitted it is read from the startup mov r16,imm / mov ds,r16 of an MZ program; a COM program uses 0x1000.",
+    ),
   resolve_call_arguments: z
     .boolean()
     .default(false)
@@ -184,6 +194,9 @@ export const LOAD_ADDRESS_SOURCES = [
   "ines-header",
   "gba-rom-header",
   "n64-rom-header",
+  "dos-mz-header",
+  "dos-com",
+  "dos-le-header",
   "caller",
 ] as const;
 
@@ -202,6 +215,14 @@ export const findCodeReferencesResultSchema = z.strictObject({
       scanned_bytes: z.number().int().min(0),
       region_end_address: z.string(),
       references: z.number().int().min(0),
+      data_segment: z
+        .strictObject({
+          value: z.string(),
+          linear_base: z.string(),
+          source: z.enum(["caller", "entry-code", "com-psp"]),
+          address: z.string().nullable(),
+        })
+        .optional(),
     }),
   ),
   gp: z.strictObject({
@@ -333,6 +354,12 @@ export interface ScanRegion {
   readonly address: number;
   /** Known $gp value, enabling gp_relative references. */
   readonly gp?: number | undefined;
+  /** x86-16: linear base (DS * 16) that near data offsets are added to. */
+  readonly dataSegmentBase?: number | undefined;
+  /** x86: file offsets of known pointer words (relocation or fixup sites). */
+  readonly pointerSites?: readonly number[] | undefined;
+  /** False for data-only regions: only pointer words are scanned. */
+  readonly executable?: boolean | undefined;
   readonly resolveCallArguments?: boolean | undefined;
   readonly includeCallerSignatures?: boolean | undefined;
 }
@@ -736,6 +763,14 @@ export const scanCodeRegion = (
     includeCallerSignatures:
       options?.includeCallerSignatures ?? region.includeCallerSignatures,
   };
+  if (architecture === "x86-16" || architecture === "x86-32")
+    return scanX86Region(
+      region,
+      scanTargets,
+      kinds,
+      architecture === "x86-32",
+      mergedOptions,
+    );
   return isMipsCodeReferenceArchitecture(architecture)
     ? scanMipsRegion(
         region,

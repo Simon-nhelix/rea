@@ -38,6 +38,8 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
         boolean executable
     ) {}
 
+    private record LoaderPatchSpec(long address, byte[] bytes) {}
+
     private record MemoryRegionSpec(
         String name,
         long address,
@@ -126,6 +128,7 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
         int swapMode = 0;
         List<FileMapSpec> fileMaps = new ArrayList<>();
         List<MemoryRegionSpec> memRegions = new ArrayList<>();
+        List<LoaderPatchSpec> loaderPatches = new ArrayList<>();
 
         for (String line : content.split("\n")) {
             if (line.isEmpty()) continue;
@@ -180,6 +183,19 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
                         );
                     }
                     swapMode = parsed;
+                }
+                case "fix" -> {
+                    if (fields.length != 3 || fields[2].isEmpty() ||
+                        fields[2].length() % 2 != 0) {
+                        throw new IllegalArgumentException("Malformed fix record in console spec");
+                    }
+                    byte[] patch = new byte[fields[2].length() / 2];
+                    for (int i = 0; i < patch.length; i++) {
+                        patch[i] = (byte) Integer.parseInt(
+                            fields[2].substring(i * 2, i * 2 + 2), 16
+                        );
+                    }
+                    loaderPatches.add(new LoaderPatchSpec(parseHex(fields[1]), patch));
                 }
                 default -> throw new IllegalArgumentException(
                     "Unknown console spec record kind: " + fields[0]
@@ -301,6 +317,31 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
             }
         }
 
+        // Loader fixups (DOS extender LE/LX) rewrite file-backed bytes the way
+        // the extender does at load time. Sites outside initialized blocks
+        // (zero-filled object tails) are counted, not written.
+        int appliedPatches = 0;
+        int skippedPatches = 0;
+        for (LoaderPatchSpec patch : loaderPatches) {
+            monitor.checkCancelled();
+            long last = patch.address + patch.bytes.length - 1;
+            if (Long.compareUnsigned(last, maxOffset) > 0) {
+                skippedPatches++;
+                continue;
+            }
+            Address start = space.getAddress(patch.address);
+            Address end = space.getAddress(last);
+            MemoryBlock first = memory.getBlock(start);
+            MemoryBlock final_ = memory.getBlock(end);
+            if (first == null || final_ == null || !first.isInitialized() ||
+                !final_.isInitialized()) {
+                skippedPatches++;
+                continue;
+            }
+            memory.setBytes(start, patch.bytes);
+            appliedPatches++;
+        }
+
         if (format.equals("gba")) {
             applyGbaFields(space, memory, maxOffset, GBA_IO_REGISTERS);
             applyGbaFields(space, memory, maxOffset, GBA_HEADER_FIELDS);
@@ -342,6 +383,12 @@ public final class ReaGhidraPrepareConsole extends GhidraScript {
             currentProgram.getOptions(Program.PROGRAM_INFO).setString(
                 "REA console file byte swap",
                 Integer.toString(swapMode)
+            );
+        }
+        if (!loaderPatches.isEmpty()) {
+            currentProgram.getOptions(Program.PROGRAM_INFO).setString(
+                "REA console loader fixups",
+                appliedPatches + " applied, " + skippedPatches + " outside initialized memory"
             );
         }
         currentProgram.getOptions(Program.PROGRAM_INFO).setBoolean("REA console prepared", true);

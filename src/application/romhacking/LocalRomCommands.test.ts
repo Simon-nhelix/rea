@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runLocalRomTool } from "./LocalRomCommands.js";
 import { inspectDiscImage } from "./LocalByteSource.js";
+import { sampleMzProgram } from "../../../tests/fixtures/dos/realMode.js";
+import { sampleLinearProgram } from "../../../tests/fixtures/dos/linearExecutable.js";
 
 /** sjis-le16 words, e.g. どう = 82C7 82A4 stored as C7 82 A4 82. */
 const le16 = (...words: number[]): number[] =>
@@ -226,6 +228,147 @@ describe("Nintendo 64 local ROM reads", () => {
       matches: [{ file_offset: 0x1014, text: "HELLO N64 WORLD" }],
       source: { mode: "data", byte_swap_undone: 16 },
     });
+  });
+});
+
+describe("DOS program local reads", () => {
+  const strings = { encoding: "ascii", terminator_byte: 0x24 };
+
+  it("reads MZ far and near pointer tables at Ghidra's linear addresses", async () => {
+    const path = join(root, "game.exe");
+    await writeFile(path, sampleMzProgram(Buffer.from("OVERLAY")));
+    const far = await runLocalRomTool({
+      path,
+      tool: "scan_pointer_table",
+      arguments: {
+        address: "0x10120",
+        count: 3,
+        pointer_form: "x86-far",
+        ...strings,
+      },
+      signal,
+      localBytes: false,
+    });
+    expect(far?.ok).toBe(true);
+    if (far === undefined || !far.ok) return;
+    expect(far.value.result).toMatchObject({
+      pointer_form: "x86-far",
+      entries: [
+        {
+          raw_pointer: "0x10100000",
+          target_address: "0x10100",
+          target_file_offset: 0x130,
+          preview_text: "HELLO",
+        },
+        {
+          raw_pointer: "0x10100008",
+          target_address: "0x10108",
+          preview_text: "BYE",
+        },
+        {
+          raw_pointer: "0x10100010",
+          target_address: "0x10110",
+          preview_text: "MENU",
+        },
+      ],
+    });
+    expect(far.value.limitations.join(" ")).toContain("segment 0x1000");
+
+    const near = await runLocalRomTool({
+      path,
+      tool: "scan_pointer_table",
+      arguments: {
+        address: "0x10130",
+        count: 3,
+        pointer_size: 2,
+        base_address: "0x10100",
+        ...strings,
+      },
+      signal,
+      localBytes: false,
+    });
+    expect(near?.ok).toBe(true);
+    if (near === undefined || !near.ok) return;
+    expect(near.value.result).toMatchObject({
+      entries: [
+        { target_address: "0x10100", preview_text: "HELLO" },
+        { target_address: "0x10108", preview_text: "BYE" },
+        { target_address: "0x10110", preview_text: "MENU" },
+      ],
+    });
+
+    const discovered = await runLocalRomTool({
+      path,
+      tool: "discover_pointer_tables",
+      arguments: { pointer_form: "x86-far", min_entries: 3, ...strings },
+      signal,
+      localBytes: false,
+    });
+    expect(discovered?.ok).toBe(true);
+    if (discovered === undefined || !discovered.ok) return;
+    expect(discovered.value.result).toMatchObject({
+      pointer_form: "x86-far",
+      tables: [{ table_address: "0x10120", entry_count: 3 }],
+    });
+  });
+
+  it("refuses x86 far pointers that are not 4-byte address-mode words", async () => {
+    const path = join(root, "far.exe");
+    await writeFile(path, sampleMzProgram());
+    const run = await runLocalRomTool({
+      path,
+      tool: "scan_pointer_table",
+      arguments: {
+        address: "0x10120",
+        pointer_size: 2,
+        pointer_form: "x86-far",
+      },
+      signal,
+      localBytes: false,
+    });
+    expect(run?.ok).toBe(false);
+  });
+
+  it("maps COM files after the program segment prefix", async () => {
+    const path = join(root, "tool.com");
+    const com = Buffer.alloc(0x40, 0x90);
+    com.write("PRESS ANY KEY$", 0x20, "latin1");
+    await writeFile(path, com);
+    const run = await runLocalRomTool({
+      path,
+      tool: "search_rom_strings",
+      arguments: { query: "PRESS", encoding: "ascii" },
+      signal,
+      localBytes: false,
+      formatHint: "dos-com",
+    });
+    expect(run?.ok).toBe(true);
+    if (run === undefined || !run.ok) return;
+    expect(run.value.result).toMatchObject({
+      matches: [{ file_offset: 0x20, address: "0x10120" }],
+    });
+  });
+
+  it("reads LE pointer slots through their fixups", async () => {
+    const path = join(root, "dos4gw.exe");
+    await writeFile(path, sampleLinearProgram({ bound: true }));
+    const run = await runLocalRomTool({
+      path,
+      tool: "scan_pointer_table",
+      arguments: { address: "0x20020", count: 3, encoding: "ascii" },
+      signal,
+      localBytes: false,
+    });
+    expect(run?.ok).toBe(true);
+    if (run === undefined || !run.ok) return;
+    expect(run.value.result).toMatchObject({
+      entries: [
+        { target_address: "0x20000", preview_text: "HELLO" },
+        { target_address: "0x20008", preview_text: "BYE" },
+        { target_address: "0x20010", preview_text: "MENU" },
+      ],
+    });
+    expect(run.value.limitations.join(" ")).toContain("fixups are applied");
   });
 });
 

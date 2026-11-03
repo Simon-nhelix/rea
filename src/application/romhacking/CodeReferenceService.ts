@@ -34,6 +34,11 @@ import {
   detectN64ByteOrder,
   unswapN64Bytes,
 } from "../../domain/consoleRom.js";
+import {
+  callerDataSegment,
+  locateDosRegions,
+  type DosDataSegment,
+} from "./dosCodeReferenceRegions.js";
 
 const OPERATION = "find_code_references";
 const MAX_FILE_BYTES = 256 * 1024 * 1024;
@@ -49,12 +54,23 @@ interface LoadedRegion {
   readonly length: number;
   readonly notes: readonly string[];
   readonly useGp: boolean;
+  /** x86: false for data objects, which are scanned for pointer words only. */
+  readonly executable?: boolean;
+  /** x86: file offsets of relocated pointer words. */
+  readonly pointerSites?: readonly number[] | undefined;
+  /** x86-16: DS used for near data operands. */
+  readonly dataSegment?: DosDataSegment | undefined;
 }
 
 type RegionCoordinate = Omit<
   LoadedRegion,
   "sha256" | "path" | "bytes" | "useGp"
 >;
+
+const isX86 = (
+  architecture: CodeReferenceArchitecture,
+): architecture is "x86-16" | "x86-32" =>
+  architecture === "x86-16" || architecture === "x86-32";
 
 /** Locate all loadable regions of a file: PS-X EXE, multi-PT_LOAD ELF32, MWo3, console headers, or caller load address. */
 const locateRegions = (
@@ -389,6 +405,12 @@ const tallyReferences = (
         length: region.length,
         address: region.loadAddress,
         gp: region.useGp ? gp : undefined,
+        dataSegmentBase:
+          region.dataSegment === undefined
+            ? undefined
+            : region.dataSegment.segment * 16,
+        pointerSites: region.pointerSites,
+        executable: region.executable,
       },
       targets,
       kinds,
@@ -450,6 +472,7 @@ const evidenceParameters = (
   architecture: input.architecture,
   gp: input.gp ?? null,
   gp_relative: input.gp_relative,
+  data_segment: input.data_segment ?? null,
   resolve_call_arguments: input.resolve_call_arguments,
   include_caller_signatures: input.include_caller_signatures,
   kinds: [...kinds],
@@ -485,6 +508,19 @@ const buildResult = (
     scanned_bytes: region.length,
     region_end_address: formatAddress32(region.loadAddress + region.length),
     references: tally.perFile[index] ?? 0,
+    ...(region.dataSegment === undefined
+      ? {}
+      : {
+          data_segment: {
+            value: `0x${region.dataSegment.segment.toString(16)}`,
+            linear_base: formatAddress32(region.dataSegment.segment * 16),
+            source: region.dataSegment.source,
+            address:
+              region.dataSegment.address === null
+                ? null
+                : formatAddress32(region.dataSegment.address),
+          },
+        }),
   })),
   overlapping_files: overlappingRegions(
     regions.map((region) => ({
@@ -554,6 +590,16 @@ export class CodeReferenceService {
         ]),
       );
 
+    if (input.data_segment !== undefined && input.architecture !== "x86-16")
+      return err(
+        new AnalysisInputError(OPERATION, undefined, [
+          {
+            path: ["data_segment"],
+            reason: "invalid_value",
+            message: "data_segment applies only to architecture x86-16.",
+          },
+        ]),
+      );
     const regions: LoadedRegion[] = [];
     for (const file of input.files) {
       if (isAborted(signal)) return err(new AnalysisCancelledError(OPERATION));
@@ -562,6 +608,7 @@ export class CodeReferenceService {
         file.load_address,
         file.use_gp,
         input.architecture,
+        input.data_segment,
       );
       if (!loaded.ok) return loaded;
       regions.push(...loaded.value);
@@ -636,6 +683,7 @@ export class CodeReferenceService {
     loadAddress: string | undefined,
     useGp: boolean,
     architecture: CodeReferenceArchitecture,
+    dataSegment: string | undefined,
   ): Promise<Result<readonly LoadedRegion[], AnalysisError>> {
     let bytes: Uint8Array;
     try {
@@ -656,6 +704,11 @@ export class CodeReferenceService {
       );
     }
     const sha256 = createHash("sha256").update(bytes).digest("hex");
+    if (isX86(architecture))
+      return this.#loadDos(path, bytes, sha256, loadAddress, useGp, {
+        architecture,
+        dataSegment,
+      });
     // Byteswapped and little-endian Nintendo 64 dumps are restored to the
     // native big-endian byte order the scan decodes; file offsets and the
     // file digest above still identify the original dump.
@@ -691,6 +744,68 @@ export class CodeReferenceService {
           byteOrderNote === undefined
             ? region.notes
             : [...region.notes, byteOrderNote],
+      })),
+    );
+  }
+
+  /** DOS programs scan the loaded bytes: relocations and fixups written. */
+  #loadDos(
+    path: string,
+    bytes: Uint8Array,
+    sha256: string,
+    loadAddress: string | undefined,
+    useGp: boolean,
+    options: {
+      readonly architecture: "x86-16" | "x86-32";
+      readonly dataSegment: string | undefined;
+    },
+  ): Result<readonly LoadedRegion[], AnalysisError> {
+    const explicit =
+      loadAddress === undefined ? undefined : parseAddress32(loadAddress);
+    if (explicit !== undefined) {
+      const dataSegment =
+        options.architecture === "x86-16"
+          ? callerDataSegment(options.dataSegment)
+          : undefined;
+      return ok([
+        {
+          path,
+          bytes,
+          sha256,
+          useGp,
+          loadAddress: explicit,
+          loadAddressSource: "caller",
+          fileOffset: 0,
+          length: bytes.length,
+          dataSegment,
+          notes:
+            options.architecture === "x86-16" && dataSegment === undefined
+              ? [
+                  `${path}: raw x86-16 scan without data_segment reports only near calls and jumps and far references; relocations are not applied.`,
+                ]
+              : [
+                  `${path}: raw scan at the caller's load address; relocations and fixups are not applied.`,
+                ],
+        },
+      ]);
+    }
+    const located = locateDosRegions(
+      path,
+      bytes,
+      options.architecture,
+      options.dataSegment,
+    );
+    if (!located.ok)
+      return err(
+        new AnalysisInputError(OPERATION, { userMessage: located.error }),
+      );
+    return ok(
+      located.value.regions.map((region) => ({
+        ...region,
+        path,
+        bytes: located.value.scanBytes,
+        sha256,
+        useGp,
       })),
     );
   }

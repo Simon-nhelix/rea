@@ -59,6 +59,7 @@ import {
   rawBinarySelectionError,
 } from "../domain/rawBinary.js";
 import { admitGamecubeDol } from "../domain/gamecubeDolAdmission.js";
+import { locateDosLinearHeader } from "../domain/dosLinearExecutable.js";
 import { DOL_HEADER_SIZE } from "../domain/gamecubeDol.js";
 import {
   mzWindowsHeaderLayoutLimitation,
@@ -111,6 +112,58 @@ import { absoluteCallerPath } from "../filesystem/callerPath.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 
 const CONSOLE_HEADER_PROBE_BYTES = 68 * 1024;
+/** DOS extender executables are a few MiB; larger MZ files are not probed. */
+const DOS_LINEAR_MAX_FILE_BYTES = 64 * 1024 * 1024;
+
+const readWholeHandle = async (
+  handle: FileHandle,
+  fileBytes: number,
+  signal?: AbortSignal,
+): Promise<Buffer> => {
+  const whole = Buffer.alloc(fileBytes);
+  let filled = 0;
+  while (filled < fileBytes) {
+    const { bytesRead } = await handle.read(
+      whole,
+      filled,
+      fileBytes - filled,
+      filled,
+    );
+    throwIfTargetResolutionCancelled(signal);
+    if (bytesRead === 0) break;
+    filled += bytesRead;
+  }
+  return whole.subarray(0, filled);
+};
+
+/**
+ * A bound DOS extender places the LE/LX header after a stub larger than the
+ * console probe. Follow the stub chain over the whole file for MZ files that
+ * no Windows header claims.
+ */
+const detectBoundDosLinearExecutable = async (
+  handle: FileHandle,
+  prefix: Buffer,
+  fileBytes: number,
+  signal?: AbortSignal,
+): Promise<boolean> => {
+  if (
+    prefix.length < 0x40 ||
+    prefix.length >= fileBytes ||
+    fileBytes > DOS_LINEAR_MAX_FILE_BYTES ||
+    prefix[0] !== 0x4d ||
+    prefix[1] !== 0x5a
+  )
+    return false;
+  const windows = observeMzWindowsHeader(prefix, fileBytes);
+  if (
+    windows.state === "declared" &&
+    (windows.signature === "PE" || windows.signature === "NE")
+  )
+    return false;
+  const whole = await readWholeHandle(handle, fileBytes, signal);
+  return locateDosLinearHeader(whole).ok;
+};
 
 const XML_PLIST_PROBE_CHUNK_BYTES = 64 * 1024;
 
@@ -1496,6 +1549,16 @@ const readConsoleAuxiliarySlices = async (input: {
     }
   }
 
+  if (format === "dos-le") {
+    // The page map and fixup tables can follow a bound extender stub of any
+    // size, so LE/LX admission reads the complete executable.
+    if (fileBytes > DOS_LINEAR_MAX_FILE_BYTES) return {};
+    innerHeaderBytes =
+      fileBytes <= headerBytes.length
+        ? headerBytes.subarray(0, fileBytes)
+        : await readWholeHandle(handle, fileBytes, signal);
+  }
+
   if (format === "wsc" && fileBytes >= 16) {
     const trailerLen = Math.min(64, fileBytes);
     const trailer = Buffer.alloc(trailerLen);
@@ -1611,11 +1674,16 @@ const tryAutoDetectConsoleBinaryTarget = async (input: {
   throwIfTargetResolutionCancelled(signal);
   const bytes = prefix.subarray(0, observed.bytesRead);
   const lowerPath = path.toLowerCase();
-  const detectedFormat = detectConsoleFormatFromHeader(
-    bytes,
-    metadata.size,
-    lowerPath,
-  );
+  const detectedFormat =
+    detectConsoleFormatFromHeader(bytes, metadata.size, lowerPath) ??
+    ((await detectBoundDosLinearExecutable(
+      handle,
+      bytes,
+      metadata.size,
+      signal,
+    ))
+      ? "dos-le"
+      : undefined);
   if (detectedFormat === undefined) return undefined;
   const { innerHeaderBytes, trailerBytes } = await readConsoleAuxiliarySlices({
     handle,
@@ -1648,6 +1716,7 @@ const tryAutoDetectConsoleBinaryTarget = async (input: {
         "nds",
         "md",
         "n64",
+        "dos-le",
       ].includes(detectedFormat)
     ) {
       return err(

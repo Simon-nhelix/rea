@@ -6,7 +6,7 @@ import {
 } from "./GhidraAnalysisSeeds.js";
 import type { GhidraLanguageOverride } from "../config/ghidraLanguageOverride.js";
 import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
-import { mkdir, realpath } from "node:fs/promises";
+import { mkdir, readFile, realpath } from "node:fs/promises";
 import { basename, dirname, join, posix, win32 } from "node:path";
 
 import { writeGhidraRuntimeFile } from "./GhidraRuntimeFile.js";
@@ -57,7 +57,9 @@ import {
   type GhidraPspExtension,
 } from "./GhidraPspExtension.js";
 import {
+  consoleLoaderPatches,
   formatConsoleTargetSpecTsv,
+  type ConsoleLoaderPatch,
   type ConsoleTargetAdmission,
 } from "../domain/consoleRom.js";
 
@@ -329,9 +331,23 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
         this.options.configurationDirectoryName,
       );
       if (this.options.consoleRom !== undefined) {
+        const consoleRom = this.options.consoleRom;
+        let loaderPatches: readonly ConsoleLoaderPatch[] = [];
+        if (consoleRom.format === "dos-le") {
+          // Fixups are computed from the same private snapshot Ghidra imports.
+          const patches = consoleLoaderPatches(
+            consoleRom,
+            await readFile(session.targetPath),
+          );
+          if (!patches.ok)
+            throw new GhidraLaunchError(
+              `DOS extender fixups could not be read: ${patches.error}`,
+            );
+          loaderPatches = patches.value;
+        }
         await writeGhidraRuntimeFile(
           paths.consoleSpecPath,
-          formatConsoleTargetSpecTsv(this.options.consoleRom),
+          formatConsoleTargetSpecTsv(consoleRom, loaderPatches),
           platform,
         );
       }

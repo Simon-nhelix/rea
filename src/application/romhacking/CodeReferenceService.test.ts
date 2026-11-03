@@ -8,6 +8,8 @@ import {
   parseFileSpec,
   parseTargetSpec,
 } from "../../cli/codeReferenceCommands.js";
+import { sampleMzProgram } from "../../../tests/fixtures/dos/realMode.js";
+import { sampleLinearProgram } from "../../../tests/fixtures/dos/linearExecutable.js";
 
 const words = (list: readonly number[]): Buffer => {
   const out = Buffer.alloc(list.length * 4);
@@ -417,5 +419,143 @@ describe("CLI spec parsing", () => {
     expect(callHit?.call_arguments).toEqual({ a0: "0x00450004" });
     expect(callHit?.caller_signature).toBeTypeOf("string");
     expect(ptrHit?.address).toBe("0x00450000");
+  });
+});
+
+describe("CodeReferenceService DOS programs", () => {
+  const hits = (report: ReturnType<typeof resultOf>) =>
+    report.references.map((hit) => [hit.kind, hit.address, hit.target_address]);
+
+  it("scans LE objects at their bases with fixups applied", async () => {
+    const path = join(directory, "GAME.EXE");
+    await writeFile(path, sampleLinearProgram({ bound: true }));
+    const result = await new CodeReferenceService().find({
+      files: [{ path }],
+      architecture: "x86-32",
+      targets: [
+        { address: "0x20000", length: 0x18, name: "strings" },
+        { address: "0x20020", name: "table" },
+        { address: "0x10020", name: "helper" },
+      ],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const report = resultOf(result.value);
+    expect(
+      report.files.map((f) => [f.load_address, f.load_address_source]),
+    ).toEqual([
+      ["0x00010000", "dos-le-header"],
+      ["0x00020000", "dos-le-header"],
+    ]);
+    expect(hits(report)).toEqual(
+      expect.arrayContaining([
+        ["address_pair", "0x00010000", "0x00020000"],
+        ["address_pair", "0x00010005", "0x00020008"],
+        ["address_pair", "0x0001000a", "0x00020020"],
+        ["call", "0x00010011", "0x00010020"],
+        ["pointer_word", "0x00020020", "0x00020000"],
+        ["pointer_word", "0x00020024", "0x00020008"],
+        ["pointer_word", "0x00020028", "0x00020010"],
+      ]),
+    );
+    // Operand fixups in code are reported once, as the instruction.
+    expect(
+      report.references.filter(
+        (hit) => hit.kind === "pointer_word" && hit.address < "0x00020000",
+      ),
+    ).toEqual([]);
+  });
+
+  it("scans an MZ module with relocations and the startup data segment", async () => {
+    const path = join(directory, "GAME.EXE");
+    await writeFile(path, sampleMzProgram(Buffer.from("OVERLAY")));
+    const result = await new CodeReferenceService().find({
+      files: [{ path }],
+      architecture: "x86-16",
+      targets: [
+        { address: "0x10100", length: 0x16, name: "strings" },
+        { address: "0x10040", name: "menu" },
+      ],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const report = resultOf(result.value);
+    expect(report.files[0]).toMatchObject({
+      load_address: "0x00010000",
+      load_address_source: "dos-mz-header",
+      scanned_file_offset: 0x30,
+      scanned_bytes: 0x140,
+      data_segment: {
+        value: "0x1010",
+        linear_base: "0x00010100",
+        source: "entry-code",
+        address: "0x00010000",
+      },
+    });
+    expect(hits(report)).toEqual(
+      expect.arrayContaining([
+        ["address_pair", "0x00010005", "0x00010100"],
+        ["call", "0x00010008", "0x00010040"],
+        ["pointer_word", "0x00010120", "0x00010100"],
+        ["pointer_word", "0x00010124", "0x00010108"],
+        ["pointer_word", "0x00010128", "0x00010110"],
+      ]),
+    );
+  });
+
+  it("uses DS = CS for COM programs and the caller's data segment when given", async () => {
+    const com = Buffer.alloc(0x20, 0x90);
+    com.set([0xba, 0x10, 0x01, 0xb4, 0x09, 0xcd, 0x21, 0xc3], 0); // mov dx,0110h
+    com.write("HI$", 0x10, "latin1");
+    const path = join(directory, "TOOL.COM");
+    await writeFile(path, com);
+    const service = new CodeReferenceService();
+    const auto = await service.find({
+      files: [{ path }],
+      architecture: "x86-16",
+      targets: [{ address: "0x10110" }],
+    });
+    expect(auto.ok).toBe(true);
+    if (!auto.ok) return;
+    const report = resultOf(auto.value);
+    expect(report.files[0]?.data_segment?.source).toBe("com-psp");
+    expect(hits(report)).toContainEqual([
+      "address_pair",
+      "0x00010100",
+      "0x00010110",
+    ]);
+    const given = await service.find({
+      files: [{ path }],
+      architecture: "x86-16",
+      data_segment: "0x1001",
+      targets: [{ address: "0x10120" }],
+    });
+    expect(given.ok).toBe(true);
+    if (!given.ok) return;
+    expect(resultOf(given.value).files[0]?.data_segment?.source).toBe("caller");
+    expect(hits(resultOf(given.value))).toContainEqual([
+      "address_pair",
+      "0x00010100",
+      "0x00010120",
+    ]);
+  });
+
+  it("rejects mismatched DOS formats and data_segment on other CPUs", async () => {
+    const path = join(directory, "GAME.EXE");
+    await writeFile(path, sampleLinearProgram());
+    const service = new CodeReferenceService();
+    const wrong = await service.find({
+      files: [{ path }],
+      architecture: "x86-16",
+      targets: [{ address: "0x20000" }],
+    });
+    expect(wrong.ok).toBe(false);
+    if (!wrong.ok) expect(wrong.error.userMessage).toContain("x86-32");
+    const mips = await service.find({
+      files: [{ path, load_address: "0x80000000" }],
+      data_segment: "0x1010",
+      targets: [{ address: "0x80000000" }],
+    });
+    expect(mips.ok).toBe(false);
   });
 });

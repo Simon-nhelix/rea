@@ -20,16 +20,24 @@ import {
 } from "./residualUnknown.js";
 import { freezeJsonSnapshot } from "./immutableJson.js";
 
-const [detectedSubjectSchema, rawSubjectSchema] =
-  evidenceSchema.shape.subject.unwrap().options;
+const [
+  detectedSubjectSchema,
+  rawSubjectSchema,
+  consoleSubjectSchema,
+  dolSubjectSchema,
+] = evidenceSchema.shape.subject.unwrap().options;
 const manifestFields = {
   digest: true,
   format: true,
   architecture: true,
 } as const;
+// Every Evidence subject variant must have a manifest row, or bundling
+// Evidence about a console or DOL target fails.
 const artifactManifestSchema = z.discriminatedUnion("format", [
   detectedSubjectSchema.pick(manifestFields),
   rawSubjectSchema.pick(manifestFields),
+  consoleSubjectSchema.pick(manifestFields),
+  dolSubjectSchema.pick(manifestFields),
 ]);
 const providerManifestSchema = providerSchema;
 const environmentManifestSchema = evidenceSchema.shape.environment.unwrap();

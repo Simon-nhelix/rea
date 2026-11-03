@@ -20,6 +20,32 @@ const provider = { id: "fixture", name: "Fixture", version: "1" };
 const targetDigest = "a".repeat(64);
 const foreignDigest = "b".repeat(64);
 
+describe("evidence bundle artifact manifest", () => {
+  it.each([
+    { format: "dos-le", architecture: "x86" },
+    { format: "n64", architecture: "mips" },
+    { format: "gamecube-dol", architecture: "powerpc" },
+  ] as const)(
+    "lists $format Evidence subjects as artifacts",
+    ({ format, architecture }) => {
+      const record = createEvidence(
+        {
+          path: "/fixture/target.bin",
+          sha256: targetDigest,
+          format,
+          architecture,
+        },
+        provider,
+        { operation: "observe", parameters: {}, result: null },
+      );
+      const bundle = createEvidenceBundle([record]);
+      expect(bundle.artifacts).toEqual([
+        { digest: { sha256: targetDigest }, format, architecture },
+      ]);
+    },
+  );
+});
+
 describe("evidence bundle failure classification", () => {
   it("tags valid-shaped bundles that fail canonical ordering", () => {
     const records = ["first", "second"].map((label) =>

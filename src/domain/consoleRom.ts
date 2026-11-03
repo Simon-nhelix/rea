@@ -1,5 +1,12 @@
 import { err, ok, type Result } from "./result.js";
 import {
+  dosLinearFixupPatch,
+  dosLinearMappedRuns,
+  dosLinearRelocatedFileBytes,
+  locateDosLinearHeader,
+  parseDosLinearExecutable,
+} from "./dosLinearExecutable.js";
+import {
   parseRawBinaryEntryPoint,
   type RawBinaryAdmissionRejection,
 } from "./rawBinary.js";
@@ -23,6 +30,7 @@ export const CONSOLE_TARGET_FORMATS = [
   "gb",
   "wsc",
   "n64",
+  "dos-le",
 ] as const;
 
 export type ConsoleTargetFormat = (typeof CONSOLE_TARGET_FORMATS)[number];
@@ -400,6 +408,16 @@ export const detectConsoleFormatFromHeader = (
     return "n64";
   }
 
+  // 20. DOS extender LE/LX module behind an MZ stub (DOS/4GW, PMODE/W, DOS/32A)
+  if (
+    bytes.length >= 0x40 &&
+    bytes[0] === 0x4d &&
+    bytes[1] === 0x5a &&
+    locateDosLinearHeader(bytes).ok
+  ) {
+    return "dos-le";
+  }
+
   // Raw SH-4 has no identifying magic. Only the conventional boot filename
   // supplies a format hint; opcode/pointer coincidences in arbitrary .bin data
   // do not establish a Dreamcast target.
@@ -516,7 +534,113 @@ export const admitConsoleTarget = (input: {
       return admitWsc(trailerBytes, fileBytes, explicitEntry);
     case "n64":
       return admitN64(headerBytes, fileBytes, explicitEntry);
+    case "dos-le":
+      return admitDosLe(innerHeaderBytes, fileBytes, explicitEntry);
   }
+};
+
+/**
+ * DOS extender LE/LX: the whole file is required because the object page map
+ * and fixup tables follow a bound stub of arbitrary size. Objects map at their
+ * relocation base addresses in the flat 32-bit address space.
+ */
+const admitDosLe = (
+  fileBytesBuffer: Buffer | undefined,
+  fileBytes: number,
+  explicitEntry?: { canonical: string; source: string },
+): Result<ConsoleTargetAdmission, RawBinaryAdmissionRejection> => {
+  if (fileBytesBuffer === undefined || fileBytesBuffer.length !== fileBytes) {
+    return err({
+      reason: "dos-le admission requires the complete executable bytes",
+      constraint: "file_format_rejected",
+    });
+  }
+  const parsed = parseDosLinearExecutable(fileBytesBuffer);
+  if (!parsed.ok) {
+    return err({
+      reason: `dos-le: ${parsed.error}`,
+      constraint: "file_format_rejected",
+    });
+  }
+  const module = parsed.value;
+  const runs = dosLinearMappedRuns(module);
+  if (runs.length === 0) {
+    return err({
+      reason: "dos-le module has no file-backed object pages",
+      constraint: "file_format_rejected",
+    });
+  }
+  const runsPerObject = new Map<number, number>();
+  for (const run of runs)
+    runsPerObject.set(run.object, (runsPerObject.get(run.object) ?? 0) + 1);
+  const seen = new Map<number, number>();
+  const fileMappings: ConsoleFileMapping[] = runs.map((run) => {
+    const index = seen.get(run.object) ?? 0;
+    seen.set(run.object, index + 1);
+    const role = run.executable ? "CODE" : "DATA";
+    const suffix = (runsPerObject.get(run.object) ?? 1) > 1 ? `_${index}` : "";
+    return {
+      name: `OBJ${run.object}_${role}${suffix}`,
+      virtualAddress: hex32(run.virtualAddress),
+      fileOffset: run.fileOffset,
+      byteLength: run.byteLength,
+      executable: run.executable,
+      writable: run.writable,
+    };
+  });
+  // Object bytes past the file-backed pages are zero-filled by the extender.
+  const memoryRegions: ConsoleMemoryRegion[] = [];
+  for (const object of module.objects) {
+    const end = object.virtualAddress + object.virtualSize;
+    const covered = runs
+      .filter((run) => run.object === object.number)
+      .map((run) => [run.virtualAddress, run.virtualAddress + run.byteLength]);
+    let cursor = object.virtualAddress;
+    let gap = 0;
+    for (const [start, stop] of [...covered, [end, end]]) {
+      if (start! > cursor) {
+        memoryRegions.push({
+          name: `OBJ${object.number}_ZERO${gap === 0 ? "" : `_${gap}`}`,
+          virtualAddress: hex32(cursor),
+          byteLength: start! - cursor,
+          kind: "ram",
+        });
+        gap++;
+      }
+      cursor = Math.max(cursor, stop!);
+    }
+  }
+  const entryPoint = explicitEntry?.canonical ?? hex32(module.entry.address);
+  const loadBase = Math.min(...module.objects.map((o) => o.virtualAddress));
+  return ok({
+    format: "dos-le",
+    architecture: "x86",
+    ghidraLanguageId: "x86:LE:32:default",
+    compilerSpecId: "gcc",
+    loader: "BinaryLoader",
+    loadBase: hex32(loadBase),
+    entryPoint,
+    entryPointSource: explicitEntry?.source ?? entryPoint,
+    fileMappings,
+    memoryRegions,
+    romMetadata: {
+      signature: module.signature,
+      header_offset: module.headerOffset,
+      stub_offset: module.containerOffset,
+      data_pages_offset: module.dataPagesOffset,
+      data_pages_base: module.dataPagesBase,
+      page_size: module.pageSize,
+      objects: module.objects.length,
+      entry_object: module.entry.object,
+      internal_fixups: module.fixups.length,
+      skipped_fixups:
+        module.skippedFixups.importByOrdinal +
+        module.skippedFixups.importByName +
+        module.skippedFixups.entryTable +
+        module.skippedFixups.unknownSource +
+        module.skippedFixups.unknownObject,
+    },
+  });
 };
 
 const admitGba = (
@@ -2824,6 +2948,7 @@ export const resolveConsoleVirtualAddress = (
  */
 export const formatConsoleTargetSpecTsv = (
   admission: ConsoleTargetAdmission,
+  loaderPatches: readonly ConsoleLoaderPatch[] = [],
 ): string => {
   const lines: string[] = [
     `meta\t${admission.format}\t${admission.ghidraLanguageId}\t${admission.entryPoint}\t${admission.loader}`,
@@ -2863,5 +2988,54 @@ export const formatConsoleTargetSpecTsv = (
       `mem\t${region.name}\t${region.virtualAddress}\t${region.byteLength}\t${rwx}`,
     );
   }
+  for (const patch of loaderPatches) {
+    lines.push(
+      `fix\t${hex32(patch.address)}\t${Buffer.from(patch.bytes).toString("hex")}`,
+    );
+  }
   return `${lines.join("\n")}\n`;
+};
+
+/** Bytes a program loader writes over mapped file bytes (relocation fixups). */
+export interface ConsoleLoaderPatch {
+  readonly address: number;
+  readonly bytes: Uint8Array;
+}
+
+/**
+ * Loader fixups of a dos-le executable, computed from the complete file by the
+ * LE/LX owner. Other console formats load their file bytes unmodified.
+ */
+export const consoleLoaderPatches = (
+  admission: ConsoleTargetAdmission,
+  fileBytes: Uint8Array,
+): Result<readonly ConsoleLoaderPatch[], string> => {
+  if (admission.format !== "dos-le") return ok([]);
+  const parsed = parseDosLinearExecutable(fileBytes);
+  if (!parsed.ok) return parsed;
+  const patches: ConsoleLoaderPatch[] = [];
+  for (const fixup of parsed.value.fixups) {
+    const bytes = dosLinearFixupPatch(fixup);
+    if (bytes !== undefined)
+      patches.push({ address: fixup.sourceAddress, bytes });
+  }
+  return ok(patches);
+};
+
+/**
+ * The bytes a scanner should read for an admitted console target, at the
+ * original file offsets: N64 dumps in native byte order, and dos-le programs
+ * with their internal fixups written as the extender loads them.
+ */
+export const consoleLoadedFileBytes = (
+  admission: ConsoleTargetAdmission,
+  fileBytes: Buffer,
+): Result<Buffer, string> => {
+  if (admission.fileByteSwap !== undefined)
+    return ok(unswapN64Bytes(fileBytes, admission.fileByteSwap));
+  if (admission.format !== "dos-le") return ok(fileBytes);
+  const parsed = parseDosLinearExecutable(fileBytes);
+  return parsed.ok
+    ? ok(dosLinearRelocatedFileBytes(fileBytes, parsed.value))
+    : parsed;
 };

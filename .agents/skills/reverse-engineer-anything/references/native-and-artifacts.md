@@ -574,6 +574,14 @@ For headerless DOS COM, explicitly open with `format: "dos-com"` (CLI
 analysis: the entry is `0x10100`, file offset zero, with imposed real-mode segment
 context. PSP/stack/device state remains unmodeled. See [DOS guide](https://github.com/morluto/rea/blob/main/docs/ghidra-dos.md).
 
+DOS/4GW-style LE/LX programs open as `dos-le` (32-bit flat, objects at their
+relocation bases, internal fixups applied). For localization scans, MZ starts
+at linear `0x10000` with relocations applied and COM at `0x10100`; read
+real-mode far pointer tables with `pointer_form: "x86-far"` and near tables
+with `base_address` = DS * 16. `find_code_references` takes `architecture`
+`x86-16` (optional `data_segment`) or `x86-32`; its hits are byte-sweep
+candidates to confirm in Ghidra.
+
 Use `inspect_byte_entropy` to triage high- and low-entropy ranges before extraction.
 
 For other headerless images (embedded firmware without ELF/Mach-O/PE/MZ

@@ -156,14 +156,16 @@ export const runLocalRomTool = async (input: {
       if (
         parsed.value.kind !== "executable" ||
         (!isConsoleBinaryTarget(parsed.value) &&
-          parsed.value.format !== "raw-binary")
+          parsed.value.format !== "raw-binary" &&
+          parsed.value.format !== "dos-mz" &&
+          parsed.value.format !== "dos-com")
       )
         return input.exportTo === undefined
           ? undefined
           : err(
               new AnalysisInputError(input.tool, {
                 userMessage:
-                  "File export needs a console ROM, raw binary, or data file (--target-format data).",
+                  "File export needs a console ROM, DOS program, raw binary, or data file (--target-format data).",
               }),
             );
       target = parsed.value;
@@ -174,6 +176,22 @@ export const runLocalRomTool = async (input: {
       ) {
         limitations.push(
           "Byteswapped or little-endian dump normalized to native big-endian bytes for scanning; reported file offsets and digests identify the original dump.",
+        );
+      }
+      if (
+        parsed.value.format === "dos-mz" ||
+        parsed.value.format === "dos-com"
+      ) {
+        limitations.push(
+          "DOS real-mode addresses are linear (segment * 16 + offset) with the program loaded at segment 0x1000, as in Ghidra: an MZ load module starts at 0x10000 and a COM image at 0x10100. MZ segment relocations are applied before scanning; the MZ header and overlays have no address. Near pointers need base_address = data segment * 16.",
+        );
+      }
+      if (
+        isConsoleBinaryTarget(parsed.value) &&
+        parsed.value.format === "dos-le"
+      ) {
+        limitations.push(
+          "DOS extender LE/LX internal fixups are applied before scanning, so pointer slots and relocated operands read as linear addresses; the file stores zeros there. Reported file offsets and digests identify the original file.",
         );
       }
     } else if (

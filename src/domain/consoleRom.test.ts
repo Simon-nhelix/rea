@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   admitConsoleTarget,
+  consoleLoaderPatches,
   detectConsoleFormatFromHeader,
   detectN64ByteOrder,
   formatConsoleTargetSpecTsv,
@@ -8,6 +9,7 @@ import {
   resolveConsoleVirtualAddress,
   unswapN64Bytes,
 } from "./consoleRom.js";
+import { sampleLinearProgram } from "../../tests/fixtures/dos/linearExecutable.js";
 
 describe("consoleRom", () => {
   it("auto-detects PS-X EXE header and parses load/entry/text_size", () => {
@@ -887,5 +889,120 @@ describe("console pointer bank rules", () => {
     expect(resolveConsoleFileOffset(uxrom, 0xc010, from(16 + 3 * 0x4000))).toBe(
       16 + 7 * 0x4000 + 0x10,
     );
+  });
+});
+
+describe("DOS extender LE/LX targets", () => {
+  it("detects and admits LE objects as flat x86-32 mappings", () => {
+    const file = sampleLinearProgram();
+    expect(
+      detectConsoleFormatFromHeader(file, file.length, "/dos/game.exe"),
+    ).toBe("dos-le");
+    const admitted = admitConsoleTarget({
+      format: "dos-le",
+      headerBytes: file.subarray(0, 0x40),
+      innerHeaderBytes: file,
+      fileBytes: file.length,
+    });
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    const target = admitted.value;
+    expect(target).toMatchObject({
+      architecture: "x86",
+      ghidraLanguageId: "x86:LE:32:default",
+      loader: "BinaryLoader",
+      loadBase: "0x10000",
+      entryPoint: "0x10000",
+    });
+    expect(
+      target.fileMappings.map((m) => [
+        m.name,
+        m.virtualAddress,
+        m.byteLength,
+        m.executable,
+      ]),
+    ).toEqual([
+      ["OBJ1_CODE", "0x10000", 0x40, true],
+      ["OBJ2_DATA", "0x20000", 0x40, false],
+    ]);
+    // The data object's zero-filled tail is RAM, not file bytes.
+    expect(target.memoryRegions).toEqual([
+      {
+        name: "OBJ2_ZERO",
+        virtualAddress: "0x20040",
+        byteLength: 0x2000 - 0x40,
+        kind: "ram",
+      },
+    ]);
+    expect(target.romMetadata).toMatchObject({
+      signature: "LE",
+      internal_fixups: 6,
+    });
+
+    const patches = consoleLoaderPatches(target, file);
+    expect(patches.ok).toBe(true);
+    if (!patches.ok) return;
+    expect(
+      patches.value.map((p) => [
+        p.address,
+        Buffer.from(p.bytes).readUInt32LE(0),
+      ]),
+    ).toEqual([
+      [0x10001, 0x20000],
+      [0x10006, 0x20008],
+      [0x1000d, 0x20020],
+      [0x20020, 0x20000],
+      [0x20024, 0x20008],
+      [0x20028, 0x20010],
+    ]);
+    const spec = formatConsoleTargetSpecTsv(target, patches.value);
+    expect(spec).toContain("fix\t0x10001\t00000200\n");
+    expect(spec).toContain("mem\tOBJ2_ZERO\t0x20040\t8128\trwx\n");
+  });
+
+  it("admits bound-stub and LX programs with the same coordinates", () => {
+    for (const file of [
+      sampleLinearProgram({ bound: true }),
+      sampleLinearProgram({ signature: "LX" }),
+    ]) {
+      const admitted = admitConsoleTarget({
+        format: "dos-le",
+        headerBytes: file.subarray(0, 0x40),
+        innerHeaderBytes: file,
+        fileBytes: file.length,
+      });
+      expect(admitted.ok).toBe(true);
+      if (!admitted.ok) continue;
+      expect(admitted.value.fileMappings.map((m) => m.virtualAddress)).toEqual([
+        "0x10000",
+        "0x20000",
+      ]);
+      const hello = admitted.value.fileMappings[1]!.fileOffset;
+      expect(file.toString("latin1", hello, hello + 5)).toBe("HELLO");
+    }
+  });
+
+  it("requires the complete file and leaves other formats unpatched", () => {
+    const file = sampleLinearProgram();
+    const partial = admitConsoleTarget({
+      format: "dos-le",
+      headerBytes: file.subarray(0, 0x40),
+      fileBytes: file.length,
+    });
+    expect(partial.ok).toBe(false);
+    const nes = Buffer.alloc(0x4010);
+    nes.write("NES\x1a", 0, "latin1");
+    nes[4] = 1;
+    const admitted = admitConsoleTarget({
+      format: "nes",
+      headerBytes: nes,
+      fileBytes: nes.length,
+    });
+    expect(admitted.ok).toBe(true);
+    if (!admitted.ok) return;
+    expect(consoleLoaderPatches(admitted.value, nes)).toEqual({
+      ok: true,
+      value: [],
+    });
   });
 });

@@ -9,6 +9,7 @@ import { logCliCommand } from "../cliLogging.js";
 import { executableFormatHintSchema } from "../domain/dosCom.js";
 import {
   POINTER_BASE_MODES,
+  POINTER_FORMS,
   ROM_TEXT_ENCODINGS,
   ROM_WORD_PARITIES,
 } from "../domain/romHacking.js";
@@ -121,6 +122,12 @@ const romWordFormatArguments = (options: {
 
 /** `--base-mode` and `--segment` shared by the pointer table commands. */
 const pointerSegmentOptions = {
+  pointerForm: z
+    .enum(POINTER_FORMS)
+    .optional()
+    .describe(
+      "linear: the value is the address (default); x86-far: 4-byte DOS offset:segment pointer, address = segment * 16 + offset",
+    ),
   baseMode: z
     .enum(POINTER_BASE_MODES)
     .optional()
@@ -192,6 +199,7 @@ const readControlCodeDeclarations = async (
 const pointerSegmentArguments = (
   operation: string,
   options: {
+    readonly pointerForm?: (typeof POINTER_FORMS)[number] | undefined;
     readonly baseMode?: (typeof POINTER_BASE_MODES)[number] | undefined;
     readonly segment?: string | undefined;
     readonly segmentAlign?: number | undefined;
@@ -214,6 +222,9 @@ const pointerSegmentArguments = (
       "--segment already gives the length; --segment-length goes with --segment-align.",
     );
   return {
+    ...(options.pointerForm === undefined
+      ? {}
+      : { pointer_form: options.pointerForm }),
     ...(options.baseMode === undefined ? {} : { base_mode: options.baseMode }),
     ...(segment === undefined
       ? {}
