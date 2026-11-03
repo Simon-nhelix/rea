@@ -24,7 +24,7 @@ const addressSchema = z
 /** Evidence provider identity of the multi-file reference scanner. */
 export const ROM_CODE_REFERENCE_PROVIDER_IDENTITY = {
   id: "rom-code-references",
-  name: "REA MIPS code reference scanner",
+  name: "REA multi-architecture code reference scanner",
   version: null,
 } as const;
 
